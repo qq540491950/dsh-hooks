@@ -1,0 +1,17 @@
+{
+  "_comment": "dsh-hooks 存活探针（demo）：只在对 pwsh 的调用里出现魔法串时才 deny，其余情况完全静默、不阻断。魔法串与完整说明见 README「验证它活了」与 .dsh/live-probe.mjs。删除本文件（连同 live-probe.mjs）即可移除。",
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "pwsh",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node \"D:\\project\\dsh-plugins\\dsh-hooks\\.dsh\\live-probe.mjs\"",
+            "timeout": 20
+          }
+        ]
+      }
+    ]
+  }
+}

@@ -1,0 +1,15 @@
+{
+  "name": "dsh-hooks",
+  "version": "0.2.0",
+  "private": true,
+  "description": "DSH Host 插件：按项目读取 <projectRoot>/.dsh/hooks.json 与 $DSH_HOME/hooks.json，运行通用 hooks 格式的配置。",
+  "type": "module",
+  "main": "lib/index.js",
+  "exports": {
+    ".": "./lib/index.js",
+    "./package.json": "./package.json"
+  },
+  "peerDependencies": {
+    "@deepseek-ai/cordis": "~4.0.4"
+  }
+}
