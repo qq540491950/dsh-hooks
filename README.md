@@ -27,16 +27,39 @@ DSH 自带两个 hooks 兼容桥（`@deepseek-ai/dsh-hooks-*`），但它们：
 缓存，并用 `ctx.fs.watch()` 监听配置文件 —— **多个项目同时开着也能各用各的，改配置免重启**
 （实测，见[热重载实测记录](#热重载实测记录不重启即生效)）。
 
-缓存失效有**两条通道**，缺一不可：
+缓存失效有**三层通道**（按优先级），缺一不可：
 
 | 通道 | 机制 | 生效延迟 |
 | --- | --- | --- |
-| 主通道 | `ctx.fs.watch()` 监听 `<projectRoot>/.dsh`、`hooks.json`、`$DSH_HOME/hooks.json` | 秒级（实测 < 1s） |
-| 兜底通道 | 正结果 4s / 负结果 2s 的 TTL，到期允许重读 | 最坏 `POSITIVE_TTL_MS` = 4s |
+| 主通道（版本核对） | 每个事件点比对两个配置文件的 `ctx.fs.stat().version` | 内容一变，**下一个事件点**即生效（连 TTL 都不必等） |
+| 加速通道（监听） | `ctx.fs.watch()` 监听 `<projectRoot>/.dsh`、`hooks.json`、`$DSH_HOME/hooks.json` | 秒级（实测 < 1s），不等版本核对 |
+| 兜底通道（TTL） | 正结果 4s / 负结果 2s；**只在拿不到 `version`（provider 不提供）或 `stat` 抛错时**才起作用 | 最坏 `POSITIVE_TTL_MS` = 4s |
 
-兜底通道是这次修复的重点：`fs.watch` 是**尽力而为**的，它可能根本没挂上、挂上了不投递事件、
-或者事件被上游吞掉。只有"监听器"这一条失效路径时，正结果会**永久**留在缓存里 ——
-也就是"改了 `hooks.json` 不生效，必须重启"。加上 TTL 之后，最坏也只是**迟几秒**生效。
+为什么三层都要：`fs.watch` 是**尽力而为**的（可能根本没挂上、挂上了不投递事件），而版本核对要求
+provider 真的返回 `version`。任意一条失效，最坏也只是"迟几秒生效"，而不会退化成"必须重启"。
+
+## 源码与构建
+
+**源码是 TypeScript**（`src/**`），`lib/index.js` 是 **esbuild 的构建产物**，同样提交进版本库
+（profile 的路径行直接指向它）：
+
+```bash
+pnpm install
+pnpm build             # src/** → lib/index.js + lib/.build-manifest.json
+pnpm check             # typecheck + typecheck:tools + format:check + lint + verify
+node tools/verify.ts   # 唯一必跑的自检
+```
+
+- **不要手改 `lib/index.js`**：下一次构建会静默覆盖它，而且自检的 `E` 区会立刻报
+  "产物 sha256 与指纹不符"。
+- 改了 `src/**` **必须重建**（`pnpm build`）：忘了重建会得到
+  `E：指纹覆盖到的每个源文件都没有变` 这条精确报错，而不是"自检全绿但改动没生效"。
+- 宿主半边**零 import**：相对 import 由 esbuild 内联进单文件，裸模块说明符在 `app.asar` 里
+  从磁盘路径根本解析不到（自检会断言产物里 `import` / `require` 计数都是 0）。
+- 构建脚本刻意**不写时间戳**，所以构建是幂等的（同源码 → 同字节），可以用
+  `git diff --exit-code lib/` 当第二把锁。
+- `pnpm typecheck` 分两半跑：宿主半边**没有 DOM**、客户端半边**没有 node types** ——
+  写错半边会直接编译不过，不靠人记规则。
 
 ## 安装
 
@@ -180,7 +203,7 @@ Copy-Item .dsh\hooks.json .tmp\hooks.json.bak
 
 # 2) 追加一个 deny 探针组（命令里带 marker M1）
 #    探针：只在 tool_input 含 HOTPROBE 时 deny，其余 exit 0
-#    用 node tools/verify.mjs --config .dsh\hooks.json 确认解析正常（无 matcher 诊断）
+#    用 node tools/verify.ts --config .dsh\hooks.json 确认解析正常（无 matcher 诊断）
 
 # 3) 等 3–5s，然后在 DSH 里发一次带魔法串的调用
 #    Write-Output HOTPROBE      ← 期望被拦住，理由里带 marker=M1
@@ -341,7 +364,7 @@ Copy-Item .dsh\hooks.json .tmp\hooks.json.bak
 不需要 DSH，直接用 Node 跑：
 
 ```pwsh
-node tools/verify.mjs
+node tools/verify.ts
 ```
 
 覆盖五个区（**条数看输出，别抄死**——每个 bug 修复都会顺手加断言）：
@@ -376,7 +399,7 @@ node tools/verify.mjs
 另外可以单独体检一份真实的配置（不跑测试）：
 
 ```pwsh
-node tools/verify.mjs --config "D:\some\project\.dsh\hooks.json"
+node tools/verify.ts --config "D:\some\project\.dsh\hooks.json"
 ```
 
 会列出：识别到哪些事件、每个 group 的 matcher 与 timeout、被跳过的非 command handler、
@@ -386,7 +409,7 @@ node tools/verify.mjs --config "D:\some\project\.dsh\hooks.json"
 
 | 现象 | 检查 |
 | --- | --- |
-| hook 完全不跑 | 1) patch 行加了但**没重启**（最常见）；2) 项目根下有没有 `.git`（没有就用会话 cwd）；3) 配置是否在 `<projectRoot>/.dsh/hooks.json`；4) `node tools/verify.mjs --config <该文件>` 看有没有被识别 |
+| hook 完全不跑 | 1) patch 行加了但**没重启**（最常见）；2) 项目根下有没有 `.git`（没有就用会话 cwd）；3) 配置是否在 `<projectRoot>/.dsh/hooks.json`；4) `node tools/verify.ts --config <该文件>` 看有没有被识别 |
 | **matcher 写了外来工具名** | 用了 `Bash` / `PowerShell` 这类别的工具的名字 → 改成 DSH 的 `pwsh`（POSIX 是 `bash`） |
 | **hook 跑了但什么都没拦住** | Windows 上多半是用了 `exit 2`，被 PowerShell 折叠成 1（见上文警告）→ 改用 JSON `permissionDecision: deny` + exit 0 |
 | **hook 里"跑了但看不到效果"** | 先排除**观测手段**问题：写文件探针会随会话档位时灵时不灵，用它判定 hook 是否触发容易误判（见[写入边界](#hook-子进程的写入边界)）。改用 `permissionDecision` / `additionalContext` 这类协议出口 |
@@ -411,7 +434,7 @@ node tools/verify.mjs --config "D:\some\project\.dsh\hooks.json"
 
 - **零 import**：本文件由 Loader 以 `file:///...` 绝对路径加载，裸模块说明符（`@deepseek-ai/*`）
   都在 `app.asar` 里，从磁盘路径解析不到。所以协议逻辑（matcher / codec / merge / runner）
-  在 `lib/index.js` 内自包含实现，语义对齐 `@deepseek-ai/dsh-hook-protocol`。
+  在 `src/host/**` 内自包含实现（由 esbuild 构建成单文件 `lib/index.js`），语义对齐 `@deepseek-ai/dsh-hook-protocol`。
 - **零外来品牌字符串**：代码、注释、配置里不使用外部工具的品牌名。环境变量是本插件自己的
   `DSH_PROJECT_DIR` / `DSH_PLUGIN_ROOT`；注入上下文的 `source.kind` 是 `dsh-hooks`。
   唯一沿用外部命名的是 **wire 协议字段**（`hookSpecificOutput` / `permissionDecision` /

@@ -22,10 +22,12 @@ import os from 'node:os'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 
-// 宿主产物：跑真实的 lib/index.js（事件接线 + 配置读取 + 子进程执行）。
+// 宿主产物：跑真实的 lib/index.js（esbuild 从 src/host/** 生成的**产物**）。
 import { apply, inject, name } from '../lib/index.js'
-// 纯协议层：**直接 import TS 源码**（Node ≥22.18 会剥类型），而不是经 lib/index.js 的
-// `internals` 转出来 —— 这样同一批断言直接压在迁移后的实现上，改错了立刻红。
+// 纯协议层：**直接 import TS 源码**（Node ≥22.18 会剥类型），不经过产物 ——
+// 这样纯函数单测压的是源码本身，产物没重新构建也能发现问题。
+// （迁移期曾有一条经 lib/index.js 的 `internals` 做"旧实现 vs TS 实现"差分对拍的区，
+//   `internals` 随 P3b 一起删掉了：产物就是源码，自己和自己对拍没有意义。）
 import {
   blocksToText,
   contextMessage,
@@ -70,6 +72,96 @@ function test(title, fn) {
 
 const tmpRoots = []
 
+//#region E. 构建指纹：产物必须就是当前源码的产物（"过期但全绿"的唯一防线）
+
+// `lib/**` 是**提交进版本库**的产物，所以必须能断言"它没过期"。没有这一区的话，
+// 改完 src/** 忘记 pnpm build，自检会拿着旧产物全绿，而刚修好的 bug 看起来"没修"。
+// 指纹由 tools/build.ts 产出（不带时间戳，可复现），这里重算并逐项比对。
+
+const MANIFEST_PATH = path.join(HERE, '..', 'lib', '.build-manifest.json')
+
+function sha256(text) {
+  return createHash('sha256').update(text).digest('hex')
+}
+
+test('E：lib/.build-manifest.json 存在且结构正确', () => {
+  assert.ok(fs.existsSync(MANIFEST_PATH), '缺少构建指纹：请先跑 pnpm build')
+  const manifest = JSON.parse(fs.readFileSync(MANIFEST_PATH, 'utf8'))
+  assert.ok(
+    typeof manifest.tool === 'string' && manifest.tool.startsWith('esbuild@'),
+    `tool 应当是 esbuild@<version>，实际 ${String(manifest.tool)}`,
+  )
+  const pkg = JSON.parse(fs.readFileSync(path.join(HERE, '..', 'package.json'), 'utf8'))
+  assert.equal(manifest.package, pkg.name, '指纹里的包名应当与 package.json 一致')
+  assert.ok(Array.isArray(manifest.targets) && manifest.targets.length > 0, '至少要有一个构建目标')
+})
+
+test('E：产物 sha256 与指纹一致（产物被手改过就会红）', () => {
+  const manifest = JSON.parse(fs.readFileSync(MANIFEST_PATH, 'utf8'))
+  for (const target of manifest.targets) {
+    const outputPath = path.join(HERE, '..', target.output)
+    assert.ok(fs.existsSync(outputPath), `产物不存在：${String(target.output)}`)
+    assert.equal(
+      sha256(fs.readFileSync(outputPath)),
+      target.outputSha256,
+      `${String(target.output)} 的内容与指纹不符 —— 要么手改了产物，要么忘了 pnpm build`,
+    )
+  }
+})
+
+test('E：指纹覆盖到的每个源文件都没有变（源改而没重建就会红）', () => {
+  const manifest = JSON.parse(fs.readFileSync(MANIFEST_PATH, 'utf8'))
+  let checked = 0
+  for (const target of manifest.targets) {
+    for (const [relPath, expected] of Object.entries(target.inputs)) {
+      const full = path.join(HERE, '..', relPath)
+      assert.ok(fs.existsSync(full), `指纹记录了不存在的源文件：${relPath}`)
+      assert.equal(
+        sha256(fs.readFileSync(full)),
+        expected,
+        `${relPath} 在构建之后被改过 —— 跑 pnpm build 重新生成产物（产物提交进版本库，别漏）`,
+      )
+      checked++
+    }
+  }
+  assert.ok(checked > 0, '指纹里一个源文件都没有？')
+})
+
+test('E：构建脚本自身没变（改了 build.ts 也要重建）', () => {
+  // 没有这一条的话，"产物与源码都对得上、但生成方式已经变了"是唯一抓不到的过期路径。
+  const manifest = JSON.parse(fs.readFileSync(MANIFEST_PATH, 'utf8'))
+  assert.ok(manifest.builder !== null && typeof manifest.builder === 'object', '指纹里应当记录构建脚本（builder）')
+  assert.equal(manifest.builder.path, 'tools/build.ts')
+  assert.equal(
+    sha256(fs.readFileSync(path.join(HERE, '..', manifest.builder.path))),
+    manifest.builder.sha256,
+    'tools/build.ts 在构建之后被改过 —— 跑 pnpm build 重新生成产物',
+  )
+})
+
+test('E：src/** 下没有漏进指纹的文件', () => {
+  const manifest = JSON.parse(fs.readFileSync(MANIFEST_PATH, 'utf8'))
+  const recorded = new Set()
+  for (const target of manifest.targets) {
+    for (const relPath of Object.keys(target.inputs)) recorded.add(relPath)
+  }
+  const walk = (dir) => {
+    const out = []
+    for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+      const full = path.join(dir, entry.name)
+      if (entry.isDirectory()) out.push(...walk(full))
+      else if (entry.isFile()) out.push(path.relative(path.join(HERE, '..'), full).split(path.sep).join('/'))
+    }
+    return out
+  }
+  const srcRoot = path.join(HERE, '..', 'src')
+  const onDisk = fs.existsSync(srcRoot) ? walk(srcRoot) : []
+  const missing = onDisk.filter((relPath) => !recorded.has(relPath))
+  assert.deepEqual(missing, [], `这些源文件没有被任何构建目标覆盖：${missing.join(', ')}`)
+})
+
+//#endregion
+
 //#region 1. 静态检查
 
 test('lib/index.js 零 import / 零 require', () => {
@@ -84,6 +176,28 @@ test('插件导出面正确', () => {
   assert.equal(name, 'dsh-hooks')
   assert.deepEqual(inject, ['shell', 'fs'])
   assert.equal(typeof apply, 'function')
+})
+
+test('产物导出面**恰好**是 apply/inject/name（不留只给自检看的死导出）', () => {
+  // 迁移期产物里曾有一个 `internals` 导出，纯粹为了让自检拿到纯函数。P3b 之后纯函数由自检
+  // 直接 import 源码，那个导出就删了。这条断言防止它（或任何别的死导出）被重新加回来。
+  const source = fs.readFileSync(LIB, 'utf8')
+  const match = source.match(/export \{([^}]*)\}/)
+  assert.ok(match, '产物里应当有且只有一个 export 语句')
+  const exported = match[1]
+    .split(',')
+    .map((item) => item.trim())
+    .filter((item) => item.length > 0)
+    .sort()
+  assert.deepEqual(exported, ['apply', 'inject', 'name'], `产物导出了：${exported.join(', ')}`)
+  assert.ok(!source.includes('internals'), '产物里不该再有迁移期为了自检而加的 internals 导出')
+})
+
+test('产物带"由构建生成、不要手改"的横幅', () => {
+  // 没有横幅的话，下一个人完全可能把产物当源码手改 —— 然后下一次构建静默覆盖他的改动。
+  const source = fs.readFileSync(LIB, 'utf8')
+  assert.ok(source.startsWith('/**'), '产物应当以横幅注释开头')
+  assert.ok(source.includes('由 tools/build.ts 从 src/** 生成'), '产物应当标明自己是由构建生成的')
 })
 
 test('A：format/format:check 的 glob 指向真实存在的目录（空 glob 不再静默）', () => {
@@ -136,7 +250,9 @@ if (configArgIndex !== -1) {
       }
     }
   }
-  console.log(`  跳过的 handler: ${parsed.skipped.length ? parsed.skipped.map((s) => `${s.event}:${s.type}`).join(', ') : '(无)'}`)
+  console.log(
+    `  跳过的 handler: ${parsed.skipped.length ? parsed.skipped.map((s) => `${s.event}:${s.type}`).join(', ') : '(无)'}`,
+  )
   console.log(`  matcher 诊断  : ${parsed.errors.length ? parsed.errors.join('; ') : '(无)'}`)
   process.exit(0)
 }
@@ -182,7 +298,14 @@ test('parseHookConfig：timeout 是秒，缺省时不写', () => {
 test('parseHookConfig：非 command handler 跳过并记录', () => {
   const r = parseHookConfig({
     hooks: {
-      PreToolUse: [{ hooks: [{ type: 'http', url: 'http://x' }, { type: 'command', command: 'a' }] }],
+      PreToolUse: [
+        {
+          hooks: [
+            { type: 'http', url: 'http://x' },
+            { type: 'command', command: 'a' },
+          ],
+        },
+      ],
       Stop: [{ hooks: [{ type: 'prompt', prompt: 'p' }] }],
     },
   })
@@ -243,12 +366,21 @@ test('parseHookConfig：损坏输入不抛', () => {
 })
 
 test('mergeHookGroups：用户级在前、项目级在后，数组拼接', () => {
-  const merged = mergeHookGroups({ PreToolUse: [{ hooks: [{ command: 'user' }] }] }, {
-    PreToolUse: [{ hooks: [{ command: 'project' }] }],
-    Stop: [{ hooks: [{ command: 'stop' }] }],
-  })
-  assert.deepEqual(merged.PreToolUse.map((g) => g.hooks[0].command), ['user', 'project'])
-  assert.deepEqual(merged.Stop.map((g) => g.hooks[0].command), ['stop'])
+  const merged = mergeHookGroups(
+    { PreToolUse: [{ hooks: [{ command: 'user' }] }] },
+    {
+      PreToolUse: [{ hooks: [{ command: 'project' }] }],
+      Stop: [{ hooks: [{ command: 'stop' }] }],
+    },
+  )
+  assert.deepEqual(
+    merged.PreToolUse.map((g) => g.hooks[0].command),
+    ['user', 'project'],
+  )
+  assert.deepEqual(
+    merged.Stop.map((g) => g.hooks[0].command),
+    ['stop'],
+  )
 })
 
 test('codec：exit 2 阻断且 stderr 作理由', () => {
@@ -342,7 +474,10 @@ test('merge：continue:false 粘住首个并带 stopReason', () => {
 })
 
 test('merge：additionalContext 按顺序累积', () => {
-  assert.deepEqual(mergeHookOutputs([{ additionalContext: 'a' }, { additionalContext: 'b' }, {}]).additionalContext, ['a', 'b'])
+  assert.deepEqual(mergeHookOutputs([{ additionalContext: 'a' }, { additionalContext: 'b' }, {}]).additionalContext, [
+    'a',
+    'b',
+  ])
 })
 
 test('helper：路径工具在根上收敛', () => {
@@ -370,163 +505,6 @@ test('helper：contextMessage 形状对齐 createUserMessage', () => {
     { type: 'text', text: 'y' },
   ])
   assert.ok(message.source && typeof message.source.kind === 'string')
-})
-
-//#endregion
-
-//#region 2b. 差分对拍：TS 协议层 ↔ lib/index.js 的 internals（**迁移期专用**）
-//
-// 为什么需要它：2 区的单测只覆盖"想到的那些例子"。迁移期间两份实现同时存在，
-// 用一批更宽的输入对拍，任何一边漂移都会立刻红。
-// **P3b 之后（lib/index.js 变成构建产物、internals 被删除）本区应当整体删除。**
-const { internals } = await import('../lib/index.js')
-
-/** 递归按键排序，使比较只看语义、不看键的书写顺序。 */
-function canon(value) {
-  if (Array.isArray(value)) return value.map(canon)
-  if (value !== null && typeof value === 'object') {
-    const out = {}
-    for (const key of Object.keys(value).sort()) out[key] = canon(value[key])
-    return out
-  }
-  return value
-}
-
-const sameAsLegacy = (label, produce, legacyProduce) => {
-  const next = JSON.stringify(canon(produce()))
-  const legacy = JSON.stringify(canon(legacyProduce()))
-  assert.equal(next, legacy, `${label}：TS 实现与旧实现结果不一致`)
-}
-
-const DIFF_CONFIGS = [
-  { hooks: { PreToolUse: [{ matcher: 'pwsh', hooks: [{ command: 'a' }] }] } },
-  { PreToolUse: [{ hooks: [{ command: 'b', timeout: 30 }] }] },
-  { hooks: { PreToolUse: [{ hooks: [{ type: 'http', command: 'x' }, { command: 'c' }] }] } },
-  { hooks: { PreToolUse: [{ matcher: '(', hooks: [{ command: 'd' }] }] } },
-  { hooks: { Stop: [{ matcher: 'pwsh', hooks: [{ command: 'e' }] }] } },
-  { hooks: { UserPromptSubmit: [{ matcher: 'pwsh', hooks: [{ command: 'f' }] }] } },
-  { hooks: { PreToolUse: [{ hooks: [{ command: '${DSH_PROJECT_DIR}/x' }] }] } },
-  { hooks: { PostToolUse: [{ hooks: [{ command: 'g', timeout: 0 }] }] } },
-  { hooks: null },
-  null,
-  42,
-  [],
-  'text',
-  { hooks: { Notification: [{ hooks: [{ command: 'h' }] }] } },
-]
-
-const DIFF_MATCHERS = [undefined, '', '*', 'pwsh|bash', '^mcp__.*', '(', 'Edit']
-const DIFF_QUERIES = ['pwsh', 'Bash', 'mcp__github__x', 'EditText', '']
-const DIFF_OUTPUTS = [
-  { exitCode: 0, stdout: '{"continue":false,"stopReason":"r"}', stderr: '' },
-  { exitCode: 2, stdout: '', stderr: 'boom' },
-  { exitCode: 2, stdout: '', stderr: '   ' },
-  { exitCode: 0, stdout: 'not json', stderr: '' },
-  { exitCode: 0, stdout: '{"decision":"deny","reason":"only approve|block"}', stderr: '' },
-  {
-    exitCode: 0,
-    stdout: '{"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"ask","permissionDecisionReason":"sure?"}}',
-    stderr: '',
-  },
-  { exitCode: 0, stdout: '{"hookSpecificOutput":{"hookEventName":"PostToolUse","permissionDecision":"deny"}}', stderr: '' },
-  { exitCode: undefined, stdout: undefined, stderr: undefined },
-  { exitCode: 0, stdout: '{"systemMessage":"sys","additionalContext":"ctx"}', stderr: '' },
-]
-
-await test('差分：parseHookConfig 与旧实现逐例一致', () => {
-  for (const raw of DIFF_CONFIGS) {
-    sameAsLegacy(
-      `parseHookConfig(${JSON.stringify(raw)})`,
-      () => parseHookConfig(raw, { projectDir: 'D:/p' }),
-      () => internals.parseHookConfig(raw, { projectDir: 'D:/p' }),
-    )
-  }
-})
-
-await test('差分：matcher 判定与诊断逐例一致', () => {
-  for (const matcher of DIFF_MATCHERS) {
-    sameAsLegacy(
-      `matcherDiagnostic(${JSON.stringify(matcher)})`,
-      () => matcherDiagnostic(matcher),
-      () => internals.matcherDiagnostic(matcher),
-    )
-    for (const query of DIFF_QUERIES) {
-      sameAsLegacy(
-        `matchesMatcher(${JSON.stringify(matcher)}, ${JSON.stringify(query)})`,
-        () => matchesMatcher(matcher, query),
-        () => internals.matchesMatcher(matcher, query),
-      )
-    }
-  }
-})
-
-await test('差分：mergeHookGroups 逐例一致', () => {
-  const user = parseHookConfig({ hooks: { PreToolUse: [{ hooks: [{ command: 'u' }] }] } })
-  const project = parseHookConfig({ hooks: { PreToolUse: [{ hooks: [{ command: 'p' }] }], Stop: [] } })
-  sameAsLegacy(
-    'mergeHookGroups',
-    () => mergeHookGroups(user.groups, project.groups),
-    () => internals.mergeHookGroups(user.groups, project.groups),
-  )
-})
-
-await test('差分：输出解码与合并逐例一致', () => {
-  for (const item of DIFF_OUTPUTS) {
-    for (const expectedEventName of [undefined, 'PreToolUse']) {
-      sameAsLegacy(
-        `parseHookOutput(${String(item.exitCode)}, …, ${String(expectedEventName)})`,
-        () => parseHookOutput(item.exitCode, item.stdout, item.stderr, expectedEventName),
-        () => internals.parseHookOutput(item.exitCode, item.stdout, item.stderr, expectedEventName),
-      )
-    }
-  }
-  const decoded = DIFF_OUTPUTS.map((item) => parseHookOutput(item.exitCode, item.stdout, item.stderr, 'PreToolUse'))
-  // ⚠️ 逐条单元素对拍是**必须的**：如果只对拍整个数组，rank 最高的那一项会掩盖其它分支
-  // （第一版就是这么写的 —— deny 项让 rank=2 的 ask 分支永远走不到，注入漂移都抓不住）。
-  for (let index = 0; index < decoded.length; index++) {
-    const single = decoded[index]
-    sameAsLegacy(
-      `mergeHookOutputs([${String(index)}])`,
-      () => mergeHookOutputs([single]),
-      () => internals.mergeHookOutputs([single]),
-    )
-  }
-  sameAsLegacy(
-    'mergeHookOutputs(all)',
-    () => mergeHookOutputs(decoded),
-    () => internals.mergeHookOutputs(decoded),
-  )
-})
-
-await test('差分：路径与文本 helper 逐例一致', () => {
-  const paths = ['/a/b/c', 'C:\\x\\y\\z', 'C:\\', '/', '/a.txt', 'relative', 'C:\\x\\y\\']
-  for (const p of paths) {
-    sameAsLegacy(`parentOf(${p})`, () => parentOf(p), () => internals.parentOf(p))
-    sameAsLegacy(
-      `joinPath(${p})`,
-      () => joinPath(p, '.dsh', 'hooks.json'),
-      () => internals.joinPath(p, '.dsh', 'hooks.json'),
-    )
-  }
-  for (const content of [undefined, null, 'text', [], [{ type: 'text', text: 'a' }, { type: 'image' }], [{}]]) {
-    sameAsLegacy(
-      `blocksToText(${JSON.stringify(content)})`,
-      () => blocksToText(content),
-      () => internals.blocksToText(content),
-    )
-  }
-  const merged = { decision: 'deny', reason: 'r', stop: false, additionalContext: ['x', 'y'], systemMessages: [] }
-  sameAsLegacy(
-    'contextMessage',
-    () => {
-      const message = contextMessage(merged)
-      return message === undefined ? undefined : { ...message, id: '(id)' }
-    },
-    () => {
-      const message = internals.contextMessage(merged)
-      return message === undefined ? undefined : { ...message, id: '(id)' }
-    },
-  )
 })
 
 //#endregion
@@ -584,7 +562,11 @@ const fakeShell = {
           })
           child.on('error', (error) => {
             clearTimeout(timer)
-            resolve({ exitCode: undefined, stdout: { text: stdout }, stderr: { text: String(error && error.message ? error.message : error) } })
+            resolve({
+              exitCode: undefined,
+              stdout: { text: stdout },
+              stderr: { text: String(error && error.message ? error.message : error) },
+            })
           })
           child.on('close', (code) => {
             clearTimeout(timer)
@@ -606,7 +588,12 @@ const fakeShell = {
 /** 架在**真实文件系统**上的最小 ctx.fs 实现（不含 watch）。 */
 const localFsBase = {
   async resolve(p, opts) {
-    return { targetKey: path.resolve((opts && opts.cwd) || process.cwd(), p), get displayPath() { return this.targetKey } }
+    return {
+      targetKey: path.resolve((opts && opts.cwd) || process.cwd(), p),
+      get displayPath() {
+        return this.targetKey
+      },
+    }
   },
   async stat(target) {
     try {
@@ -792,7 +779,10 @@ await test('集成：exit 2 转成 deny，理由来自 stderr', async () => {
   await writeHooks(dir, { hooks: { PreToolUse: [{ matcher: '*', hooks: [{ command: cmd(s) }] }] } })
   const { agent } = fakeAgent(dir)
   const h = await mount()
-  const decision = await h.listeners.get('tools/pre-execute')[0]({ name: 'pwsh', arguments: {}, callId: 'c', agent }, nextAllow)
+  const decision = await h.listeners.get('tools/pre-execute')[0](
+    { name: 'pwsh', arguments: {}, callId: 'c', agent },
+    nextAllow,
+  )
   assert.equal(decision.kind, 'deny')
   assert.equal(decision.reason, 'dangerous')
 })
@@ -807,7 +797,10 @@ await test('集成：permissionDecision ask 转成审批询问', async () => {
   await writeHooks(dir, { hooks: { PreToolUse: [{ hooks: [{ command: cmd(s) }] }] } })
   const { agent } = fakeAgent(dir)
   const h = await mount()
-  const decision = await h.listeners.get('tools/pre-execute')[0]({ name: 'anything', arguments: {}, callId: 'c', agent }, nextAllow)
+  const decision = await h.listeners.get('tools/pre-execute')[0](
+    { name: 'anything', arguments: {}, callId: 'c', agent },
+    nextAllow,
+  )
   assert.deepEqual(decision, { kind: 'ask', reason: 'sure?' })
 })
 
@@ -833,7 +826,13 @@ await test('集成：UserPromptSubmit 拒绝整条 prompt', async () => {
   const { agent } = fakeAgent(dir)
   const h = await mount()
   const decision = await h.listeners.get('agent/pre-step')[0](
-    { agent, messages: [{ role: 'user', content: [{ type: 'text', text: 'hi' }] }], turn: 1, step: 1, signal: undefined },
+    {
+      agent,
+      messages: [{ role: 'user', content: [{ type: 'text', text: 'hi' }] }],
+      turn: 1,
+      step: 1,
+      signal: undefined,
+    },
     sayNext({ kind: 'enter', messages: [] }),
   )
   assert.deepEqual(decision, { kind: 'reject' })
@@ -850,7 +849,13 @@ await test('集成：additionalContext 被注入成 user 消息', async () => {
   const { agent } = fakeAgent(dir)
   const h = await mount()
   const decision = await h.listeners.get('agent/pre-step')[0](
-    { agent, messages: [{ role: 'user', content: [{ type: 'text', text: 'hi' }] }], turn: 1, step: 1, signal: undefined },
+    {
+      agent,
+      messages: [{ role: 'user', content: [{ type: 'text', text: 'hi' }] }],
+      turn: 1,
+      step: 1,
+      signal: undefined,
+    },
     sayNext({ kind: 'enter', messages: [] }),
   )
   assert.equal(decision.kind, 'enter')
@@ -876,7 +881,11 @@ await test('集成：SessionStart 注入到 agent.inject', async () => {
 
 await test('集成：Stop 阻断会 steer，且连续超过上限后放行', async () => {
   const dir = await makeProject()
-  const s = await script(dir, 'stop.mjs', `process.stdout.write(JSON.stringify({decision:'block',reason:'keep going'}))`)
+  const s = await script(
+    dir,
+    'stop.mjs',
+    `process.stdout.write(JSON.stringify({decision:'block',reason:'keep going'}))`,
+  )
   await writeHooks(dir, { hooks: { Stop: [{ hooks: [{ command: cmd(s) }] }] } })
   const { agent, steered } = fakeAgent(dir)
   const h = await mount()
@@ -904,7 +913,10 @@ await test('集成：项目没有 .dsh/hooks.json 时原样放行且无 warn 噪
   const dir = await makeProject()
   const { agent } = fakeAgent(dir)
   const h = await mount()
-  const decision = await h.listeners.get('tools/pre-execute')[0]({ name: 'pwsh', arguments: {}, callId: 'c', agent }, nextAllow)
+  const decision = await h.listeners.get('tools/pre-execute')[0](
+    { name: 'pwsh', arguments: {}, callId: 'c', agent },
+    nextAllow,
+  )
   assert.deepEqual(decision, { kind: 'allow' })
   assert.equal(h.logs.filter((entry) => entry.level === 'warn').length, 0)
 })
@@ -915,7 +927,10 @@ await test('集成：projectRoot 是最近的含 .git 祖先，子目录会话�
   await writeHooks(dir, { hooks: { PreToolUse: [{ hooks: [{ command: cmd(s) }] }] } })
   const { agent } = fakeAgent(path.join(dir, 'packages', 'app', 'src'))
   const h = await mount()
-  const decision = await h.listeners.get('tools/pre-execute')[0]({ name: 'any', arguments: {}, callId: 'c', agent }, nextAllow)
+  const decision = await h.listeners.get('tools/pre-execute')[0](
+    { name: 'any', arguments: {}, callId: 'c', agent },
+    nextAllow,
+  )
   assert.equal(decision.kind, 'deny')
   assert.equal(decision.reason, 'from project root')
 })
@@ -925,7 +940,10 @@ await test('集成：hook 命令不存在时非阻断', async () => {
   await writeHooks(dir, { hooks: { PreToolUse: [{ hooks: [{ command: 'definitely-not-a-real-command-xyz-123' }] }] } })
   const { agent } = fakeAgent(dir)
   const h = await mount()
-  const decision = await h.listeners.get('tools/pre-execute')[0]({ name: 'any', arguments: {}, callId: 'c', agent }, nextAllow)
+  const decision = await h.listeners.get('tools/pre-execute')[0](
+    { name: 'any', arguments: {}, callId: 'c', agent },
+    nextAllow,
+  )
   assert.deepEqual(decision, { kind: 'allow' })
 })
 
@@ -936,7 +954,10 @@ await test('集成：hook 超时是非阻断且快速返回', async () => {
   const { agent } = fakeAgent(dir)
   const h = await mount()
   const started = Date.now()
-  const decision = await h.listeners.get('tools/pre-execute')[0]({ name: 'any', arguments: {}, callId: 'c', agent }, nextAllow)
+  const decision = await h.listeners.get('tools/pre-execute')[0](
+    { name: 'any', arguments: {}, callId: 'c', agent },
+    nextAllow,
+  )
   assert.deepEqual(decision, { kind: 'allow' })
   assert.ok(Date.now() - started < 20000, '超时应当很快返回')
 })
@@ -987,7 +1008,10 @@ await test('集成：用户级 $DSH_HOME/hooks.json 与项目级同时生效（�
 
     const { agent } = fakeAgent(dir)
     const h = await mount()
-    const decision = await h.listeners.get('tools/pre-execute')[0]({ name: 'any', arguments: {}, callId: 'c', agent }, nextAllow)
+    const decision = await h.listeners.get('tools/pre-execute')[0](
+      { name: 'any', arguments: {}, callId: 'c', agent },
+      nextAllow,
+    )
     assert.equal(decision.kind, 'deny')
     assert.equal(decision.reason, 'user\n\nproject', '同档理由应全部拼接，用户级在前')
   } finally {
@@ -1019,7 +1043,10 @@ await test('集成：hooks.json 带 UTF-8 BOM 也能读到（PowerShell 写文�
   )
   const { agent } = fakeAgent(dir)
   const h = await mount()
-  const decision = await h.listeners.get('tools/pre-execute')[0]({ name: 'any', arguments: {}, callId: 'c', agent }, nextAllow)
+  const decision = await h.listeners.get('tools/pre-execute')[0](
+    { name: 'any', arguments: {}, callId: 'c', agent },
+    nextAllow,
+  )
   assert.deepEqual(decision, { kind: 'deny', reason: 'bom ok' })
 })
 
@@ -1102,7 +1129,10 @@ await test('集成：ctx.fs 不提供 watch() 时 hook 仍工作，且每条路�
     const watchWarns = () => h.logs.filter((e) => e.level === 'warn' && /不提供 watch/.test(e.message))
     assert.equal(watchWarns().length, 3, '三条监听路径各应有一条 warn（不是每个 hook 事件一条）')
     for (const p of [path.join(dir, '.dsh'), path.join(dir, '.dsh', 'hooks.json'), path.join(home, 'hooks.json')]) {
-      assert.ok(watchWarns().some((e) => e.message.includes(p)), `warn 文案里应带路径：${p}`)
+      assert.ok(
+        watchWarns().some((e) => e.message.includes(p)),
+        `warn 文案里应带路径：${p}`,
+      )
     }
 
     // 继续触发，并跨过一次正结果 TTL 到期：都不应重复告警。
@@ -1457,7 +1487,10 @@ await test('集成：hook 子进程按**调用会话**的沙箱策略跑（否�
     },
   }
   const h = await mount({ sandboxPolicy })
-  const decision = await h.listeners.get('tools/pre-execute')[0]({ name: 'any', arguments: {}, callId: 'c', agent }, nextAllow)
+  const decision = await h.listeners.get('tools/pre-execute')[0](
+    { name: 'any', arguments: {}, callId: 'c', agent },
+    nextAllow,
+  )
 
   assert.equal(decision.kind, 'deny', '透传策略不能影响 hook 判定')
   assert.equal(resolved.length, 1, '每个 hook 事件只解析一次策略')
@@ -1490,7 +1523,10 @@ await test('集成：拿不到 sandboxPolicy 服务时省略该字段（回退�
   await writeHooks(dir, { hooks: { PreToolUse: [{ hooks: [{ command: cmd(s) }] }] } })
   const { agent } = fakeAgent(dir)
   const h = await mount() // 不提供 sandboxPolicy 服务
-  const decision = await h.listeners.get('tools/pre-execute')[0]({ name: 'any', arguments: {}, callId: 'c', agent }, nextAllow)
+  const decision = await h.listeners.get('tools/pre-execute')[0](
+    { name: 'any', arguments: {}, callId: 'c', agent },
+    nextAllow,
+  )
   assert.equal(decision.kind, 'deny')
   assert.equal(decision.reason, 'no policy')
   assert.ok(!('sandboxPolicy' in lastShellRequest()), '拿不到策略时不应传该字段')
@@ -1507,7 +1543,10 @@ await test('集成：sandboxPolicy.resolve 抛错时非阻断、回退部署策�
     },
   }
   const h = await mount({ sandboxPolicy })
-  const decision = await h.listeners.get('tools/pre-execute')[0]({ name: 'any', arguments: {}, callId: 'c', agent }, nextAllow)
+  const decision = await h.listeners.get('tools/pre-execute')[0](
+    { name: 'any', arguments: {}, callId: 'c', agent },
+    nextAllow,
+  )
   assert.equal(decision.kind, 'deny', '策略解析失败不能拖垮 hook')
   assert.equal(decision.reason, 'policy error fallback')
   assert.ok(!('sandboxPolicy' in lastShellRequest()))
@@ -1526,7 +1565,13 @@ await test('集成：SubagentStart 的 hook 也按子会话的策略跑', async 
     inject() {},
     steer() {},
   }
-  const sandboxPolicy = { resolve: (request) => ({ mode: 'danger-full-access', workspaceRoot: dir, byChild: request.session === child.session }) }
+  const sandboxPolicy = {
+    resolve: (request) => ({
+      mode: 'danger-full-access',
+      workspaceRoot: dir,
+      byChild: request.session === child.session,
+    }),
+  }
   const h = await mount({ sandboxPolicy })
   h.agents.set('child-1', child)
   h.listeners.get('subagent/start')[0]({ id: 'child-1', runId: 'run-1' })

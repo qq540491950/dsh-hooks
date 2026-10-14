@@ -17,8 +17,8 @@
     "lint": "eslint .",
     "format": "prettier --write --no-error-on-unmatched-pattern \"src/**/*.{ts,tsx}\" \"tools/**/*.ts\" \"*.{json,js,mjs}\"",
     "format:check": "prettier --check --no-error-on-unmatched-pattern \"src/**/*.{ts,tsx}\" \"tools/**/*.ts\" \"*.{json,js,mjs}\"",
-    "verify": "node tools/verify.mjs",
-    "check": "pnpm format:check && pnpm lint && pnpm verify"
+    "verify": "node tools/verify.ts",
+    "check": "pnpm typecheck && pnpm typecheck:tools && pnpm format:check && pnpm lint && pnpm verify"
   },
   "engines": {
     "node": ">=22.18",

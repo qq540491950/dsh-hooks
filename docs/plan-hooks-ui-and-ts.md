@@ -486,6 +486,17 @@ window.__ModuleLoader__.load({
 - 关闭 P2 债务：新增断言"A：format/format:check 的 glob 指向真实存在的目录"。
 - **本阶段未做（留给 P3b）**：宿主体仍手写在 `lib/index.js`；`internals` 这个只为自检存在的导出还不能删（差分对拍要靠它）；`tools/build.ts` 未落地；自检仍是 `tools/verify.mjs`。
 
+### P3b —— 完成（本次提交）：宿主体搬 TS + 构建产物 + 自检迁移
+
+- 产出：`src/host/service-types.ts`（本地最小 Service 契约）、`src/host/index.ts`（宿主体，逐行保语义）、`tools/build.ts`（esbuild 宿主目标 + 指纹）、`lib/index.js`（**首次成为构建产物**）、`lib/.build-manifest.json`、`tools/verify.ts`（`git mv` 自 `verify.mjs`）。
+- 自检：**74 → 73 条**（删掉了迁移期专用的 `2b 差分对拍` 区共 5 条 —— 那是**有意减少**，不是丢断言：产物就是源码，自己和自己对拍没有意义），其余全部保留并照旧全绿。另新增 `E` 区 4 条构建指纹断言，净变化见提交说明。
+- **行为等价性用自检本身证明**：迁移过程中自检抓到**一处真实回归** —— 我一开始把沙箱策略对象**重建**成 `{mode, workspaceRoot, sessionId}`，而原实现是**原样透传** provider 给的对象；`assert.deepStrictEqual` 区分"键存在但为 undefined"与"没有这个键"，于是 3c 区两条断言当场红。改回原样透传（`ResolvedPolicy.passthrough`）后恢复。**这是"看代码觉得等价"和"证明等价"的区别。**
+- 新增 `E` 区（构建指纹，AGENTS §4.8 的两把锁之一）：产物 sha256 ↔ 指纹、每个源文件 sha256 ↔ 指纹、`src/**` 无漏网文件。反向验证：① 改 `src/**` 不重建 → `E：指纹覆盖到的每个源文件都没有变` 精确报错；② 手改产物 → `E：产物 sha256 与指纹一致` 精确报错；两次还原后字节相同、73/73。
+- 三处**故意不听 lint** 的地方（都写了理由）：`@typescript-eslint/return-await` 要求把 try 里的 `return next()` 改成 `return await next()`，而那会把下游的 rejection 吸进本函数的 catch，catch 里又会**再调一次** `next()` → 下游跑两遍。改成"不满足条件就落到 try 之外的 `return next()`"，语义与手写版逐字一致且不再需要 lint 例外。
+- 其他决策：`FakeReact`/指纹无关；`pnpm check` 已接上 `typecheck && typecheck:tools`（P2 的欠账）；`tools/verify.ts` 走 Node 类型剥离运行，它的类型收紧进度单独用 `tsconfig.tools.wip.json` 量（当前 155 条，**只许下降**，不进门槛）。
+- 文档：AGENTS §0 判据改为"看 `lib/.build-manifest.json`"、§4.8 从"迁移期纪律"改写成"产物纪律"、§2.9/§5 的 `verify.mjs` 引用改为 `.ts`；README 新增「源码与构建」小节、把"两条失效通道"改成**三层**（版本核对 / watcher / TTL）。
+- **未实测（需要重启 DSH）**：产物在真实 host 里加载（profile 路径行指向的仍是旧模块实例）。
+
 ### 下一步
 
-**P3b**：把宿主体搬进 `src/host/**` + 落地 `tools/build.ts`，让 `lib/index.js` 变成产物（届时删掉 `internals` 与 `2b 差分对拍` 区、`verify.mjs` → `verify.ts`）。**P5 才需要第一次重启**（客户端半边首次发布），宿主侧的在线验收可以在那时合并做一次。
+**P4**：宿主数据面 —— `GET/POST /api/hooks`（`scope.connection.fetch.register`）、定点写（`writeText` + 版本锁 + 深比较保留未知键）、有界执行台账、试运行复用 `runPoint`。**P5 才需要第一次重启**（客户端半边首次发布），宿主侧的在线验收在那时合并做一次。

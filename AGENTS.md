@@ -28,7 +28,7 @@
 | 宿主 | `src/host/**` | `lib/index.js` | **零 import**；读两个 hooks.json + `ctx.fs.watch` 热重载 + 跑 hook 子进程；并将开 `/api/hooks` 给设置页用 |
 | 客户端 | `src/client/**` | `lib/client.js` | 设置页「Hooks」（`settings.section`，list 座位，`order: 920`） |
 
-**唯一必跑**：`node tools/verify.ts`（迁移前为 `node tools/verify.mjs`），期望 `PASS n/n`。**别把条数抄死**——条数看输出，台账是 `//#region` + 实际输出。
+**唯一必跑**：`node tools/verify.ts`，期望 `PASS n/n`。**别把条数抄死**——条数看输出，台账是 `//#region` + 实际输出。
 
 **座位台账（活台账，`cordis_inspect_query` client `Slots.listSubTree` root=`settings.section`）**：
 `account/-10`、`general/0`、`models/10`、`plugins/15`、`agent-presets/20`、`mcp/900`（本地 `dsh-mcp-manager`）、`skills/910`（本地 `dsh-skill-manager`）、**`hooks/920`（本插件）**。
@@ -76,9 +76,9 @@
 
 **2.9 [边界][硬] 「读不到」≠「没有」——三态语义，已修一半。**
 读取配置有三态：`absent`（ENOENT，合法的空配置）/ `ok`（解析成功 + 刷新 last-good）/ `error`（读到了但 JSON 非法、顶层不是对象、或 IO 失败）。
-- **C1 已实现（v0.2.1）**：`error` 时**继续沿用最近一次成功解析的配置**；同一条错误只 warn 一次（成功读取后计数重置）；每次沿用打一条限流 info。对应断言在 `tools/verify.mjs` 的 `fail-open` 区（4 条），并做过反向验证（把 `stale` 打回 `false` → 3 条精确报错）。**删除文件仍然是合法的清空**，不许 fail-safe 回旧配置。
+- **C1 已实现（v0.2.1）**：`error` 时**继续沿用最近一次成功解析的配置**；同一条错误只 warn 一次（成功读取后计数重置）；每次沿用打一条限流 info。对应断言在 `tools/verify.ts` 的 `fail-open` 区，并做过反向验证（把 `stale` 打回 `false` → 3 条精确报错）。**删除文件仍然是合法的清空**，不许 fail-safe 回旧配置。
 - 修之前的形态是危险的 fail-open：`error` 被折叠成"没有配置"，写坏一个字符就让**全部** hook（含 deny 守卫）静默消失，而且一直消失。历史取证见 `.tmp/hotreload-fix-plan.md`。
-- **C2 已实现（v0.2.1）**：用 `ctx.fs.stat()` 的 `version`（`dev:ino:size:mtimeNs:ctimeNs`）做**失效主通道** —— 版本没变就复用缓存（连 TTL 都不等），变了就立刻重读；watcher 是加速器，**TTL 降为"provider 不返回 version / stat 抛错"时的兜底**。`configFor` 每次事件点先核对版本（2 次 stat），`loadConfig` 才真正读。断言在 `tools/verify.mjs` 的 `C2` 区（3 条），并做过**双向**反向验证（关掉版本通道 → 2 条报错；把"内容变了"看成"没变" → 1 条报错）。
+- **C2 已实现（v0.2.1）**：用 `ctx.fs.stat()` 的 `version`（`dev:ino:size:mtimeNs:ctimeNs`）做**失效主通道** —— 版本没变就复用缓存（连 TTL 都不等），变了就立刻重读；watcher 是加速器，**TTL 降为"provider 不返回 version / stat 抛错"时的兜底**。`configFor` 每次事件点先核对版本（2 次 stat），`loadConfig` 才真正读。断言在 `tools/verify.ts` 的 `C2` 区，并做过**双向**反向验证（关掉版本通道 → 2 条报错；把"内容变了"看成"没变" → 1 条报错）。
   代价与边界：每次事件点多 2 次 `stat`（Windows ~10–100µs）；假 `ctx.fs` **默认不返回 `version`**（于是默认覆盖"没有版本通道"那一支），需要版本的项目必须显式 `makeFs({version: true})`；`stat` 失败**绝不允许**清掉 last-good。
 - **C3 未实现**：可观测性（payload 里加 `dsh_hooks: {config_path, config_version, loaded_at, reload_reason, last_error}`；可选旁路 journal）。宿主 logger 没有可发现的落盘位置（§6），所以这条对排查很重要。
 - **任何写入路径落地之前必须先有 C1**（已满足）**且 C2 落地**（UI 会让人更频繁地改这个文件）。
@@ -130,16 +130,17 @@
 
 **4.7 不要为了让断言通过而放宽断言。** 先判断是断言过严还是改动错了；改断言要说明理由并保留原有防护意图。**改断言之后要重新做反向验证**——锚点会随重构过期。
 
-**4.8 [硬] 迁移期纪律（`src/**` 与 `lib/**` 并存时）。**
-- 同一次提交里**不同时**手改 `lib/**` 和 `src/**`：`lib/**` 只能由 `pnpm build` 产出。
+**4.8 [硬] 产物纪律（`src/**` 是源码，`lib/**` 是产物且**要提交**）。**
+- `lib/**` **只能**由 `pnpm build` 产出。手改产物等于下次构建被静默覆盖，而且指纹立刻对不上（自检 `E` 区当场红）。
+- 改了 `src/**` **必须重建**：先 `pnpm build`，再 `node tools/verify.ts`。忘重建会得到 `E：指纹覆盖到的每个源文件都没有变` 这条精确报错。
+- 两把锁：① `lib/.build-manifest.json` 指纹（每个源文件 + 产物的 sha256，自检 `E` 区逐项重算）；② 提交前 `git diff --exit-code lib/`（构建必须幂等——`tools/build.ts` 刻意不写时间戳）。
 - 每个阶段结束必须：`node tools/verify.ts` PASS（条数**不减少**）+ 无 BOM / 无 `U+FFFD` / LF。
-- **任何中间态都必须能被现有 profile 行加载**：`lib/index.js` 必须始终是可用的产物（先建 `src/host/index.ts` 并让构建输出与手写版行为一致，再删手写逻辑）。
-- 产物提交进版本库（`lib/**` 在 `.gitignore` 之外），并用两把锁守住：`lib/.build-manifest.json` 指纹 + `git diff --exit-code lib/`。
+- **任何中间态都必须是一个能被现有 profile 行加载的模块**：`lib/index.js` 就是 profile 里那条 `file://` 路径指向的文件，它不能"暂时坏着"。
 
 ## 5. 常用命令
 
 - **自检**：`node tools/verify.ts`（唯一必跑）。
-- **体检一份真实配置**（不跑测试）：`node tools/verify.ts --config "<path>/.dsh/hooks.json"`（迁移前 `verify.mjs`）—— 列出识别到的事件、每个 group 的 matcher/timeout、被跳过的非 command handler、matcher 诊断。**写完配置先跑这个**，比等重启看日志快。
+- **体检一份真实配置**（不跑测试）：`node tools/verify.ts --config "<path>/.dsh/hooks.json"` —— 列出识别到的事件、每个 group 的 matcher/timeout、被跳过的非 command handler、matcher 诊断。**写完配置先跑这个**，比等重启看日志快。
 - **座位台账**：`cordis_inspect_query`（platform: client, provider: Slots, method: listSubTree, input `{"root":"settings.section"}`）。
 - **本插件 Loader 条目 / Service 契约**：`cordis_inspect_query`（host, provider: Service, method: listService，`input {"service":"fs"}` 这样只取一个服务的精确契约）比读源码快；条目 id 是 `include:dsh-hooks`。
 - **官方源码 / CSS / 契约**：源码在 `<安装目录>\resources\app.asar`（**是文件不是目录**）。`read` / glob / shell / `node` 都穿不过 asar 虚拟路径，要用**只读探针**（`.tmp/asar.mjs`：解析 asar 头按 offset 取文件；`list <regex>` / `cat <path>` / `top`）。**判据权威顺序**：本机安装的 DSH 源码 ＞ asar 内官方 README/practices ＞ 同目录成熟兄弟插件 ＞ 二手资料。

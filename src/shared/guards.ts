@@ -10,6 +10,16 @@ export function isObject(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value)
 }
 
+/**
+ * 数组判定，但**结果是 `unknown[]` 而不是 `any[]`**。
+ *
+ * 直接写 `Array.isArray(x)` 会让 TS 把 `unknown` 收窄成 `any[]`，于是后续所有元素访问
+ * 都变成 `any`，触发 strictTypeChecked 的 `no-unsafe-*`。用类型谓词把它挡在门外。
+ */
+export function isUnknownArray(value: unknown): value is unknown[] {
+  return Array.isArray(value)
+}
+
 /** 从对象里读一个字符串字段；不是字符串就返回 undefined。 */
 export function strField(obj: Record<string, unknown>, key: string): string | undefined {
   const value = obj[key]
