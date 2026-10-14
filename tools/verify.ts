@@ -233,6 +233,8 @@ function createFakeReact() {
     out.push({
       className: typeof props.className === 'string' ? props.className : '',
       title: typeof props.title === 'string' ? props.title : '',
+      // `onClick` 要留着：渲染测试得能**真的点**它（§4.5：事件闭包是当次渲染的，点了要重新渲染再看）。
+      onClick: typeof props.onClick === 'function' ? props.onClick : undefined,
     })
     flatten(node.children, out)
     return out
@@ -403,6 +405,135 @@ await test('D：真实渲染 —— 取数失败时主文案是人话，技术�
     texts.some((text) => text.includes('FsError: cannot list')),
     '技术原文只能作为补充出现在下面（排查要用得上）',
   )
+})
+
+/** 造一份最小可用快照：项目级 1 条 hook + 用户级空（两份都是 `ok`，所以只有一个写入按钮）。 */
+function minimalSnapshot() {
+  const emptyEvents = HOOK_EVENTS.map((event) => ({ event, groups: [], hookCount: 0, disabledCount: 0, runCount: 0 }))
+  return {
+    route: '/api/hooks',
+    projectRoot: 'D:/p',
+    cwd: 'D:/p',
+    cwdSource: 'session',
+    files: [
+      {
+        kind: 'project',
+        path: 'D:/p/.dsh/hooks.json',
+        state: 'ok',
+        message: null,
+        version: 'v1',
+        hookCount: 1,
+        skipped: [],
+        matcherErrors: [],
+        events: HOOK_EVENTS.map((event) => ({
+          event,
+          groups:
+            event === 'PreToolUse'
+              ? [
+                  {
+                    file: 'project',
+                    rawIndex: 0,
+                    matcher: 'pwsh',
+                    matcherOk: true,
+                    matcherProblem: null,
+                    hooks: [
+                      {
+                        rawIndex: 0,
+                        command: 'echo a',
+                        timeoutSec: null,
+                        defaultTimeoutSec: 600,
+                        disabled: false,
+                        lastRun: null,
+                      },
+                    ],
+                  },
+                ]
+              : [],
+          hookCount: event === 'PreToolUse' ? 1 : 0,
+          disabledCount: 0,
+          runCount: 0,
+        })),
+      },
+      {
+        kind: 'user',
+        path: 'C:/u/.dsh/hooks.json',
+        state: 'ok',
+        message: null,
+        version: 'v1',
+        hookCount: 0,
+        skipped: [],
+        matcherErrors: [],
+        events: emptyEvents,
+      },
+    ],
+    events: [],
+    total: { hookCount: 1, disabledCount: 0, groupCount: 1 },
+    staleInUse: false,
+    capabilities: { writable: true },
+  }
+}
+
+/** 取写入按钮（可写时每条 hook 一个；"新建文件"按钮的 className 相同，所以按数量断言）。 */
+function writeButtons(nodes) {
+  return nodes.filter((node) => typeof node.className === 'string' && node.className.includes('dsh-hooks__btn'))
+}
+
+await test('D：点"停用"发的是定点写请求（file + 原始下标 + 目标值）', async () => {
+  const harness = createFakeReact()
+  const component = componentFromArtifact(harness.React)
+  const nodes = await renderSection(component, harness, { ok: true, data: minimalSnapshot() })
+  const buttons = writeButtons(nodes)
+  assert.equal(buttons.length, 1, '可写时每条 hook 一个启停按钮（这里只有一条 hook）')
+  assert.equal(typeof buttons[0].onClick, 'function', '按钮必须真的带 onClick')
+
+  const calls = []
+  globalThis.fetch = async (_url: string, options: { method?: string; body?: string } = {}) => {
+    const method = options.method ?? 'GET'
+    calls.push({ method, body: typeof options.body === 'string' ? JSON.parse(options.body) : null })
+    return {
+      json: async () =>
+        method === 'POST'
+          ? { ok: true, data: { file: 'project', version: 'v2' } }
+          : { ok: true, data: minimalSnapshot() },
+    }
+  }
+  buttons[0].onClick()
+  await new Promise((resolve) => setTimeout(resolve, 0))
+  await new Promise((resolve) => setTimeout(resolve, 0))
+
+  assert.equal(calls[0].method, 'POST', '停用是一次写请求，不是又一次取数')
+  assert.deepEqual(
+    calls[0].body,
+    { file: 'project', op: 'setHookDisabled', event: 'PreToolUse', groupIndex: 0, hookIndex: 0, disabled: true },
+    '请求体只能是定点操作（绝不回传整份文件），且下标必须是**文件里的**下标',
+  )
+})
+
+await test('D：写失败按错误码分别说清，且只渲染在页面级通道（§3.7/§3.9）', async () => {
+  const harness = createFakeReact()
+  const component = componentFromArtifact(harness.React)
+  const nodes = await renderSection(component, harness, { ok: true, data: minimalSnapshot() })
+  const button = writeButtons(nodes)[0]
+
+  globalThis.fetch = async () => ({
+    json: async () => ({ ok: false, error: 'stale', detail: 'FS_STALE_VERSION: 期望 v1' }),
+  })
+  button.onClick()
+  await new Promise((resolve) => setTimeout(resolve, 0))
+  await new Promise((resolve) => setTimeout(resolve, 0))
+
+  // 状态变更后**重新渲染再看**（§4.5：事件闭包是当次渲染的，别拿旧节点判断）。
+  harness.begin()
+  const after = harness.flatten(component())
+  const joined = after
+    .filter((node) => node.text !== undefined)
+    .map((node) => node.text)
+    .join('')
+  assert.ok(joined.includes('刚被别处改过了'), 'stale 必须说"该刷新"，而不是含混的"保存失败"')
+  assert.ok(joined.includes('FS_STALE_VERSION'), '技术原文只作补充（排查要用得上），不是主文案')
+  assert.ok(joined.includes('生效 1 条'), '失败**不**清空已有内容 —— 用户要对着旧内容决定下一步')
+  const banners = after.filter((node) => typeof node.className === 'string' && node.className.includes('banner--error'))
+  assert.equal(banners.length, 1, '一条错误只允许一个渲染点（§3.7）')
 })
 
 //#endregion

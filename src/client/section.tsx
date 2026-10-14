@@ -1,13 +1,14 @@
 /**
- * 设置页「Hooks」（只读看板，P5a）。
+ * 设置页「Hooks」。
  *
  * ## 它显示什么、由谁决定
  * 全部内容来自宿主 `GET /api/hooks`（AGENTS §2.6：**页面不许自己解析 `hooks.json`**，
  * 那些分组、条数、matcher 诊断、来源都是宿主用同一个 `parseHookConfig` 算出来的）。
- * 这一版是**只读**：写入控件在 P6 落地，届时复用同一份快照与同一套错误码。
+ * 写入只发**定点操作**（§2.3），宿主读→改→写并带版本锁（页面看到的版本就是锁的版本）。
  *
- * ## 三条 UI 纪律在这里的体现
- *   - §3.6：**7 个事件永远全列**（含 0 条），两个来源也永远都列 —— "空"和"不存在"必须长得不一样；
+ * ## UI 纪律在这里的体现
+ *   - §3.6：**7 个事件永远全列**（含 0 条），两个来源也永远都列 ——"空"和"不存在"必须长得不一样；
+ *   - §3.7：**一条错误只允许一个渲染点** —— 行内操作（启停 / 新建）的失败写进**页面级**通道；
  *   - §3.8：每行的颜色**只**来自执行台账（`lastRun`）与 `disabled`；没有记录就是灰"未运行"；
  *   - §3.9：文件不存在 / JSON 非法 / 沙箱拒绝 / matcher 非法**分别说清**，且不把内部错误原文当主文案。
  */
@@ -16,19 +17,22 @@ import { Fragment, h, useEffect, useState } from './react.ts'
 import type { Jsx } from './react.ts'
 import { HOOKS_ROUTE } from '../shared/constants.ts'
 import { styles } from './styles.ts'
+import { requestWrite, writeErrorSentence, type WriteIntent } from './write.ts'
 import type { FileEventView, FileView, GroupView, HooksResponse, HooksSnapshot, HookView } from './wire.ts'
 
 /**
  * 请求超时预算。
  *
  * 没有它的话，宿主一旦卡住 `fetch` 永不 settle，页面会永远停在"读取中…"，用户只能刷新整页。
- * 这一条是抄 `dsh-skill-manager` 的教训（它的注释里记着同类问题）。
  */
 const REQUEST_TIMEOUT_MS = 10_000
 
 /** 页面状态：三种，互斥；**不做"猜测式"降级**。 */
 type Phase =
   { kind: 'loading' } | { kind: 'ready'; snapshot: HooksSnapshot } | { kind: 'failed'; code: string; detail: string }
+
+/** 行内操作的失败（**页面级**通道，§3.7）。 */
+type Banner = { code: string; detail: string }
 
 /** 机器错误码 → 人话。**技术原文只进 detail**，主文案用自己的话（AGENTS §3.9）。 */
 function sentenceFor(code: string): string {
@@ -69,8 +73,20 @@ function statusOf(hook: HookView): { className: string; label: string } {
   return { className: 'dsh-hooks__dot dsh-hooks__dot--warn', label: `失败 · ${where}` }
 }
 
+/** 行内操作的回调：行组件自己不知道怎么写，由最外层统一发请求并处理错误。 */
+type Toggle = (file: FileView, event: string, groupRawIndex: number, hook: HookView) => void
+
 /** 一条 hook。 */
-function HookRow({ hook }: { hook: HookView }): Jsx {
+function HookRow(props: {
+  hook: HookView
+  file: FileView
+  event: string
+  groupRawIndex: number
+  writable: boolean
+  busy: boolean
+  onToggle: Toggle
+}): Jsx {
+  const { hook, file, event, groupRawIndex, writable, busy, onToggle } = props
   const status = statusOf(hook)
   const run = hook.lastRun
   const title = run === null ? status.label : `${status.label}\n${run.stderr || run.stdout || '(无输出)'}`
@@ -84,12 +100,34 @@ function HookRow({ hook }: { hook: HookView }): Jsx {
       <span className="dsh-hooks__meta" title="超时（未写则为默认值）">
         {hook.timeoutSec === null ? `${String(hook.defaultTimeoutSec)}s 默认` : `${String(hook.timeoutSec)}s`}
       </span>
+      {writable ? (
+        <span className="dsh-hooks__actions">
+          <button
+            type="button"
+            className="dsh-hooks__btn"
+            disabled={busy}
+            onClick={() => {
+              onToggle(file, event, groupRawIndex, hook)
+            }}
+          >
+            {hook.disabled ? '启用' : '停用'}
+          </button>
+        </span>
+      ) : null}
     </div>
   )
 }
 
 /** 一个 group（matcher 属于 group，command/timeout 属于 hook）。 */
-function GroupBlock({ group }: { group: GroupView }): Jsx {
+function GroupBlock(props: {
+  group: GroupView
+  file: FileView
+  event: string
+  writable: boolean
+  busy: boolean
+  onToggle: Toggle
+}): Jsx {
+  const { group, file, event, writable, busy, onToggle } = props
   return (
     <div className="dsh-hooks__groups">
       <div className="dsh-hooks__matcher">
@@ -97,7 +135,16 @@ function GroupBlock({ group }: { group: GroupView }): Jsx {
         {group.matcherOk ? null : <span className="dsh-hooks__tag">matcher 非法，这一组不会运行</span>}
       </div>
       {group.hooks.map((hook) => (
-        <HookRow key={`${String(group.rawIndex)}:${String(hook.rawIndex)}`} hook={hook} />
+        <HookRow
+          key={`${String(group.rawIndex)}:${String(hook.rawIndex)}`}
+          hook={hook}
+          file={file}
+          event={event}
+          groupRawIndex={group.rawIndex}
+          writable={writable}
+          busy={busy}
+          onToggle={onToggle}
+        />
       ))}
     </div>
   )
@@ -123,13 +170,34 @@ function EventRow({ view }: { view: FileEventView }): Jsx {
 }
 
 /** 一个来源（项目级 / 用户级）：**永远都列**，含"文件不存在"和"读不出来"（§3.6/§3.9）。 */
-function SourceCard({ file }: { file: FileView }): Jsx {
+function SourceCard(props: {
+  file: FileView
+  writable: boolean
+  busy: boolean
+  onToggle: Toggle
+  onCreate: (file: FileView) => void
+}): Jsx {
+  const { file, writable, busy, onToggle, onCreate } = props
   return (
     <div className="dsh-hooks__card">
       <div className="dsh-hooks__cardhead">
         <strong>{file.kind === 'project' ? '项目级' : '用户级'}</strong>
         <span className="dsh-hooks__path">{file.path}</span>
         <span className="dsh-hooks__count">{String(file.hookCount)} 条</span>
+        {writable && file.state === 'absent' ? (
+          <span className="dsh-hooks__actions">
+            <button
+              type="button"
+              className="dsh-hooks__btn"
+              disabled={busy}
+              onClick={() => {
+                onCreate(file)
+              }}
+            >
+              新建这个文件
+            </button>
+          </span>
+        ) : null}
       </div>
       <div className="dsh-hooks__muted">{fileStateText(file)}</div>
       {file.matcherErrors.length > 0 ? (
@@ -147,7 +215,15 @@ function SourceCard({ file }: { file: FileView }): Jsx {
           <Fragment key={view.event}>
             <EventRow view={view} />
             {view.groups.map((group) => (
-              <GroupBlock key={String(group.rawIndex)} group={group} />
+              <GroupBlock
+                key={String(group.rawIndex)}
+                group={group}
+                file={file}
+                event={view.event}
+                writable={writable}
+                busy={busy}
+                onToggle={onToggle}
+              />
             ))}
           </Fragment>
         ))}
@@ -159,6 +235,10 @@ function SourceCard({ file }: { file: FileView }): Jsx {
 /** 设置页「Hooks」的整节内容。 */
 export function HooksSection(): Jsx {
   const [phase, setPhase] = useState<Phase>({ kind: 'loading' })
+  const [banner, setBanner] = useState<Banner | null>(null)
+  const [busy, setBusy] = useState(false)
+  /** 写成功后 +1 → 重新取数，保证页面显示的是**写完之后**的状态。 */
+  const [nonce, setNonce] = useState(0)
 
   useEffect(() => {
     const controller = new AbortController()
@@ -190,7 +270,41 @@ export function HooksSection(): Jsx {
       clearTimeout(timer)
       controller.abort()
     }
-  }, [])
+  }, [nonce])
+
+  /**
+   * 行内操作统一入口。
+   *
+   * - 失败写进**页面级**通道（§3.7），且**不清空**已有内容 —— 用户要能对着旧内容判断
+   *   该刷新还是该去改文件；
+   * - 成功后 `nonce + 1` 重新取数（绝不自己在本地猜新状态：那会和宿主的答案漂移）。
+   */
+  const runWrite = (intent: WriteIntent): void => {
+    if (busy) return
+    setBusy(true)
+    setBanner(null)
+    void (async () => {
+      const outcome = await requestWrite(intent)
+      if (outcome.ok) setNonce((value) => value + 1)
+      else setBanner({ code: outcome.error ?? 'internal', detail: outcome.detail ?? '' })
+      setBusy(false)
+    })()
+  }
+
+  const onToggle: Toggle = (file, event, groupRawIndex, hook) => {
+    runWrite({
+      file: file.kind,
+      op: 'setHookDisabled',
+      event,
+      groupIndex: groupRawIndex,
+      hookIndex: hook.rawIndex,
+      disabled: !hook.disabled,
+    })
+  }
+
+  const onCreate = (file: FileView): void => {
+    runWrite({ file: file.kind, op: 'createFile' })
+  }
 
   if (phase.kind === 'loading') {
     return (
@@ -237,9 +351,23 @@ export function HooksSection(): Jsx {
         {snapshot.capabilities.writable ? null : (
           <div className="dsh-hooks__banner">本页当前是只读模式（宿主没有提供写入能力）。</div>
         )}
+        {/* 行内操作的失败**只在这里**渲染（§3.7：一条错误只允许一个渲染点）。 */}
+        {banner === null ? null : (
+          <div className="dsh-hooks__banner dsh-hooks__banner--error">
+            {writeErrorSentence(banner.code)}
+            {banner.detail === '' ? null : <span className="dsh-hooks__muted">（{banner.detail}）</span>}
+          </div>
+        )}
       </div>
       {snapshot.files.map((file) => (
-        <SourceCard key={file.kind} file={file} />
+        <SourceCard
+          key={file.kind}
+          file={file}
+          writable={snapshot.capabilities.writable}
+          busy={busy}
+          onToggle={onToggle}
+          onCreate={onCreate}
+        />
       ))}
     </div>
   )

@@ -97,3 +97,11 @@ export interface HooksErrorBody {
 
 /** `GET /api/hooks` 的响应：成功与失败两种形状。 */
 export type HooksResponse = { ok: true; data: HooksSnapshot } | HooksErrorBody
+
+/** `POST /api/hooks` 的响应：成功给出写后的新版本，失败**没有 `data`**。 */
+export interface HooksWriteResponse {
+  ok: boolean
+  data?: { file: string; version: string | null }
+  error?: string
+  detail?: string
+}

@@ -46,4 +46,9 @@ export const styles = `
 .dsh-hooks__dot--warn { background: var(--dsw-alias-state-warning-primary, var(--dsw-alias-state-warning-background, #c93)); }
 .dsh-hooks__tag { flex: none; font-size: 11px; padding: 1px 6px; border-radius: 999px; background: var(--dsw-alias-bg-module-platform, rgba(127,127,127,.12)); }
 .dsh-hooks__actions { display: flex; align-items: center; gap: 8px; flex: none; white-space: nowrap; }
+.dsh-hooks__btn { font: inherit; font-size: 12px; padding: 2px 8px; border-radius: 6px; cursor: pointer; flex: none;
+  border: .5px solid var(--dsw-alias-settings-card-stroke, rgba(127,127,127,.35)); background: transparent;
+  color: var(--dsw-alias-text-primary, inherit); }
+.dsh-hooks__btn:hover:not(:disabled) { background: var(--dsw-alias-bg-module-platform, rgba(127,127,127,.12)); }
+.dsh-hooks__btn:disabled { opacity: .5; cursor: default; }
 `
