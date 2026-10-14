@@ -1466,6 +1466,21 @@ function makeCtx(options = {}) {
       disposers.push(fn())
       return () => {}
     },
+    /**
+     * 声明式依赖：等服务就绪后再跑回调。
+     *
+     * **假 ctx 故意不把服务挂在属性上** —— 真实 Cordis 里服务是**渐进可用**的，`apply()` 时刻
+     * 读 `ctx.connection` 很可能还是 `undefined`。这正是线上实测踩到的坑（界面活了、
+     * `/api/hooks` 却是 web 服务器的 "not found"）：宿主半边当时写的是
+     * `if (ctx.connection !== undefined)`，于是整条路由被**静默跳过**，而自检全绿 —— 因为
+     * 假 ctx 把服务挂在属性上了。现在只经 inject 交付，"直接读属性"的写法在自检里就会红。
+     */
+    inject(deps, callback) {
+      if (deps.includes('connection') && options.connection !== undefined) {
+        callback({ connection: options.connection })
+      }
+      return () => {}
+    },
     get(service) {
       if (service === 'agents') {
         return { get: (id) => agents.get(id), currentInitiator: () => options.initiator }
@@ -1473,9 +1488,6 @@ function makeCtx(options = {}) {
       if (service === 'sandboxPolicy') return options.sandboxPolicy
       return undefined
     },
-    // 只有显式传了才存在 —— 与真实载体的可选性一致（shell 载体没有 Web 半边），
-    // 所以默认的假 ctx 顺带覆盖了"没有 connection 时插件照常工作"这一支。
-    connection: options.connection,
   }
   return { ctx, listeners, logs, disposers, agents }
 }
@@ -2498,13 +2510,35 @@ await test('P：路由字面量与共享常量逐字一致，且原样出现在�
   assert.ok(client.includes(`"${HOOKS_ROUTE}"`), '客户端产物里必须是**同一个**字面量（不一致就是静默 404）')
 })
 
-await test('P：没有 connection 服务时插件照常工作（数据面是便利设施，不是硬依赖）', async () => {
-  const h = await mount({})
-  assert.equal(h.listeners.get('tools/pre-execute').length, 1, '路由缺失不该影响事件接线')
-  assert.ok(
-    h.logs.some((entry) => entry.message.includes('设置页数据面未注册')),
-    '应当如实说明数据面没注册，而不是静默',
+await test('P：connection 只经 inject 交付 —— 直接读属性会静默丢掉整条路由（线上实测踩过）', async () => {
+  // ① 服务缺席（shell 载体）：插件照常激活、事件照常接线，只是数据面不注册。
+  const withoutConnection = await mount({})
+  assert.equal(
+    withoutConnection.listeners.get('tools/pre-execute').length,
+    1,
+    '数据面是便利设施，不是硬依赖：没有 connection 也必须照常接线',
   )
+
+  // ② 假 ctx **刻意不把服务挂在属性上**：真实 Cordis 的服务是渐进可用的，apply 时刻读
+  //    `ctx.connection` 很可能还是 undefined。宿主半边曾写 `if (ctx.connection !== undefined)`，
+  //    于是路由被静默跳过 —— 页面拿到 web 服务器的纯文本 "not found"，而自检全绿。
+  const conn = makeConnection()
+  const { ctx } = makeCtx({ connection: conn.connection })
+  assert.equal(
+    ctx.connection,
+    undefined,
+    '假 ctx 不许把服务挂在属性上：那样"直接读属性"的写法会在自检里假绿（这正是线上的坑）',
+  )
+  let delivered = null
+  ctx.inject(['connection'], (scope) => {
+    delivered = scope.connection
+  })
+  assert.ok(delivered !== null, 'inject 必须把服务交给回调 —— 这是可选服务的唯一正确访问方式')
+
+  // ③ 走完整挂载后，路由必须真的注册上（这条断言现在会抓住"直接读属性"的写法）。
+  const mounted = await mount({ connection: conn.connection })
+  assert.equal(conn.routes.length, 1, '服务就绪后必须注册 /api/hooks')
+  assert.equal(mounted.listeners.get('tools/pre-execute').length, 1, '事件接线不受数据面影响')
 })
 
 await test('P：快照恒为 7 个事件（含 0 条），顺序即事件表顺序', () => {

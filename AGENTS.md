@@ -103,7 +103,9 @@
 - 路由**必须**是 `/api/<名字>`（`connection.fetch` 自己校验），字面量只能有一处（`HOOKS_ROUTE`），**宿主与客户端两份产物里必须逐字一致** —— 不一致就是静默 404。
 - `requestBody` 必须在 bridge 读字节之前声明；POST 体积小，用 `'buffered'`。
 - 成功 `{ok:true, data}`，失败 `{ok:false, error, detail?}` 且 **没有 `data`**；`detail` 只放技术原文，**绝不作为页面主文案**（§3.9）。
-- **`connection` 是可选服务**：shell 载体没有 Web 半边时数据面不注册，但 **hooks 必须照常工作**（数据面是便利设施，不是硬依赖）。
+- **`connection` 是可选服务，但访问它只有一种正确方式：`ctx.inject(['connection'], (scope) => …)`。**
+  **不许在 `apply()` 里直接读 `ctx.connection`** —— Cordis 的服务是**渐进可用**的，apply 时刻它很可能还是 `undefined`，于是 `if (ctx.connection !== undefined)` 会**静默跳过注册**：页面拿到的是 web 服务器的纯文本 `not found`，而自检全绿。**这条是线上实测踩到的**（P8b：界面正常渲染、`/api/hooks` 是 404），根因就是自检的假 ctx 把服务挂在属性上了 —— 现在假 ctx **只经 inject 交付**，"直接读属性"会在自检里红成一片（把旧写法注入回去 → **18 条同时红**）。
+  用 inject 还有第二个好处：服务永不出现时插件照常激活 —— 数据面是便利设施，不是硬依赖。
 - 快照里的"生效配置"**必须取 `configFor()` 的缓存**（就是 runner 正在用的那一份），而不是路由里重新解析一遍 —— 后者会得到"磁盘刚的样子"，在 fail-open 场景下与 runner 不一致，页面就在撒谎。
 - 没有会话上下文时 `cwd` / `projectRoot` 一律给 `null` 并如实标注来源，**不许拿 `process.cwd()` 顶上**。
 - 可离线测：注册契约靠捕获 `register()`，handler 行为靠**直接 `new Request(...)` 调 handler**（绝对 URL）—— 不需要浏览器。

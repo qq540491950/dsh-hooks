@@ -227,8 +227,25 @@ export interface HostContext {
   /**
    * 浏览器载体才提供。**刻意可选**：shell 载体（无 Web 半边）里它就是 undefined，
    * 那时设置页数据面不注册，但 hooks 本身必须照常工作 —— 数据面是便利设施，不是硬依赖。
+   *
+   * ⚠️ 但**不要直接读这个属性**：Cordis 的服务是**渐进可用**的，`apply()` 时刻它可能还没加载，
+   * 于是"读到 undefined 就跳过"会**静默丢掉整条路由**（线上实测踩过：界面活了、`/api/hooks`
+   * 是 404）。正确写法是 `ctx.inject(['connection'], (scope) => …)` —— 服务就绪后才回调，
+   * 永不出现时插件也照常激活。
    */
   readonly connection?: ConnectionService | undefined
+  /**
+   * 声明式依赖。等服务就绪后回调；服务永不出现则回调不跑（插件照常激活）。
+   * 可选服务的**唯一**正确访问方式（见上面 `connection` 的说明）。
+   *
+   * 两条重载：精确声明 `['connection']` 时，回调里的 `scope.connection` **保证存在**
+   * （这正是 inject 的语义 —— 服务没就绪回调根本不会跑）；泛化那条只保证 `HostContext`。
+   */
+  inject(
+    deps: readonly ['connection'],
+    callback: (scope: HostContext & { readonly connection: ConnectionService }) => void,
+  ): unknown
+  inject(deps: readonly string[], callback: (scope: HostContext) => void): unknown
   get(name: 'sandboxPolicy'): SandboxPolicyService | undefined
   get(name: 'agents'): AgentsService | undefined
   get(name: string): unknown

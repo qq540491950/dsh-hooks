@@ -75,6 +75,26 @@
 - **形态**：`{String(n)} 条` 在假 React 下是**多个**文本节点，`texts.includes('生效 4 条')` 永远为假。
 - **修法**：子串断言先把文本片段按文档顺序**拼起来**（`joined`）；精确匹配（事件名）仍用数组。
 
+### 2.9 上线才发现的 404：`apply()` 里直接读可选服务（§2.12 的那条硬规则）
+- **现象（用户重启后第一步就撞上）**：设置页「Hooks」**正常出现并渲染**（导航、齿轮图标、错误文案全对），但面板里是
+  `连不上宿主…` + 技术原文 `Unexpected token 'o', "not found" is not valid JSON` —— `GET /api/hooks` 拿到的是
+  **web 服务器的纯文本 "not found"**，不是我们的 JSON 信封。
+- **根因**：宿主写的是 `if (ctx.connection !== undefined) { registerHooksRoute(...) }`。Cordis 的服务是**渐进可用**的，
+  `apply()` 时刻 `connection` 还没加载 → 条件为假 → **整条路由被静默跳过**。改成
+  `ctx.inject(['connection'], (scope) => …)` 后正常。
+- **为什么自检当时全绿**：假 `ctx` 把服务挂在属性上（`connection: options.connection`）。**假件比真的强** ——
+  它替产品把"服务已就绪"这个不成立的前提补上了。这与 §2.5（假 fs 比真的**弱**）是同一枚硬币的两面：
+  **假件的时序与能力都必须与真件一致**，否则自检只是自我安慰。
+- **修法与防线**：① 宿主改走 `inject`；② `HostContext.inject` 加**重载**（精确声明 `['connection']` 时回调里的
+  `scope.connection` 保证存在）；③ **假 ctx 不再把服务挂在属性上**，并专门断言 `ctx.connection === undefined`
+  且 `inject` 能交付；④ 把旧写法注入回去 → **18 条断言同时红**（修前全绿）。
+- **教训（比 bug 本身重要）**："真人点一遍"抓到了离线自检抓不到的东西 —— 这里缺的是一个**只有真运行时才有的前提**
+  （服务在 apply 时尚未就绪）。所以真实走查与断言**不是替代关系**。
+
+### 2.10 顺带确认的事实
+- 客户端半边**确实需要重启一次**才发布：重启后 `settings.section` 的占位从 7 个变成 8 个（多了 `hooks/920`）；
+  在此之前 `Slots.listSubTree` 里**没有** `hooks`。这条可以用 `cordis_inspect_query`（不需要审批）直接取证。
+
 ---
 
 ## 3. 断言台账

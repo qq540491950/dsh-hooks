@@ -943,13 +943,18 @@ export function apply(ctx: HostContext): void {
     }
   }
 
-  // 只有 Web 载体才提供 connection。没有它就不注册数据面 —— 设置页没了，但 hooks 照跑：
-  // 数据面是便利设施，不是硬依赖（也正因为如此，自检的假 ctx 不必实现它）。
-  if (ctx.connection !== undefined) {
-    registerHooksRoute(ctx.connection, { inspect, write: handleWrite, dryRun: dryRunHook })
-  } else {
-    info('dsh-hooks: 当前载体没有 connection 服务，设置页数据面未注册（hooks 本身不受影响）')
-  }
+  // 只有 Web 载体才提供 connection。**必须用 `ctx.inject` 等服务就绪**，不能在 apply 时直接读
+  // `ctx.connection`：Cordis 的服务是**渐进可用**的，apply 时刻它很可能还是 `undefined`，于是
+  // `if (ctx.connection !== undefined)` 会**静默跳过**注册 —— 页面拿到的是 web 服务器的纯文本
+  // "not found"，而不是我们的 JSON 信封。
+  //
+  // 这条是**线上实测**踩到的（P8b：界面正常渲染、`/api/hooks` 却是 404），而自检当时抓不到，
+  // 因为假 ctx 把服务挂在属性上了。现在的假 ctx 只通过 inject 交付，直接读属性就会红。
+  //
+  // 用 inject 还有第二个好处：服务永不出现时插件照常激活 —— 数据面是便利设施，不是硬依赖。
+  ctx.inject(['connection'], (scope) => {
+    registerHooksRoute(scope.connection, { inspect, write: handleWrite, dryRun: dryRunHook })
+  })
 
   //#endregion
 
