@@ -347,6 +347,7 @@ function SourceCard(props: {
             <button
               type="button"
               className="dsh-hooks__btn"
+              title="新建这个文件"
               disabled={busy}
               onClick={() => {
                 onCreate(file)

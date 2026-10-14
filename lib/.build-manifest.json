@@ -23,11 +23,11 @@
     },
     {
       "output": "lib/client.js",
-      "outputSha256": "05610f205ae4972ad7112d425c9cc260859133844d877b8ca3ed0b03c2cd93f0",
+      "outputSha256": "16a56a6c7f81137510a1e252511a882b720d92bc873aa0a525a557e921459805",
       "inputs": {
         "src/client/index.ts": "4e9ec5ff0aad13cfdb0ed173efad3a607d24193d5751958e03b83735f03b1f0b",
         "src/client/react.ts": "015dcb18d88be6b65954ada347271c5724b0a5f41e7f72737df1bb4643772946",
-        "src/client/section.tsx": "9daa877325f9b3fc90b359580dca7989ec2ba949fc7bdb183435052579570994",
+        "src/client/section.tsx": "0787ce3b9b227595f0034d66bbb2223c365baf1bb703dc9599f3e7185f671a26",
         "src/client/styles.ts": "f238a8121bd768175210e5e532082e6dfd83288db2eb2c0396f580abf23d691a",
         "src/client/wire.ts": "2120d8be60afc2b06f98b061fc09c96a8dee35fa479cec17b339b102b6476653",
         "src/client/write.ts": "00220ce62b78865d227ff80745b4017049bee2e76dcf8655d59aa6aa5ac98d4b",

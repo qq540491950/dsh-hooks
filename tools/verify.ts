@@ -772,6 +772,42 @@ await test('D：点"试运行"发 dryRun 请求，结果贴在这一行，且那
   assert.ok(failedText.includes('没有写入'), '试运行失败也要按错误码说清（这条是"文件读不出来，所以没写"）')
 })
 
+await test('D：文件不存在时说"不存在"（不是"读不出来"），并给出"新建这个文件"', async () => {
+  const harness = createFakeReact()
+  const component = componentFromArtifact(harness.React)
+  const snapshot = minimalSnapshot()
+  // 用户级那份文件不存在 —— 这正是"用户删掉 hooks.json 之后"的状态。
+  snapshot.files[1].state = 'absent'
+  const nodes = await renderSection(component, harness, { ok: true, data: snapshot })
+  const joined = nodes
+    .filter((node) => node.text !== undefined)
+    .map((node) => node.text)
+    .join('')
+  assert.ok(joined.includes('文件不存在'), '"不存在"必须**明说**，而不是让那一格空着')
+  assert.ok(
+    !joined.includes('读不出来'),
+    '不存在 ≠ 读不出来：绝不能说成"读不出来"（用户会去修一个没坏的文件，§2.9/§3.9）',
+  )
+  assert.ok(joined.includes('已读取'), '同一页里另一份文件是好的，两种状态必须**同时**说得清')
+
+  const calls = []
+  globalThis.fetch = async (_url: string, options: { method?: string; body?: string } = {}) => {
+    const method = options.method ?? 'GET'
+    calls.push({ method, body: typeof options.body === 'string' ? JSON.parse(options.body) : null })
+    return { json: async () => ({ ok: true, data: { file: 'user', version: 'v2' } }) }
+  }
+  buttonByLabel(nodes, '新建这个文件').onClick()
+  await new Promise((resolve) => setTimeout(resolve, 0))
+  await new Promise((resolve) => setTimeout(resolve, 0))
+
+  assert.equal(calls.length, 1, '"新建"是一次写请求')
+  assert.deepEqual(
+    calls[0].body,
+    { file: 'user', op: 'createFile' },
+    '新建的必须是**那一份**不存在文件（用户级），不是项目级',
+  )
+})
+
 //#endregion
 
 //#region E. 构建指纹：产物必须就是当前源码的产物（"过期但全绿"的唯一防线）
