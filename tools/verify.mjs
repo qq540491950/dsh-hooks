@@ -1042,6 +1042,148 @@ await test('集成：watcher 回调触发时立刻失效缓存并打一条 info�
   })
 })
 
+//#region 3d. fail-open：解析失败必须保持上一份可用配置（P1 修复的重点）
+//
+// `readJsonFile` 的三态语义：
+//   absent  文件不存在   → 合法的"这份配置是空的"
+//   ok      解析成功     → 用它，并刷新 last-good
+//   error   读到但坏了   → **沿用 last-good**，绝不静默放开
+//
+// 本区用 watcher 回调强制失效（不 sleep），既快，走的又是生产上的真实失效通道。
+
+/** 挂上带 capture 的假 fs，并返回"强制失效"函数。 */
+async function mountCaptured(options = {}) {
+  const captured = []
+  const h = await mount({ ...options, fs: makeFs({ watch: 'capture', captured }) })
+  return {
+    h,
+    invalidate: () => {
+      for (const { changed } of captured) changed()
+    },
+  }
+}
+
+await test('fail-open：hooks.json 写坏后必须继续沿用上一份可用配置（deny 不能消失）', async () => {
+  await withIsolatedHome(async () => {
+    const dir = await makeProject()
+    const s = await script(dir, 'failopen.mjs', `process.stderr.write('guard alive');process.exit(2)`)
+    await writeHooks(dir, { hooks: { PreToolUse: [{ matcher: 'pwsh', hooks: [{ command: cmd(s) }] }] } })
+    const { agent } = fakeAgent(dir)
+    const { h, invalidate } = await mountCaptured()
+    const handler = h.listeners.get('tools/pre-execute')[0]
+    const call = () => handler({ name: 'pwsh', arguments: {}, callId: 'c', agent }, nextAllow)
+
+    assert.equal((await call()).reason, 'guard alive', '基线：正常配置必须拦得住')
+
+    // 写坏文件（模拟编辑器写一半 / 并发写入 / 手改错一个字符），立刻走真实失效通道。
+    await fsp.writeFile(path.join(dir, '.dsh', 'hooks.json'), '{"hooks": {', 'utf8')
+    invalidate()
+
+    const after = await call()
+    assert.equal(after.kind, 'deny', '解析失败绝不能静默放开——这正是修复前的形态')
+    assert.equal(after.reason, 'guard alive', '沿用的必须是"上一份可以解析"的配置')
+
+    const parseWarns = () => h.logs.filter((e) => e.level === 'warn' && /读取 .*hooks\.json 失败/.test(e.message))
+    assert.equal(parseWarns().length, 1, '同一条错误只 warn 一次')
+
+    // 再失效一次、再调用：同一条错误不应重复告警。
+    invalidate()
+    await call()
+    assert.equal(parseWarns().length, 1, '跨重读不重复告警（否则 TTL 周期会刷屏）')
+    assert.ok(
+      h.logs.some((e) => e.level === 'info' && /沿用上一份可用配置/.test(e.message)),
+      '沿用旧配置这件事必须留痕，否则宿主日志里看不出"为什么改的配置没生效"',
+    )
+  })
+})
+
+await test('fail-open：配置被**删除**时必须真的清空（缺失 ≠ 读不出来）', async () => {
+  await withIsolatedHome(async () => {
+    const dir = await makeProject()
+    const s = await script(dir, 'gone.mjs', `process.stderr.write('gone guard');process.exit(2)`)
+    await writeHooks(dir, { hooks: { PreToolUse: [{ matcher: 'pwsh', hooks: [{ command: cmd(s) }] }] } })
+    const { agent } = fakeAgent(dir)
+    const { h, invalidate } = await mountCaptured()
+    const handler = h.listeners.get('tools/pre-execute')[0]
+    const call = () => handler({ name: 'pwsh', arguments: {}, callId: 'c', agent }, nextAllow)
+
+    assert.equal((await call()).kind, 'deny')
+
+    await fsp.rm(path.join(dir, '.dsh', 'hooks.json'))
+    invalidate()
+
+    const after = await call()
+    assert.equal(after.kind, 'allow', 'ENOENT 是合法的"没有配置"：必须真的停掉 hook，不能 fail-safe 到旧配置')
+    // 缺文件不该产生"读取失败"告警（项目还没建 hooks.json 是常态）。
+    assert.equal(
+      h.logs.filter((e) => e.level === 'warn' && /读取 .*hooks\.json 失败/.test(e.message)).length,
+      0,
+      '文件不存在不是错误，不许刷告警',
+    )
+  })
+})
+
+await test('fail-open：顶层不是对象的 JSON 也算"读不出来"（不是空配置）', async () => {
+  await withIsolatedHome(async () => {
+    const dir = await makeProject()
+    const s = await script(dir, 'nonobj.mjs', `process.stderr.write('obj guard');process.exit(2)`)
+    await writeHooks(dir, { hooks: { PreToolUse: [{ matcher: 'pwsh', hooks: [{ command: cmd(s) }] }] } })
+    const { agent } = fakeAgent(dir)
+    const { h, invalidate } = await mountCaptured()
+    const handler = h.listeners.get('tools/pre-execute')[0]
+    const call = () => handler({ name: 'pwsh', arguments: {}, callId: 'c', agent }, nextAllow)
+
+    assert.equal((await call()).kind, 'deny')
+
+    // 合法 JSON，但顶层是字符串：修之前会被 `isObject` 判成 undefined → 当成"没有配置"。
+    await fsp.writeFile(path.join(dir, '.dsh', 'hooks.json'), '"not an object"', 'utf8')
+    invalidate()
+
+    const after = await call()
+    assert.equal(after.kind, 'deny', '顶层不是对象同样是坏配置，必须沿用上一份')
+    assert.equal(after.reason, 'obj guard')
+    assert.ok(
+      h.logs.some((e) => e.level === 'warn' && /顶层不是 JSON 对象/.test(e.message)),
+      '这条错误要有专门文案，用户才知道该把文件改回对象',
+    )
+  })
+})
+
+await test('fail-open：修好文件后按新配置跑，且错误计数重置（新错误重新告警）', async () => {
+  await withIsolatedHome(async () => {
+    const dir = await makeProject()
+    const file = path.join(dir, '.dsh', 'hooks.json')
+    const a = await script(dir, 'fo-a.mjs', `process.stderr.write('old');process.exit(2)`)
+    await writeHooks(dir, { hooks: { PreToolUse: [{ matcher: 'pwsh', hooks: [{ command: cmd(a) }] }] } })
+    const { agent } = fakeAgent(dir)
+    const { h, invalidate } = await mountCaptured()
+    const handler = h.listeners.get('tools/pre-execute')[0]
+    const call = () => handler({ name: 'pwsh', arguments: {}, callId: 'c', agent }, nextAllow)
+    const parseWarns = () => h.logs.filter((e) => e.level === 'warn' && /读取 .*hooks\.json 失败/.test(e.message))
+
+    assert.equal((await call()).reason, 'old')
+    await fsp.writeFile(file, '{ broken', 'utf8')
+    invalidate()
+    assert.equal((await call()).reason, 'old', '坏文件期间沿用旧配置')
+    assert.equal(parseWarns().length, 1)
+
+    // 修好并换成另一条命令：必须按**新**配置跑（last-good 要被刷新）。
+    const b = await script(dir, 'fo-b.mjs', `process.stderr.write('new');process.exit(2)`)
+    await writeHooks(dir, { hooks: { PreToolUse: [{ matcher: 'pwsh', hooks: [{ command: cmd(b) }] }] } })
+    invalidate()
+    assert.equal((await call()).reason, 'new', '修好之后必须立刻按新配置跑')
+    assert.equal(parseWarns().length, 1, '成功读取后不应产生新的错误告警（之前的记录被清掉）')
+
+    // 再坏一次：这是一条**新的**错误，必须重新告警一次。
+    await fsp.writeFile(file, '{ broken again', 'utf8')
+    invalidate()
+    assert.equal((await call()).reason, 'new', '再次沿用最近一次成功的那份（已是 new）')
+    assert.equal(parseWarns().length, 2, '成功读取后错误记录重置，新错误要重新告警')
+  })
+})
+
+//#endregion
+
 //#region 3c. hook 的沙箱策略透传（落盘类 hook 能不能写，全看这里）
 
 await test('集成：hook 子进程按**调用会话**的沙箱策略跑（否则格式化类 hook 会静默 EPERM）', async () => {

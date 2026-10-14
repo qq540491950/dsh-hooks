@@ -344,7 +344,7 @@ Copy-Item .dsh\hooks.json .tmp\hooks.json.bak
 node tools/verify.mjs
 ```
 
-覆盖三层共 61 项：
+覆盖五个区（**条数看输出，别抄死**——每个 bug 修复都会顺手加断言）：
 
 1. **静态**：`lib/index.js` 必须零 `import` / 零 `require`（这是 `file:///` 装载方式的硬约束）。
 2. **纯函数**：matcher 语义、exit code 解码、`hookEventName` 守卫、顶层 decision 白名单、
@@ -359,10 +359,14 @@ node tools/verify.mjs
    - **正结果 TTL 到期后会重读**（watcher 挂得上但永不投递事件时的自愈路径）；
    - **未到期不重复读**、到期只重读一次 —— 用真实 `readText` **调用次数**断言；
    - watcher 回调触发时**立刻**失效缓存（不等 TTL）并打一条**带 path 的限流 info**。
-5. **hook 的沙箱策略透传**（本次新增）：hook spec 必须带上**调用会话**解析出来的
+5. **hook 的沙箱策略透传**：hook spec 必须带上**调用会话**解析出来的
    `sandboxPolicy`（并断言 `resolve` 拿到的是那个 session）；会话是 `read-only` 时**原样透传**
    （不提权）；`ctx.sandboxPolicy` 缺失或 `resolve()` 抛错时**省略该字段**回退部署策略、
    且只打一条降级 warn —— hook 照常工作、判定不受影响。
+6. **fail-open 修复**（v0.2.1 新增）：hooks.json 写坏后**必须继续沿用上一份可用配置**
+   （deny 不能消失）；顶层不是对象的 JSON 同样算"读不出来"；**删除**配置文件则必须真的清空
+   （`absent` ≠ `error`，不许 fail-safe 回旧配置）；同一条错误只 warn 一次、成功读取后计数重置。
+   用 watcher 回调强制失效，不靠 sleep。
 
 另外可以单独体检一份真实的配置（不跑测试）：
 
@@ -386,6 +390,8 @@ node tools/verify.mjs --config "D:\some\project\.dsh\hooks.json"
 | 日志里 `跳过不支持的 "xxx" handler` | 用了非 command handler（本插件只跑 command） |
 | 日志里 `invalid regex matcher ...` | 该 group 的 matcher 不是合法正则，已跳过（其余 group 不受影响） |
 | 日志里 `无可用 hook` | 文件读到了但没有任何可用事件组（只在事件集合变化时打，不会反复刷） |
+| 日志里 `配置当前读不出来，继续沿用上一份可用配置` | **配置现在解析不了**（JSON 非法 / 顶层不是对象 / IO 失败）。hook 仍在按上一份可用配置跑，所以"改的配置不生效"很可能是文件本身写坏了。紧跟上面的 `读取 … 失败：…` 看具体原因 |
+| 日志里 `读取 … 失败：…` 只出现一次 | 正常：同一条错误只告警一次；换成**另一处**错误会再告警一次 |
 | 日志里 `ctx.fs 不提供 watch()` | 该 fs 服务没有 `watch()`：热重载退化成 4s TTL 兜底。每条路径只打一次 |
 | 日志里 `已监听 <path>（判定为目录/文件/尚不存在）` | 正常挂载点。**"已监听" + "改了不生效"** = 挂了但没事件；**完全没有这条** = 没挂上（对照上一条） |
 | 日志里 `监听到变化 → 失效配置缓存（<path>）` | 热重载真的触发了。同一条路径 1s 内不重复打 |
@@ -418,6 +424,15 @@ node tools/verify.mjs --config "D:\some\project\.dsh\hooks.json"
   `tools/*` 会静默地按 app 启动目录找配置，hook 永远不生效。
 - **负结果必须有过期**：`fs.watch` 对尚不存在的路径不一定挂得上，所以"没有配置"的缓存
   带 `NEGATIVE_TTL_MS`(2s) 过期，否则"先开项目、后建 hooks.json"要等到重启。
+- **「读不到」≠「没有」：解析失败必须保持上一份可用配置**（v0.2.1 修复）。
+  读取配置分成**三态**：`absent`（文件不存在 = 合法的"这份配置是空的"）、`ok`（解析成功，
+  同时刷新 last-good）、`error`（读到了但 JSON 非法 / 顶层不是对象 / IO 失败）。
+  `error` 时**继续沿用最近一次成功解析的配置**，并在错误内容变化时 warn 一次
+  （同一条错误跨重读不重复告警）、每次沿用打一条限流 info。
+  **修之前的形态是危险的 fail-open**：`error` 被折叠成"没有配置"，于是 hooks.json 写坏一个
+  字符（编辑器写一半、并发写、手改错一处）会让**全部** hook（含 `PreToolUse` deny 守卫）
+  **静默消失**，而且文件一直是坏的就一直消失。三条对应断言见自检 `fail-open` 区。
+  注意边界：**删除**配置文件仍然是合法的清空（`absent`），不会 fail-safe 回旧配置。
 - **正结果也必须有过期**：watcher 是"尽力而为"的（可能没挂上 / 挂了没事件）。只靠 watcher 失效时，
   正结果会永久缓存 → "改配置必须重启"。所以正结果带 `POSITIVE_TTL_MS`(4s)。
   TTL **只是允许重读**，单次 hook 事件内不重复读（`contextFor()` 每个事件点只调一次 `configFor()`）。
