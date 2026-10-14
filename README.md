@@ -363,10 +363,15 @@ node tools/verify.mjs
    `sandboxPolicy`（并断言 `resolve` 拿到的是那个 session）；会话是 `read-only` 时**原样透传**
    （不提权）；`ctx.sandboxPolicy` 缺失或 `resolve()` 抛错时**省略该字段**回退部署策略、
    且只打一条降级 warn —— hook 照常工作、判定不受影响。
-6. **fail-open 修复**（v0.2.1 新增）：hooks.json 写坏后**必须继续沿用上一份可用配置**
-   （deny 不能消失）；顶层不是对象的 JSON 同样算"读不出来"；**删除**配置文件则必须真的清空
-   （`absent` ≠ `error`，不许 fail-safe 回旧配置）；同一条错误只 warn 一次、成功读取后计数重置。
-   用 watcher 回调强制失效，不靠 sleep。
+6. **fail-open 修复与版本核对**（v0.2.1 新增）：
+   - fail-open：hooks.json 写坏后**必须继续沿用上一份可用配置**（deny 不能消失）；
+     顶层不是对象的 JSON 同样算"读不出来"；**删除**配置文件则必须真的清空
+     （`absent` ≠ `error`，不许 fail-safe 回旧配置）；同一条错误只 warn 一次、成功读取后计数重置。
+     用 watcher 回调强制失效，不靠 sleep。
+   - 版本核对（C2）：provider 给出 `version` 时，**内容没变则 TTL 到期也不重读**（用真实
+     `readText` 调用次数断言）；**内容一变就立刻重读**，不必等 TTL；**`stat` 抛错时只降级成
+     TTL 语义、绝不丢 last-good**。假 `ctx.fs` 默认**不给** `version`，所以上面那批 TTL 用例
+     同时在守"没有版本通道的 provider"这一支。
 
 另外可以单独体检一份真实的配置（不跑测试）：
 
@@ -396,7 +401,7 @@ node tools/verify.mjs --config "D:\some\project\.dsh\hooks.json"
 | 日志里 `已监听 <path>（判定为目录/文件/尚不存在）` | 正常挂载点。**"已监听" + "改了不生效"** = 挂了但没事件；**完全没有这条** = 没挂上（对照上一条） |
 | 日志里 `监听到变化 → 失效配置缓存（<path>）` | 热重载真的触发了。同一条路径 1s 内不重复打 |
 | 日志里 `无法监听 ...` | 路径还不存在或 `resolve`/`watch` 抛错；正/负结果都会按 4s / 2s TTL 自愈，不必重启 |
-| 改了 hooks.json 没生效 | 正常应秒级热重载；监听器失效时由 **4s 正向 TTL** 兜底。用"改完只等 1s 再调用"可以把 watcher 和 TTL 区分开 |
+| 改了 hooks.json 没生效 | 正常应秒级热重载（watcher）/ 下一个事件点（版本核对）。用"改完只等 1s 再调用"可以把 watcher 与其它通道区分开；日志里出现 `配置当前读不出来，继续沿用上一份可用配置` 说明是**文件本身写坏了**，不是热重载没生效 |
 | 项目**先开着**、后来才建 hooks.json | 支持：负结果有 2 秒过期，不需要重启 |
 | hook 想写文件却被拒绝（`EPERM`） | v0.1.0 的老问题：hook 按**部署**档跑，只能写自己那次的私有 `%TEMP%\dsh-XXXXXX`。v0.2.0 起 hook 继承**会话**档位（`sandbox: <档位>`，见[写入边界](#hook-子进程的写入边界)）。仍被拒就先看档位：`read-only` 会话下 hook 与工具调用一样写不了；日志里 `sandbox=deployment` 说明没拿到 `ctx.sandboxPolicy` |
 | 格式化 / 自动修复类 hook 没生效 | v0.1.0 会**静默**失效（退出码非 2、输出非 JSON ⇒ 按非阻断失败处理，动作照常放行）。升级到 v0.2.0 后 hook 按会话档跑即可落盘；仍不行就看该 hook 自己的 stderr |
@@ -433,9 +438,18 @@ node tools/verify.mjs --config "D:\some\project\.dsh\hooks.json"
   字符（编辑器写一半、并发写、手改错一处）会让**全部** hook（含 `PreToolUse` deny 守卫）
   **静默消失**，而且文件一直是坏的就一直消失。三条对应断言见自检 `fail-open` 区。
   注意边界：**删除**配置文件仍然是合法的清空（`absent`），不会 fail-safe 回旧配置。
-- **正结果也必须有过期**：watcher 是"尽力而为"的（可能没挂上 / 挂了没事件）。只靠 watcher 失效时，
-  正结果会永久缓存 → "改配置必须重启"。所以正结果带 `POSITIVE_TTL_MS`(4s)。
-  TTL **只是允许重读**，单次 hook 事件内不重复读（`contextFor()` 每个事件点只调一次 `configFor()`）。
+- **失效有三层通道（版本 → watcher → TTL）**，优先级从高到低：
+  1. **版本核对（主通道，v0.2.1）**：每个事件点用 `ctx.fs.stat()` 的 `version`
+     （真实值是 `dev:ino:size:mtimeNs:ctimeNs`）核对两个配置文件。**没变就复用缓存**
+     （连 TTL 都不必等，省掉一次 `readText`）；**变了就立刻重读**——新配置在下一个事件点
+     就生效，不用等 TTL。
+  2. **watcher（加速器）**：`ctx.fs.watch()` 事件到达立即丢缓存，不等任何核对（实测 < 1s）。
+  3. **TTL（兜底）**：provider **不返回 `version`** 或 `stat` 抛错时，退回"到期允许重读"的
+     老语义 —— 正结果 `POSITIVE_TTL_MS`(4s)、负结果 `NEGATIVE_TTL_MS`(2s)。
+     TTL **只是允许重读**，单次 hook 事件内不重复读（`contextFor()` 每个事件点只调一次 `configFor()`）。
+  为什么保留 TTL 而不是删掉：版本通道依赖 provider 提供 `version`，这不是所有 provider 的
+  义务；`stat` 也可能因 ACL 抖动失败。**任何一条通道静默失效，最坏也只是延迟 4 秒生效**，
+  而不是"改了配置必须重启"。
 - **静默早退是可诊断性的大敌**：`ctx.fs` 没有 `watch()` 时必须 warn 一次（带路径），
   挂载成功 / 失效回调也必须留痕，否则"没挂上"和"挂了没事件"在日志里无法区分。
   这些日志都做了限流（每路径一次 / 1s 窗口），不会在热路径刷屏。

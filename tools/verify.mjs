@@ -15,6 +15,7 @@
  */
 import assert from 'node:assert/strict'
 import { spawn, spawnSync } from 'node:child_process'
+import { createHash } from 'node:crypto'
 import fs from 'node:fs'
 import fsp from 'node:fs/promises'
 import os from 'node:os'
@@ -463,10 +464,21 @@ const fakeFs = {
  *   `'capture'` = 把 `changed` 回调收集进 `options.captured`（测失效路径）；
  *   省略 = 挂得上但静默。
  * @param options.onRead 每次 `readText` 都被调用一次（用来断言"读了几次配置"）。
+ * @param options.version `true` = `stat` 额外返回一个**内容派生**的 `version`
+ *   （真实 `FsInfo.version` 是 `dev:ino:size:mtimeNs:ctimeNs`；这里用 size+内容摘要，
+ *   保证"内容变→版本变、不动文件→版本不变"，测版本核对通道用）。
+ *   **默认不给 version** —— 于是默认假 fs 走的是"provider 没有版本"的 TTL 兜底分支。
  */
 function makeFs(options = {}) {
   const fsImpl = {
     ...localFsBase,
+    async stat(target) {
+      const info = await localFsBase.stat(target)
+      if (info === undefined || options.version !== true) return info
+      const text = await fsp.readFile(target.displayPath, 'utf8').catch(() => '')
+      const digest = createHash('sha1').update(text).digest('hex').slice(0, 12)
+      return { ...info, version: `${info.size}:${digest}` }
+    },
     async readText(target) {
       if (options.onRead) options.onRead(target)
       return localFsBase.readText(target)
@@ -1051,10 +1063,10 @@ await test('集成：watcher 回调触发时立刻失效缓存并打一条 info�
 //
 // 本区用 watcher 回调强制失效（不 sleep），既快，走的又是生产上的真实失效通道。
 
-/** 挂上带 capture 的假 fs，并返回"强制失效"函数。 */
-async function mountCaptured(options = {}) {
+/** 挂上带 capture 的假 fs，并返回"强制失效"函数（`fsOptions` 透传给 `makeFs`）。 */
+async function mountCaptured(options = {}, fsOptions = {}) {
   const captured = []
-  const h = await mount({ ...options, fs: makeFs({ watch: 'capture', captured }) })
+  const h = await mount({ ...options, fs: makeFs({ ...fsOptions, watch: 'capture', captured }) })
   return {
     h,
     invalidate: () => {
@@ -1179,6 +1191,80 @@ await test('fail-open：修好文件后按新配置跑，且错误计数重置�
     invalidate()
     assert.equal((await call()).reason, 'new', '再次沿用最近一次成功的那份（已是 new）')
     assert.equal(parseWarns().length, 2, '成功读取后错误记录重置，新错误要重新告警')
+  })
+})
+
+//#endregion
+
+//#region 3e. C2 版本核对：stat().version 作为失效主通道（watcher 只是加速器，TTL 只是兜底）
+
+await test('C2：provider 给出 version 时，内容没变则 TTL 到期也不重读（省 I/O）', async () => {
+  await withIsolatedHome(async () => {
+    const dir = await makeProject()
+    const s = await script(dir, 'v-stable.mjs', `process.stderr.write('stable');process.exit(2)`)
+    await writeHooks(dir, { hooks: { PreToolUse: [{ matcher: 'pwsh', hooks: [{ command: cmd(s) }] }] } })
+    const { agent } = fakeAgent(dir)
+    const reads = []
+    const h = await mount({ fs: makeFs({ version: true, onRead: (target) => reads.push(target.displayPath) }) })
+    const handler = h.listeners.get('tools/pre-execute')[0]
+    const call = () => handler({ name: 'pwsh', arguments: {}, callId: 'c', agent }, nextAllow)
+
+    assert.equal((await call()).reason, 'stable')
+    const baseline = reads.length
+    assert.ok(baseline >= 1, '首次必须真读一次')
+
+    // 跨过正结果 TTL：**没有版本通道时这里会重读**；有版本且内容没变则不该重读。
+    await new Promise((resolve) => setTimeout(resolve, POSITIVE_TTL_MS + 400))
+    assert.equal((await call()).reason, 'stable')
+    assert.equal(reads.length, baseline, '版本没变就不重读：TTL 只是"provider 没有 version"时的兜底')
+  })
+})
+
+await test('C2：内容一变就立刻重读（不必等 TTL）', async () => {
+  await withIsolatedHome(async () => {
+    const dir = await makeProject()
+    const a = await script(dir, 'v1.mjs', `process.stderr.write('v1');process.exit(2)`)
+    await writeHooks(dir, { hooks: { PreToolUse: [{ matcher: 'pwsh', hooks: [{ command: cmd(a) }] }] } })
+    const { agent } = fakeAgent(dir)
+    const h = await mount({ fs: makeFs({ version: true }) })
+    const handler = h.listeners.get('tools/pre-execute')[0]
+    const call = () => handler({ name: 'pwsh', arguments: {}, callId: 'c', agent }, nextAllow)
+
+    assert.equal((await call()).reason, 'v1')
+
+    const b = await script(dir, 'v2.mjs', `process.stderr.write('v2');process.exit(2)`)
+    await writeHooks(dir, { hooks: { PreToolUse: [{ matcher: 'pwsh', hooks: [{ command: cmd(b) }] }] } })
+    // **故意不 sleep**：TTL 远未到期，只有版本核对才能让新配置在这里生效。
+    assert.equal((await call()).reason, 'v2', '版本变了必须在下一个事件点就生效，而不是等 TTL')
+  })
+})
+
+await test('C2：stat 抛错时只降级成 TTL 语义，绝不丢 last-good', async () => {
+  await withIsolatedHome(async () => {
+    const dir = await makeProject()
+    const s = await script(dir, 'v-stat-throw.mjs', `process.stderr.write('still guarded');process.exit(2)`)
+    await writeHooks(dir, { hooks: { PreToolUse: [{ matcher: 'pwsh', hooks: [{ command: cmd(s) }] }] } })
+    const { agent } = fakeAgent(dir)
+    const captured = []
+    const fsImpl = makeFs({ version: true, watch: 'capture', captured })
+    const h = await mount({ fs: fsImpl })
+    const handler = h.listeners.get('tools/pre-execute')[0]
+    const call = () => handler({ name: 'pwsh', arguments: {}, callId: 'c', agent }, nextAllow)
+    const invalidate = () => {
+      for (const { changed } of captured) changed()
+    }
+
+    assert.equal((await call()).reason, 'still guarded', '基线')
+
+    // provider 的 stat 从此失败（ACL 抖动 / 服务故障）：版本通道不可用 → 退回 TTL 语义。
+    fsImpl.stat = async () => {
+      throw new Error('EPERM: stat denied by sandbox')
+    }
+    invalidate()
+
+    const after = await call()
+    assert.equal(after.kind, 'deny', 'stat 失败也不许静默放开')
+    assert.equal(after.reason, 'still guarded', 'stat 失败必须沿用 last-good，而不是把它丢掉')
   })
 })
 

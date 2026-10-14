@@ -75,7 +75,8 @@
 读取配置有三态：`absent`（ENOENT，合法的空配置）/ `ok`（解析成功 + 刷新 last-good）/ `error`（读到了但 JSON 非法、顶层不是对象、或 IO 失败）。
 - **C1 已实现（v0.2.1）**：`error` 时**继续沿用最近一次成功解析的配置**；同一条错误只 warn 一次（成功读取后计数重置）；每次沿用打一条限流 info。对应断言在 `tools/verify.mjs` 的 `fail-open` 区（4 条），并做过反向验证（把 `stale` 打回 `false` → 3 条精确报错）。**删除文件仍然是合法的清空**，不许 fail-safe 回旧配置。
 - 修之前的形态是危险的 fail-open：`error` 被折叠成"没有配置"，写坏一个字符就让**全部** hook（含 deny 守卫）静默消失，而且一直消失。历史取证见 `.tmp/hotreload-fix-plan.md`。
-- **C2 未实现**：用 `ctx.fs.stat()` 的 `version`（`dev:ino:size:mtimeNs:ctimeNs`）做**状态核对**，作为失效主通道（watcher 降为加速器、TTL 只做兜底）。注意 verify 的假 `ctx.fs.stat` 目前**不返回 `version`**（真实 `ctx.fs` 返回 `FsInfo.version`）——实现 C2 时要同时给假 fs 补 `version`，并覆盖"没有 version 的 provider 退化成 TTL"这一支。
+- **C2 已实现（v0.2.1）**：用 `ctx.fs.stat()` 的 `version`（`dev:ino:size:mtimeNs:ctimeNs`）做**失效主通道** —— 版本没变就复用缓存（连 TTL 都不等），变了就立刻重读；watcher 是加速器，**TTL 降为"provider 不返回 version / stat 抛错"时的兜底**。`configFor` 每次事件点先核对版本（2 次 stat），`loadConfig` 才真正读。断言在 `tools/verify.mjs` 的 `C2` 区（3 条），并做过**双向**反向验证（关掉版本通道 → 2 条报错；把"内容变了"看成"没变" → 1 条报错）。
+  代价与边界：每次事件点多 2 次 `stat`（Windows ~10–100µs）；假 `ctx.fs` **默认不返回 `version`**（于是默认覆盖"没有版本通道"那一支），需要版本的项目必须显式 `makeFs({version: true})`；`stat` 失败**绝不允许**清掉 last-good。
 - **C3 未实现**：可观测性（payload 里加 `dsh_hooks: {config_path, config_version, loaded_at, reload_reason, last_error}`；可选旁路 journal）。宿主 logger 没有可发现的落盘位置（§6），所以这条对排查很重要。
 - **任何写入路径落地之前必须先有 C1**（已满足）**且 C2 落地**（UI 会让人更频繁地改这个文件）。
 
@@ -150,7 +151,7 @@
 | 宿主半边不热重载 | §1.2：重启，或告知用户；`plugin_manager` 禁用→启用也**不重新 import 模块** |
 | **设置导航那一格**的图标不可由插件提供 | §3.3。上游支持 `icon` 注册参数后立刻改用它。别和 **manifest 级 `icon`** 混淆——那个是插件卡片图标，官方支持（§7） |
 | `order` 不保证"永远最后" | 920 只是大于 mcp/900、skills/910 |
-| **`readJson` fail-open** | §2.9。**C1 已修**（三态 + last-good + 错误去重告警，有断言与反向验证）；**C2 版本核对 / C3 可观测性仍未实现** |
+| **配置读取的三态与失效通道** | §2.9。**C1 已修**（三态 + last-good + 错误去重告警）、**C2 已修**（stat 版本核对为主通道）——两者都有断言与反向验证；**C3 可观测性（payload 元数据 + 旁路 journal）未做** |
 | 项目级 = 最近 `.git` 祖先 | 上游约束（与 `dsh-skill-filesystem` 同一约定），不支持 monorepo 子项目选择 |
 | 官方兼容桥是**进程级单配置** | `dsh-hooks-claude-code` / `dsh-hooks-codex` 的 `configPath` 启动只读一次，无法表达项目级；同时命中同一事件 = 同一个 hook 跑两遍 |
 | `args` 不被协议支持 | DSH 的 hook 协议只认 `command` 字符串 → 参数拼进 `command` |

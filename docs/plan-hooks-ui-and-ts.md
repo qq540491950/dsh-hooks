@@ -439,3 +439,31 @@ window.__ModuleLoader__.load({
 - [ ] 试运行与真实运行同路径
 - [ ] `node tools/verify.ts` 是唯一必跑命令、零依赖、不经过构建链；每个新断言都有反向验证
 - [ ] README / AGENTS / docs 三份文档互相指向，且引用的路径都存在
+
+---
+
+## 9. 执行记录（每阶段完成后追加，含"没实测什么"）
+
+### P0 —— 完成（commit `223934b`）
+
+- 产出：`AGENTS.md`、`docs/plan-hooks-ui-and-ts.md`、`docs/baseline-p0.md`、`.gitattributes`、`.editorconfig`、`.prettierrc.json`、`.gitignore` 补 esbuild 中间产物。
+- 验收：`node tools/verify.mjs` → `61 passed, 0 failed`（源码未动）；新文件编码检查通过（无 BOM / 无 `U+FFFD` / LF）。
+- **未实测**：无（本阶段只加文件）。
+
+### P1a —— 完成（commit `fceaaa0`）
+
+- 产出：`readJsonFile` 三态（`absent`/`ok`/`error`）+ `lastGood` + 错误内容去重告警 + 沿用时的限流 info；`configFor` 拆分出 `loadConfig`。
+- 断言：新增 `fail-open` 区 4 条（写坏后仍 deny、删除即清空、顶层非对象也算坏、修好即按新配置跑且错误计数重置）。
+- 反向验证：把 `stale` 打回 `false`（锚点唯一，命中 1 次）→ **3 条**精确报错 → 还原后 61+4 = 65/65，且 `lib/index.js` 与注入前字节相同。
+- **未实测（需要重启 DSH）**：在线复现"写坏后 deny 仍在"、在线热重载；profile 里跑的还是重启前的旧模块。
+
+### P1b —— 完成（本次提交）
+
+- 产出：`readVersions`（`ctx.fs.stat().version` 探测）+ `sameVersions` + `configFor` 改为「版本核对 → watcher → TTL」三层；`loadConfig` 记录 `entry.versions` / `entry.hasHooks`（**无论成败都记**，坏文件没改动时不再重复读）；并发在飞的条目被共享。
+- 断言：新增 `C2` 区 3 条（版本没变则 TTL 到期也不重读 / 内容一变立刻重读 / `stat` 抛错只降级 TTL 且不丢 last-good）；假 `ctx.fs` 增加 `version: true` 选项（默认**不给** version，于是原有那批 TTL 用例同时在守"没有版本通道的 provider"）。
+- 反向验证：**双向**注入 —— ① 关掉版本通道 → 预期 2 条报错；② 把"内容变了"看成"没变"（最危险的陈旧方向）→ 预期 1 条报错。两次都精确命中且还原后 68/68。
+- **未实测（需要重启 DSH）**：真实 `ctx.fs` 的 `version` 在 Windows 上是否真的随内容变化（本机未采样）；每次事件点多 2 次 `stat` 的实际开销（计划里按 ~10–100µs 估）。
+
+### 下一步
+
+P2（TS 工具链配置 + `pnpm install`）→ P3（协议层搬 TS + `tools/build.ts` + verify 迁移）。**P5 才需要第一次重启**（客户端半边首次发布），宿主侧的在线验收可以在那时合并做一次。
