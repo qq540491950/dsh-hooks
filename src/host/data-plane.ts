@@ -16,6 +16,7 @@ import { HOOK_EVENTS, DEFAULT_TIMEOUT_MS, type HookEvent } from '../shared/const
 import { messageOf } from '../shared/guards.ts'
 import { matcherDiagnostic } from '../shared/protocol.ts'
 import type { ParsedGroups, SkippedHandler } from '../shared/types.ts'
+import { parseHooksRequest, type HooksRequest } from './write.ts'
 
 /**
  * 本插件注册的浏览器路由。
@@ -61,6 +62,13 @@ export interface HooksInspection {
   effective: ParsedGroups
   /** 生效配置是否来自"沿用上一份可用配置"（磁盘当前读不出来）。 */
   staleInUse: boolean
+  /**
+   * 宿主声明"这个数据面能不能写"。
+   *
+   * 由宿主给而不是由路由猜：路由注册了 POST 才为 true，页面据此显示可编辑 / 只读横幅 ——
+   * 而不是让用户点了没反应。
+   */
+  writable: boolean
 }
 
 /** 单条 hook 的呈现。 */
@@ -231,8 +239,8 @@ export function buildSnapshot(inspection: HooksInspection): HooksSnapshot {
     events,
     total: { hookCount: totalHooks, disabledCount: totalDisabled, groupCount: totalGroups },
     staleInUse: inspection.staleInUse,
-    // P4b 接上写入后改成 true；在那之前页面显示只读横幅，而不是让用户点了没反应。
-    capabilities: { writable: false },
+    // 由宿主的 inspection 决定（路由注册了 POST 才为 true）。
+    capabilities: { writable: inspection.writable },
   }
 }
 
@@ -270,24 +278,89 @@ function sessionIdOf(request: Request): string | undefined {
   }
 }
 
+/** 一次写入的结果（宿主给，路由只负责翻成 HTTP）。 */
+export interface WriteOutcome {
+  ok: boolean
+  error?: string
+  detail?: string
+  version?: string
+}
+
+/** 路由需要的两个能力：读快照、定点写。 */
+export interface RouteDeps {
+  inspect(sessionId: string | undefined): Promise<HooksInspection>
+  write(request: HooksRequest, sessionId: string | undefined, signal: AbortSignal): Promise<WriteOutcome>
+}
+
 /**
- * 注册 `/api/hooks`。**只做 HTTP 适配**：真正的语义（读文件、合并、判定 stale）在 `inspect` 里。
+ * 错误码 → HTTP 状态码。
+ *
+ * 页面据此把失败**分别**说清（AGENTS §3.9）：`stale` = "文件被别处改过了，请刷新"，
+ * `sandbox` = "当前会话权限不允许写"，`invalid-json` = "文件读不出来，为避免覆盖所以没写"。
+ * 全用 4xx 表达"你的请求/环境的问题"，5xx 只留给真正的插件内部错误。
+ */
+function statusFor(error: string | undefined): number {
+  switch (error) {
+    case 'stale':
+    case 'exists':
+    case 'not-preservable':
+    case 'invalid-json':
+    case 'no-project':
+    case 'no-version':
+      return 409
+    case 'absent':
+    case 'not-found':
+      return 404
+    case 'sandbox':
+      return 403
+    case 'bad-op':
+    case 'bad-json':
+      return 400
+    default:
+      return 500
+  }
+}
+
+/**
+ * 注册 `/api/hooks`。**只做 HTTP 适配**：读的语义在 `deps.inspect`、写的语义在 `deps.write`。
  *
  * 错误信封：`{ok:false, error, detail?}` **没有 `data`**；成功是 `{ok:true, data}`。
- * 500 的 `detail` 只放技术原文，页面主文案要用自己的话（AGENTS §3.9）。
+ * `detail` 只放技术原文，页面主文案要用自己的话（AGENTS §3.9）。
  */
-export function registerHooksRoute(
-  connection: ConnectionFetchBridge,
-  inspect: (sessionId: string | undefined) => Promise<HooksInspection>,
-): void {
+export function registerHooksRoute(connection: ConnectionFetchBridge, deps: RouteDeps): void {
   connection.fetch.register({
     path: HOOKS_ROUTE,
-    methods: ['GET'],
+    // POST 与 GET 同时在册：页面用 `capabilities.writable` 决定要不要真的发写请求。
+    methods: ['GET', 'POST'],
     // 必须在 bridge 读任何字节**之前**声明（官方契约）。body 只有几百字节，不必流式。
     requestBody: 'buffered',
     async fetch(request: Request): Promise<Response> {
+      const sessionId = sessionIdOf(request)
       try {
-        const inspection = await inspect(sessionIdOf(request))
+        if (request.method === 'POST') {
+          let body: unknown
+          try {
+            body = await request.json()
+          } catch {
+            return jsonResponse(400, { ok: false, error: 'bad-json' })
+          }
+          const parsed = parseHooksRequest(body)
+          if (!parsed.ok) return jsonResponse(400, { ok: false, error: 'bad-op', detail: parsed.reason })
+          // `request.signal`：客户端断开时中止这次写入（官方契约里桥接器会中止处理函数的信号）。
+          const outcome = await deps.write(parsed.request, sessionId, request.signal)
+          if (!outcome.ok) {
+            return jsonResponse(statusFor(outcome.error), {
+              ok: false,
+              error: outcome.error ?? 'write-failed',
+              ...(outcome.detail !== undefined ? { detail: outcome.detail } : {}),
+            })
+          }
+          return jsonResponse(200, {
+            ok: true,
+            data: { file: parsed.request.file, version: outcome.version ?? null },
+          })
+        }
+        const inspection = await deps.inspect(sessionId)
         return jsonResponse(200, { ok: true, data: buildSnapshot(inspection) })
       } catch (error) {
         // 技术原文留在 detail 里，页面自己决定怎么措辞 —— 绝不把 FsError 原文当主文案。

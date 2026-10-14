@@ -105,6 +105,9 @@
 - 快照里的"生效配置"**必须取 `configFor()` 的缓存**（就是 runner 正在用的那一份），而不是路由里重新解析一遍 —— 后者会得到"磁盘刚的样子"，在 fail-open 场景下与 runner 不一致，页面就在撒谎。
 - 没有会话上下文时 `cwd` / `projectRoot` 一律给 `null` 并如实标注来源，**不许拿 `process.cwd()` 顶上**。
 - 可离线测：注册契约靠捕获 `register()`，handler 行为靠**直接 `new Request(...)` 调 handler**（绝对 URL）—— 不需要浏览器。
+- **写请求的错误码必须能分别说清**（§3.9）：`stale`（版本冲突，409）、`exists`（409）、`not-preservable`（409）、`invalid-json`（409，**读不懂就拒写**）、`absent` / `not-found`（404）、`sandbox`（403）、`bad-op` / `bad-json`（400）。**不许**把"读不懂文件"和"权限不允许"都糊成一句"保存失败"。
+- **`invalid-json` 时绝不落笔**：覆盖一份我们读不懂的文件 = 删掉用户的内容。`no-version`（provider 没给版本）同样拒写 —— **不做无守卫写入**。
+- **已核实的 provider 行为**（读 `dsh-fs-local/lib/index.js`）：`writeFileAtomic` 里有 `mkdir(dirname, { recursive: true })`，所以**父目录会被自动创建**（`createFile` 因此能建出 `<projectRoot>/.dsh/hooks.json`）；`replaceIfVersion` 在**文件已消失**时同样报 `FS_STALE_VERSION`。假 fs 必须与真实 provider 同能力，否则会出现"自检里假失败、真机没事"。
 
 ## 3. UI 纪律
 

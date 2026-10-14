@@ -144,6 +144,9 @@ export function serialize(doc: Record<string, unknown>, style: DocStyle): string
   return style.finalNewline ? withEol + style.eol : withEol
 }
 
+/** 默认风格（我们自己的输出风格，也是新建文件用的风格）。 */
+export const DEFAULT_STYLE: DocStyle = { indent: '  ', eol: '\n', finalNewline: true }
+
 /** 新文件的内容：一个自解释的空配置。 */
 export function starterText(style: DocStyle): string {
   return serialize({ hooks: {} }, style)

@@ -79,6 +79,16 @@ import type {
   ToolExecution,
 } from './service-types.ts'
 import { registerHooksRoute, type HooksInspection, type SourceInspection } from './data-plane.ts'
+// 写路径的纯函数区：定点操作、风格、保留性证明、请求体校验（业务语义只有这一份）。
+import {
+  DEFAULT_STYLE,
+  applyOp,
+  detectStyle,
+  preservationProblem,
+  serialize,
+  starterText,
+  type HooksRequest,
+} from './write.ts'
 
 /** 插件名。 */
 export const name = 'dsh-hooks'
@@ -103,9 +113,17 @@ interface VersionSnapshot {
 
 /** 一次读取的三态结果。 */
 type ReadState =
-  | { path: string; state: 'absent'; version: string | null | undefined }
-  | { path: string; state: 'ok'; raw: Record<string, unknown>; version: string | null | undefined }
-  | { path: string; state: 'error'; message: string; version: string | null | undefined }
+  | { path: string; state: 'absent'; target: FsTarget | undefined; version: string | null | undefined }
+  | {
+      path: string
+      state: 'ok'
+      target: FsTarget | undefined
+      raw: Record<string, unknown>
+      /** 原文件的**原始文本**（写路径要用它探测缩进/行尾/结尾换行）。 */
+      text: string
+      version: string | null | undefined
+    }
+  | { path: string; state: 'error'; target: FsTarget | undefined; message: string; version: string | null | undefined }
 
 /** 缓存条目的可变状态（与 promise 分开，避免"先有 promise 后有 entry"的初始化绕路）。 */
 interface CacheState {
@@ -282,30 +300,32 @@ export function apply(ctx: HostContext): void {
    *
    * 永不抛。见文件头的「三态读取」。
    */
-  async function readJsonFile(path: string): Promise<ReadState> {
+  async function readJsonFile(path: string, signal?: AbortSignal): Promise<ReadState> {
     let target: FsTarget
-    let version: string | undefined
+    let version: string | null | undefined
     try {
       target = await fsSvc.resolve(path)
-      const stat = await fsSvc.stat(target)
-      if (stat === undefined || stat.type !== 'file') return { path, state: 'absent', version: undefined }
+      const stat = await fsSvc.stat(target, signal)
+      if (stat === undefined || stat.type !== 'file') return { path, state: 'absent', target, version: undefined }
       // 契约里 `version` 是字符串（或 null/undefined）；不再多套一层 String()：
       // 真要有 provider 违约给出非字符串，最坏也只是缓存键对不上 → 多读一次，不会出错。
       version = stat.version === undefined || stat.version === null ? undefined : stat.version
     } catch (error) {
       const message = messageOf(error)
       return isMissingFile(message)
-        ? { path, state: 'absent', version: undefined }
-        : { path, state: 'error', message, version: undefined }
+        ? { path, state: 'absent', target: undefined, version: undefined }
+        : { path, state: 'error', target: undefined, message, version: undefined }
     }
 
     let text: string
     try {
-      text = await fsSvc.readText(target)
+      text = await fsSvc.readText(target, signal)
     } catch (error) {
       const message = messageOf(error)
       // 读的瞬间文件被删掉：按"不存在"处理，不当成损坏。
-      return isMissingFile(message) ? { path, state: 'absent', version } : { path, state: 'error', message, version }
+      return isMissingFile(message)
+        ? { path, state: 'absent', target, version }
+        : { path, state: 'error', target, message, version }
     }
 
     // Windows PowerShell 的 `Set-Content -Encoding utf8` 会写出带 BOM 的文件，而 JSON.parse
@@ -314,14 +334,14 @@ export function apply(ctx: HostContext): void {
     try {
       parsed = JSON.parse(text.replace(/^\uFEFF/, ''))
     } catch (error) {
-      return { path, state: 'error', message: messageOf(error), version }
+      return { path, state: 'error', target, message: messageOf(error), version }
     }
     // 顶层不是对象（`42` / `"text"` / `[...]` / `null`）同样是"读到了但不是合法配置"：
     // 当成"没有配置"的话，用户把文件改成数组也会静默停掉全部 hook。
     if (!isObject(parsed)) {
-      return { path, state: 'error', message: '顶层不是 JSON 对象', version }
+      return { path, state: 'error', target, message: '顶层不是 JSON 对象', version }
     }
-    return { path, state: 'ok', raw: parsed, version }
+    return { path, state: 'ok', target, raw: parsed, text, version }
   }
 
   /** 从 cwd 向上找最近的含 .git 的目录；找不到返回 cwd 本身。 */
@@ -761,26 +781,42 @@ export function apply(ctx: HostContext): void {
 
   //#region 数据面（设置页的只读快照）
 
-  /** cwd 的来源，如实报告、绝不编造（AGENTS §2.8）。**同步**函数：只查内存里的 agent 表。 */
-  function cwdFor(sessionId: string | undefined): { cwd: string | null; source: 'session' | 'initiator' | 'none' } {
+  /**
+   * 按 `sessionId` 找 agent（找不到退回"当前发起者"），并如实报告来源。**同步**函数：只查内存表。
+   *
+   * 数据面的读（要 cwd）与写（还要沙箱策略）都从这里出发，所以必须是**同一个**解析。
+   */
+  function agentForSession(sessionId: string | undefined): {
+    agent: AgentLike | undefined
+    source: 'session' | 'initiator' | 'none'
+  } {
     const agents = ctx.get('agents')
     if (sessionId !== undefined && agents !== undefined && typeof agents.get === 'function') {
       try {
-        const cwd = agents.get(sessionId)?.session?.header?.cwd
-        if (typeof cwd === 'string' && cwd.length > 0) return { cwd, source: 'session' }
+        const agent = agents.get(sessionId)
+        const cwd = agent?.session?.header?.cwd
+        if (typeof cwd === 'string' && cwd.length > 0) return { agent, source: 'session' }
       } catch {
         /* 拿不到就往下试 */
       }
     }
     if (agents !== undefined && typeof agents.currentInitiator === 'function') {
       try {
-        const cwd = agents.currentInitiator()?.session?.header?.cwd
-        if (typeof cwd === 'string' && cwd.length > 0) return { cwd, source: 'initiator' }
+        const agent = agents.currentInitiator()
+        const cwd = agent?.session?.header?.cwd
+        if (typeof cwd === 'string' && cwd.length > 0) return { agent, source: 'initiator' }
       } catch {
         /* 没有就是没有 */
       }
     }
-    return { cwd: null, source: 'none' }
+    return { agent: undefined, source: 'none' }
+  }
+
+  /** cwd 的来源，如实报告、绝不编造（AGENTS §2.8）。 */
+  function cwdFor(sessionId: string | undefined): { cwd: string | null; source: 'session' | 'initiator' | 'none' } {
+    const found = agentForSession(sessionId)
+    const cwd = found.agent?.session?.header?.cwd
+    return typeof cwd === 'string' && cwd.length > 0 ? { cwd, source: found.source } : { cwd: null, source: 'none' }
   }
 
   /** 把一次读取折成页面要的来源视图（用**同一个** `parseHookConfig` —— AGENTS §2.6）。 */
@@ -824,6 +860,8 @@ export function apply(ctx: HostContext): void {
         sources: [userOnly],
         effective: userOnly.groups,
         staleInUse: false,
+        // 数据面本身就是"能写"的入口：路由注册了 POST，页面据此显示可编辑。
+        writable: true,
       }
     }
     const projectRoot = await projectRootFor(cwd)
@@ -840,15 +878,132 @@ export function apply(ctx: HostContext): void {
       sources: [project, user],
       effective: config.groups,
       staleInUse: projectCache.get(projectRoot)?.state.stale === true,
+      writable: true,
     }
   }
 
   // 只有 Web 载体才提供 connection。没有它就不注册数据面 —— 设置页没了，但 hooks 照跑：
   // 数据面是便利设施，不是硬依赖（也正因为如此，自检的假 ctx 不必实现它）。
   if (ctx.connection !== undefined) {
-    registerHooksRoute(ctx.connection, inspect)
+    registerHooksRoute(ctx.connection, { inspect, write: handleWrite })
   } else {
     info('dsh-hooks: 当前载体没有 connection 服务，设置页数据面未注册（hooks 本身不受影响）')
+  }
+
+  //#endregion
+
+  //#region 数据面：写路径（定点写 + 版本锁 + 保留性证明）
+
+  /** 准备一次写入的结果。任何"读不出来"都在这里变成**拒写**。 */
+  type WritePrep =
+    | { ok: true; state: 'absent'; target: FsTarget }
+    | { ok: true; state: 'ok'; target: FsTarget; doc: Record<string, unknown>; text: string; version: string }
+    | { ok: false; error: string; detail?: string }
+
+  async function prepareWrite(path: string, signal: AbortSignal | undefined): Promise<WritePrep> {
+    const read = await readJsonFile(path, signal)
+    if (read.state === 'error') {
+      // **绝不在读不懂的文件上落笔**：那会把用户的内容整段替换成我们序列化出来的东西。
+      return { ok: false, error: 'invalid-json', detail: read.message }
+    }
+    if (read.target === undefined) return { ok: false, error: 'resolve-failed' }
+    if (read.state === 'absent') return { ok: true, state: 'absent', target: read.target }
+    const version = read.version
+    if (typeof version !== 'string' || version.length === 0) {
+      // 拿不到版本就**不做无守卫写入** —— 那正是"覆盖别人改动"的入口（`expected` 必给，AGENTS §2.3）。
+      return { ok: false, error: 'no-version' }
+    }
+    return { ok: true, state: 'ok', target: read.target, doc: read.raw, text: read.text, version }
+  }
+
+  /** 把 `writeText` 抛出的异常翻成页面能**分别处理**的错误码。 */
+  function writeErrorCode(error: unknown): string {
+    const message = messageOf(error)
+    // `FS_STALE_VERSION` 是官方契约里版本冲突的精确错误码（已用 cordis_inspect_query 核实）。
+    if (message.includes('FS_STALE_VERSION')) return 'stale'
+    // 沙箱拒绝只能按消息 best-effort 归类 —— 契约没给精确错误码，这条要在线上复核。
+    if (/FS_(DENIED|SANDBOX|READ_ONLY)|read-only|permission denied|EPERM|EACCES/i.test(message)) return 'sandbox'
+    return 'write-failed'
+  }
+
+  /** 一次写入的结果（路由据此出响应）。 */
+  interface WriteResult {
+    ok: boolean
+    error?: string
+    detail?: string
+    version?: string
+  }
+
+  /**
+   * 定点写：只改 `request` 指到的那一处。
+   *
+   * 三道防线，缺一不可：
+   *   ① 读不懂就拒写（`invalid-json`）—— 否则会把读不懂的内容整段覆盖掉；
+   *   ② 保留性证明不过就拒写（`not-preservable`）—— 证明的是"我声明改了什么"这份声明；
+   *   ③ 写盘带**版本锁**（存在用 `replaceIfVersion`、不存在用 `createIfAbsent`）——
+   *      页面与编辑器并发改同一份文件时，后到的那次拿到 `stale`，而不是静默覆盖。
+   */
+  async function writeHookFile(
+    request: HooksRequest,
+    projectRoot: string | null,
+    signal: AbortSignal | undefined,
+    policy: ResolvedPolicy | undefined,
+  ): Promise<WriteResult> {
+    const path =
+      request.file === 'user'
+        ? joinPath(dshHome(), HOOKS_FILE)
+        : projectRoot === null
+          ? undefined
+          : joinPath(projectRoot, PROJECT_DIR, HOOKS_FILE)
+    if (path === undefined) return { ok: false, error: 'no-project' }
+
+    const prep = await prepareWrite(path, signal)
+    if (!prep.ok) return { ok: false, error: prep.error, ...(prep.detail !== undefined ? { detail: prep.detail } : {}) }
+    // 与 hook 子进程同理：写入按**调用会话**的沙箱档位来；拿不到就省略该字段回退部署策略（AGENTS §1.6）。
+    const sandboxPolicy = policy?.passthrough
+
+    try {
+      if (request.op === 'createFile') {
+        if (prep.state !== 'absent') return { ok: false, error: 'exists' }
+        const created = await fsSvc.writeText(
+          prep.target,
+          starterText(DEFAULT_STYLE),
+          { kind: 'createIfAbsent' },
+          signal,
+          sandboxPolicy,
+        )
+        return { ok: true, version: created.version }
+      }
+
+      if (prep.state === 'absent') return { ok: false, error: 'absent' }
+      const applied = applyOp(prep.doc, request)
+      if (!applied.ok) return { ok: false, error: applied.reason }
+      const problem = preservationProblem(prep.doc, applied.applied.doc, applied.applied.changes)
+      if (problem !== undefined) return { ok: false, error: 'not-preservable', detail: problem }
+      const text = serialize(applied.applied.doc, detectStyle(prep.text))
+      const written = await fsSvc.writeText(
+        prep.target,
+        text,
+        { kind: 'replaceIfVersion', version: prep.version },
+        signal,
+        sandboxPolicy,
+      )
+      return { ok: true, version: written.version }
+    } catch (error) {
+      return { ok: false, error: writeErrorCode(error), detail: messageOf(error) }
+    }
+  }
+
+  /** 路由的写入口：把 `sessionId` 解析成 projectRoot + 该会话的沙箱策略。 */
+  async function handleWrite(
+    request: HooksRequest,
+    sessionId: string | undefined,
+    signal: AbortSignal,
+  ): Promise<WriteResult> {
+    const found = agentForSession(sessionId)
+    const cwd = found.agent?.session?.header?.cwd
+    const projectRoot = typeof cwd === 'string' && cwd.length > 0 ? await projectRootFor(cwd) : null
+    return writeHookFile(request, projectRoot, signal, sandboxPolicyFor(found.agent))
   }
 
   //#endregion

@@ -518,3 +518,13 @@ window.__ModuleLoader__.load({
 - 反向验证 4 个注入全部精确命中：删除类补偿方向退回 `both`、下标校验放过 `-1`、序列化忽略 tab 缩进、**把保留性证明改成永远返回"没问题"**。还原后 98/98。
 - **写路径自身抓到过一个真 bug**（第一版）：`removeHook` 的补偿方向写成"两侧都抹掉"，于是删除操作会被自己的保留性证明拒写。是 `W：…只动目标` 那条断言把它抓出来的 —— 这正是"证明"存在的意义。
 - **未做（留给 P4c）**：`POST /api/hooks` 的路由接线（版本锁 `replaceIfVersion`/`createIfAbsent`、`FS_STALE_VERSION` → `stale`、`invalid-json` 时**拒写**、沙箱策略透传）、有界执行台账、试运行。
+
+### P4c —— 完成（本次提交）：把写路径接线到 `POST /api/hooks`
+
+- 产出：`registerHooksRoute(connection, {inspect, write})` —— GET 读快照 + POST 定点写挂在同一条路由上；宿主侧 `prepareWrite` / `writeHookFile` / `handleWrite`（新增 `agentForSession` 统一"读要 cwd、写还要沙箱策略"的解析）；`ReadState` 补 `target` 与 `text`（写路径要原文探测缩进/行尾）；`capabilities.writable` 改由宿主的 `inspection.writable` 声明（不再写死 false）。
+- **三道防线落地**：① **读不懂就拒写**（`invalid-json`，409）—— 覆盖读不懂的文件等于删用户内容；② 保留性证明不过就拒写（`not-preservable`）；③ 写盘带**版本锁**，且 `prepareWrite` 拿不到版本时拒写（`no-version`）—— **绝不做无守卫写入**。
+- 错误码 → 状态码：`stale`/`exists`/`not-preservable`/`invalid-json`/`no-project`/`no-version` = 409；`absent`/`not-found` = 404；`sandbox` = 403；`bad-op`/`bad-json` = 400。页面据此把失败分别说清（§3.9）。
+- 断言：新增 `P3` 区 7 条（真实文件系统上跑 POST）：落盘 + 未知键保留 + **乐观锁用的是读到的那个版本** + 版本冲突（文件不变）+ 坏文件拒写（文件不变）+ `absent`/`createFile`/`exists` + 越界 + 沙箱 + 畸形请求体（一条都没写到盘）+ `not-preservable` 透传；`E` 区补上 `write.ts` 的产物标记。自检 **99 → 107**。
+- 反向验证 3 个注入全部精确命中并还原：乐观锁传假版本、读不懂也照写、`capabilities.writable` 写死 false。
+- **自检又抓到一个"假件比真的弱"的问题**：`createFile` 在自检里 500，因为假 fs 不建父目录；而真实 provider 的 `writeFileAtomic` 里有 `mkdir(dirname, {recursive:true})`（已读 asar 源码核实）。修法是让假 fs 与真实同能力 —— 否则会出现"自检里假失败、真机没事"，反过来也可能掩盖真问题。
+- **未做（留给 P4d）**：有界执行台账（状态色的唯一证据来源）与试运行（复用 `runPoint`）。

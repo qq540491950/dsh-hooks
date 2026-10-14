@@ -158,7 +158,7 @@ test('E：功能标记必须真的出现在产物里（源码存在 ≠ 已交�
   const source = fs.readFileSync(LIB, 'utf8')
   const markers = [
     '/api/hooks', // data-plane.ts：设置页路由
-    // TODO(P4c)：接线写路径后把 write.ts 的标记加进来（例如「改写会动到目标之外的字段」）
+    '改写会动到目标之外的字段', // write.ts：写路径（接线之前它整块被 esbuild 丢掉了）
   ]
   for (const marker of markers) {
     assert.ok(source.includes(marker), `产物里应当出现 ${marker} —— 检查它所在的模块是不是没被 import 进去`)
@@ -675,6 +675,33 @@ function makeFs(options = {}) {
     async readText(target) {
       if (options.onRead) options.onRead(target)
       return localFsBase.readText(target)
+    },
+    /**
+     * 写盘：按官方 `FsWriteIntent` 语义**仿真守卫** —— `replaceIfVersion` 版本不符抛
+     * `FS_STALE_VERSION`（与真实 provider 的精确错误码一致），`createIfAbsent` 目标已存在抛错。
+     * 这样"乐观锁真的传了、过期真的被拒"可以被离线断言，而不是靠线上试。
+     */
+    async writeText(target, content, expected) {
+      if (options.writes) options.writes.push({ path: target.displayPath, content, expected })
+      if (expected && expected.kind === 'replaceIfVersion') {
+        const info = await fsImpl.stat(target)
+        if (info === undefined || info.version !== expected.version) {
+          throw new Error(`FS_STALE_VERSION: 期望 ${expected.version}，实际 ${String(info && info.version)}`)
+        }
+      }
+      if (expected && expected.kind === 'createIfAbsent' && fs.existsSync(target.displayPath)) {
+        throw new Error('FS_EXISTS: 目标已存在')
+      }
+      // 真实 provider 的 `writeFileAtomic` 里有 `mkdir(dirname, { recursive: true })`（已核实 asar 源码），
+      // 父目录会被自动创建。假 fs 必须同样做到 —— 否则"新建项目级配置"会在自检里假失败。
+      await fsp.mkdir(path.dirname(target.displayPath), { recursive: true })
+      await fsp.writeFile(target.displayPath, content, 'utf8')
+      return {
+        operation: expected && expected.kind === 'createIfAbsent' ? 'create' : 'update',
+        version: 'v-written',
+        before: null,
+        after: content,
+      }
     },
   }
   if (options.watch === 'none') return fsImpl
@@ -1663,6 +1690,32 @@ async function callRoute(route, query = '') {
   return { status: response.status, body, data }
 }
 
+/** POST 一个定点操作（走真实 handler，不碰浏览器）。 */
+async function postRoute(route, payload) {
+  const response = await route.fetch(
+    new Request('http://127.0.0.1/api/hooks', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(payload),
+    }),
+  )
+  const body = await response.json()
+  const data = body !== null && typeof body === 'object' && body.data ? body.data : {}
+  return { status: response.status, body, data }
+}
+
+/** POST 一个**原始** body 字符串（测非 JSON 的请求体）。 */
+async function postRaw(route, raw) {
+  const response = await route.fetch(
+    new Request('http://127.0.0.1/api/hooks', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: raw,
+    }),
+  )
+  return { status: response.status, body: await response.json() }
+}
+
 /** 造一个空的检视结果（纯函数测试用）。 */
 function emptyInspection(overrides = {}) {
   return {
@@ -1672,6 +1725,7 @@ function emptyInspection(overrides = {}) {
     sources: [],
     effective: {},
     staleInUse: false,
+    writable: false,
     ...overrides,
   }
 }
@@ -1691,7 +1745,7 @@ function sourceInspection(kind, groups, overrides = {}) {
   }
 }
 
-await test('P：路由注册契约（路径以 /api/ 开头、GET、buffered）', async () => {
+await test('P：路由注册契约（路径以 /api/ 开头、GET+POST、buffered）', async () => {
   const conn = makeConnection()
   await mount({ connection: conn.connection })
   assert.equal(conn.routes.length, 1, '应当恰好注册一条路由')
@@ -1701,7 +1755,7 @@ await test('P：路由注册契约（路径以 /api/ 开头、GET、buffered）'
     route.path.startsWith('/api/'),
     'connection.fetch 要求路径以 /api/ 开头，否则拿不到 Host/Origin 围栏与浏览器鉴权',
   )
-  assert.deepEqual(route.methods, ['GET'])
+  assert.deepEqual(route.methods, ['GET', 'POST'], '读快照 + 定点写都挂在这一条路由上')
   assert.equal(route.requestBody, 'buffered', '必须在 bridge 读字节之前声明请求体处理方式')
   assert.equal(typeof route.fetch, 'function')
 })
@@ -1809,7 +1863,7 @@ await test('P：GET 正常路径 —— 两个来源、合并条数、只读能�
     assert.equal(pre.groups[1].hooks[0].command, 'p1', '项目级在后')
     assert.equal(pre.groups[1].hooks[1].timeoutSec, 30, '文件里的 timeout 要带出来（第 2 条才是写了 timeout 的那条）')
     assert.equal(pre.groups[1].hooks[0].timeoutSec, null, '没写 timeout 就该是 null，不要编一个数字')
-    assert.equal(data.capabilities.writable, false, 'P4a 还是只读：页面据此显示只读横幅')
+    assert.equal(data.capabilities.writable, true, 'POST 已注册：页面应当显示可编辑')
     assert.equal(data.staleInUse, false)
   })
 })
@@ -1931,8 +1985,11 @@ await test('P：disabled 的 hook 真的不跑（不只是界面显示）', asyn
 
 await test('P：handler 抛错 → 500 信封，且**没有 data**（错误契约）', async () => {
   const conn = makeConnection()
-  registerHooksRoute(conn.connection, async () => {
-    throw new Error('boom')
+  registerHooksRoute(conn.connection, {
+    inspect: async () => {
+      throw new Error('boom')
+    },
+    write: async () => ({ ok: false, error: 'write-failed' }),
   })
   const { status, body, data } = await callRoute(conn.routes[0])
   assert.equal(status, 500)
@@ -1941,6 +1998,231 @@ await test('P：handler 抛错 → 500 信封，且**没有 data**（错误契�
   assert.equal(body.detail, 'boom', '技术原文放 detail，页面主文案自己措辞')
   assert.equal(body.data, undefined, '失败响应不该有 data')
   assert.deepEqual(data.events, [], '补空形状之后仍然可断言，而不是崩在第一处解引用')
+})
+
+//#endregion
+
+//#region P3. POST /api/hooks：定点写 + 乐观锁 + 拒写情形
+
+await test('P：POST 改一条命令真的落盘、未知键保留、且用的是读到的版本（乐观锁）', async () => {
+  await withIsolatedHome(async () => {
+    const dir = await makeProject()
+    const projectFile = path.join(dir, '.dsh', 'hooks.json')
+    await writeHooks(dir, {
+      _comment: 'keep me',
+      hooks: { PreToolUse: [{ matcher: 'pwsh', hooks: [{ command: 'echo old' }] }] },
+    })
+    const conn = makeConnection()
+    const writes = []
+    const { agent } = fakeAgent(dir)
+    await mount({ connection: conn.connection, fs: makeFs({ version: true, writes }), initiator: agent })
+
+    // 页面就是照这个流程做的：先 GET 拿到版本，再拿这个版本去写。
+    const before = await callRoute(conn.routes[0])
+    const project = before.data.files.find((file) => file.kind === 'project')
+    assert.equal(typeof project.version, 'string', 'GET 必须给出文件版本，否则页面没法做乐观锁')
+
+    const response = await postRoute(conn.routes[0], {
+      op: 'setHookCommand',
+      file: 'project',
+      event: 'PreToolUse',
+      groupIndex: 0,
+      hookIndex: 0,
+      command: 'echo NEW',
+    })
+    assert.equal(response.status, 200)
+    assert.equal(response.body.ok, true)
+    assert.equal(response.data.file, 'project')
+
+    // ① 真的落盘了，而且**未知键还在**
+    const onDisk = JSON.parse(fs.readFileSync(projectFile, 'utf8'))
+    assert.equal(onDisk._comment, 'keep me', '未知键必须还在 —— 这是"克隆整份文档"最直接的证明')
+    assert.equal(onDisk.hooks.PreToolUse[0].hooks[0].command, 'echo NEW')
+    assert.equal(onDisk.hooks.PreToolUse[0].matcher, 'pwsh', 'group 上的 matcher 不许被顺手改掉')
+
+    // ② 写盘用的是**读到的那个版本**，不是无守卫覆盖
+    assert.equal(writes.length, 1, '应当恰好写一次')
+    assert.equal(writes[0].expected.kind, 'replaceIfVersion')
+    assert.equal(writes[0].expected.version, project.version, '乐观锁必须用页面看到的那个版本')
+    assert.equal(writes[0].path, projectFile)
+
+    // ③ 写完再 GET，看到的应当是**新**配置（缓存失效链路也要跟着走）
+    const after = await callRoute(conn.routes[0])
+    const pre = after.data.events.find((event) => event.event === 'PreToolUse')
+    assert.equal(pre.groups[0].hooks[0].command, 'echo NEW', '页面刷新后应当看到新命令')
+  })
+})
+
+await test('P：版本冲突 → 409 stale，且文件一个字节都没变', async () => {
+  await withIsolatedHome(async () => {
+    const dir = await makeProject()
+    const projectFile = path.join(dir, '.dsh', 'hooks.json')
+    await writeHooks(dir, { hooks: { PreToolUse: [{ hooks: [{ command: 'echo old' }] }] } })
+    const original = fs.readFileSync(projectFile, 'utf8')
+
+    const fsImpl = makeFs({ version: true })
+    fsImpl.writeText = async () => {
+      throw new Error('FS_STALE_VERSION: 期望 v1，实际 v2')
+    }
+    const conn = makeConnection()
+    const { agent } = fakeAgent(dir)
+    await mount({ connection: conn.connection, fs: fsImpl, initiator: agent })
+
+    const response = await postRoute(conn.routes[0], {
+      op: 'setHookCommand',
+      file: 'project',
+      event: 'PreToolUse',
+      groupIndex: 0,
+      hookIndex: 0,
+      command: 'echo NEW',
+    })
+    assert.equal(response.status, 409)
+    assert.equal(response.body.error, 'stale', '页面据此提示"文件被别处改过了，请刷新"')
+    assert.equal(fs.readFileSync(projectFile, 'utf8'), original, '写失败绝不能留下半成品')
+  })
+})
+
+await test('P：文件读不出来 → 拒写 invalid-json（绝不许覆盖读不懂的内容）', async () => {
+  await withIsolatedHome(async () => {
+    const dir = await makeProject()
+    const projectFile = path.join(dir, '.dsh', 'hooks.json')
+    await fsp.mkdir(path.join(dir, '.dsh'), { recursive: true })
+    const broken = '{"hooks": {\n'
+    await fsp.writeFile(projectFile, broken, 'utf8')
+    const conn = makeConnection()
+    const { agent } = fakeAgent(dir)
+    await mount({ connection: conn.connection, fs: makeFs({ version: true }), initiator: agent })
+
+    const response = await postRoute(conn.routes[0], {
+      op: 'setHookCommand',
+      file: 'project',
+      event: 'PreToolUse',
+      groupIndex: 0,
+      hookIndex: 0,
+      command: 'echo NEW',
+    })
+    assert.equal(response.status, 409)
+    assert.equal(response.body.error, 'invalid-json')
+    assert.ok(typeof response.body.detail === 'string' && response.body.detail.length > 0, '要说得出为什么')
+    assert.equal(fs.readFileSync(projectFile, 'utf8'), broken, '读不懂的文件必须原封不动 —— 覆盖它等于删掉用户的内容')
+  })
+})
+
+await test('P：文件不存在 → absent；createFile 建出可解析的空配置，再建一次是 exists', async () => {
+  await withIsolatedHome(async () => {
+    const dir = await makeProject()
+    const projectFile = path.join(dir, '.dsh', 'hooks.json')
+    const conn = makeConnection()
+    const { agent } = fakeAgent(dir)
+    await mount({ connection: conn.connection, fs: makeFs({ version: true }), initiator: agent })
+
+    const missing = await postRoute(conn.routes[0], {
+      op: 'setHookCommand',
+      file: 'project',
+      event: 'PreToolUse',
+      groupIndex: 0,
+      hookIndex: 0,
+      command: 'x',
+    })
+    assert.equal(missing.status, 404)
+    assert.equal(missing.body.error, 'absent', '页面据此提示"这份配置还不存在，要不要新建"')
+
+    const created = await postRoute(conn.routes[0], { op: 'createFile', file: 'project' })
+    assert.equal(created.status, 200)
+    const onDisk = JSON.parse(fs.readFileSync(projectFile, 'utf8'))
+    assert.deepEqual(Object.keys(onDisk), ['hooks'], '新建的文件应当是一个自解释的空配置')
+    assert.deepEqual(parseHookConfig(onDisk).errors, [], '新建的文件必须立刻是合法配置')
+
+    const again = await postRoute(conn.routes[0], { op: 'createFile', file: 'project' })
+    assert.equal(again.status, 409)
+    assert.equal(again.body.error, 'exists', '已存在就不能"创建" —— 那会覆盖')
+  })
+})
+
+await test('P：越界寻址 → 404 not-found，文件不变', async () => {
+  await withIsolatedHome(async () => {
+    const dir = await makeProject()
+    const projectFile = path.join(dir, '.dsh', 'hooks.json')
+    await writeHooks(dir, { hooks: { PreToolUse: [{ hooks: [{ command: 'echo a' }] }] } })
+    const original = fs.readFileSync(projectFile, 'utf8')
+    const conn = makeConnection()
+    const { agent } = fakeAgent(dir)
+    await mount({ connection: conn.connection, fs: makeFs({ version: true }), initiator: agent })
+
+    const response = await postRoute(conn.routes[0], {
+      op: 'setHookCommand',
+      file: 'project',
+      event: 'PreToolUse',
+      groupIndex: 0,
+      hookIndex: 7,
+      command: 'echo NEW',
+    })
+    assert.equal(response.status, 404)
+    assert.equal(response.body.error, 'not-found')
+    assert.equal(fs.readFileSync(projectFile, 'utf8'), original)
+  })
+})
+
+await test('P：沙箱拒绝写入 → 403 sandbox（不是含混的"保存失败"）', async () => {
+  await withIsolatedHome(async () => {
+    const dir = await makeProject()
+    await writeHooks(dir, { hooks: { PreToolUse: [{ hooks: [{ command: 'echo a' }] }] } })
+    const fsImpl = makeFs({ version: true })
+    fsImpl.writeText = async () => {
+      throw new Error('FS_DENIED: sandbox mode read-only forbids writing workspaceRoot')
+    }
+    const conn = makeConnection()
+    const { agent } = fakeAgent(dir)
+    await mount({ connection: conn.connection, fs: fsImpl, initiator: agent })
+
+    const response = await postRoute(conn.routes[0], {
+      op: 'setHookCommand',
+      file: 'project',
+      event: 'PreToolUse',
+      groupIndex: 0,
+      hookIndex: 0,
+      command: 'echo NEW',
+    })
+    assert.equal(response.status, 403)
+    assert.equal(response.body.error, 'sandbox')
+  })
+})
+
+await test('P：畸形请求体 → 400，且什么都不写', async () => {
+  await withIsolatedHome(async () => {
+    const dir = await makeProject()
+    const projectFile = path.join(dir, '.dsh', 'hooks.json')
+    await writeHooks(dir, { hooks: { PreToolUse: [{ hooks: [{ command: 'echo a' }] }] } })
+    const original = fs.readFileSync(projectFile, 'utf8')
+    const writes = []
+    const conn = makeConnection()
+    const { agent } = fakeAgent(dir)
+    await mount({ connection: conn.connection, fs: makeFs({ version: true, writes }), initiator: agent })
+
+    const notJson = await postRaw(conn.routes[0], 'not json at all')
+    assert.equal(notJson.status, 400)
+    assert.equal(notJson.body.error, 'bad-json')
+
+    const badOp = await postRoute(conn.routes[0], { op: 'setHookCommand', file: 'project', groupIndex: -1 })
+    assert.equal(badOp.status, 400)
+    assert.equal(badOp.body.error, 'bad-op')
+    assert.ok(typeof badOp.body.detail === 'string', '要说出哪一项不合法')
+
+    assert.equal(writes.length, 0, '畸形请求绝不许触到写盘')
+    assert.equal(fs.readFileSync(projectFile, 'utf8'), original)
+  })
+})
+
+await test('P：not-preservable 会以 409 透传给页面（页面要能分别说清）', async () => {
+  const conn = makeConnection()
+  registerHooksRoute(conn.connection, {
+    inspect: async () => emptyInspection(),
+    write: async () => ({ ok: false, error: 'not-preservable', detail: '改写会动到目标之外的字段' }),
+  })
+  const response = await postRoute(conn.routes[0], { op: 'createFile', file: 'user' })
+  assert.equal(response.status, 409)
+  assert.equal(response.body.error, 'not-preservable')
+  assert.equal(response.body.detail, '改写会动到目标之外的字段')
 })
 
 //#endregion
