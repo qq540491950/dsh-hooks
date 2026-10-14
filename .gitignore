@@ -11,6 +11,8 @@ out/
 # esbuild 打包客户端时的中间产物；正常会被构建脚本删掉，崩了才会留下
 lib/.client.cjs
 lib/.client.cjs.map
+# tsc 的声明产物（只给编辑器/引用用，不进版本库；也没有 package.json 的 types 入口）
+lib/.types/
 
 # 测试与覆盖率
 coverage/

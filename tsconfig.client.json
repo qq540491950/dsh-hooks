@@ -1,0 +1,21 @@
+{
+  // 客户端半边：有 DOM、没有 node types。**classic JSX**（jsx:"react" + jsxFactory:"h"）：
+  // JSX 编译成 h(...)，于是产物只需要 require("react") 这一个种子模块，
+  // 不必赌 react/jsx-runtime 在平台的种子表里（它在，但少一个依赖面更稳）。
+  "extends": "./tsconfig.base.json",
+  "compilerOptions": {
+    "composite": true,
+    "declaration": true,
+    "declarationMap": false,
+    "emitDeclarationOnly": true,
+    "rootDir": "src",
+    "outDir": "lib/.types",
+    "tsBuildInfoFile": ".tsbuildinfo/client.tsbuildinfo",
+    "lib": ["ES2022", "DOM", "DOM.Iterable"],
+    "types": ["react"],
+    "jsx": "react",
+    "jsxFactory": "h",
+    "jsxFragmentFactory": "Fragment"
+  },
+  "include": ["src/client/**/*.ts", "src/client/**/*.tsx", "src/shared/**/*.ts"]
+}

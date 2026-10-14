@@ -1,0 +1,6 @@
+{
+  // 只做两件事的项目引用：`pnpm typecheck` = `tsc -b` 会按半边的隔离分别检查。
+  // tools 的两个 project 刻意**不**在这里引用（自检脚本不进 typecheck 门槛）。
+  "files": [],
+  "references": [{ "path": "./tsconfig.host.json" }, { "path": "./tsconfig.client.json" }]
+}

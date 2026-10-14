@@ -1,0 +1,4 @@
+# pnpm 默认阻止依赖的安装脚本。esbuild 的安装脚本只负责把本地二进制放到位，
+# 它同时提供平台专用 optional dependency（@esbuild/win32-x64），不执行脚本也能用。
+allowBuilds:
+  esbuild: false

@@ -1,0 +1,20 @@
+{
+  // 宿主半边：**没有 DOM** —— 写 `document` / `window` 会直接编译不过（这是纪律的机器化）。
+  // 注意隔离靠的是"没有 DOM lib"，不是"没有 node types"：宿主确实要用 process 与全局 fetch。
+  "extends": "./tsconfig.base.json",
+  "compilerOptions": {
+    "composite": true,
+    "declaration": true,
+    "declarationMap": false,
+    // 只产声明、不产 JS：真正的产物由 tools/build.ts（esbuild，bundle 成一个文件）负责。
+    // 产物落在被 gitignore 的 lib/.types/ —— 刻意**不**提交、也不进 package.json 的
+    // `types`（本包是 private + 路径行装载，没有类型入口的需求，避免"提交的 .d.ts 过期"这一坑）。
+    "emitDeclarationOnly": true,
+    "rootDir": "src",
+    "outDir": "lib/.types",
+    "tsBuildInfoFile": ".tsbuildinfo/host.tsbuildinfo",
+    "lib": ["ES2022"],
+    "types": ["node"]
+  },
+  "include": ["src/host/**/*.ts", "src/shared/**/*.ts"]
+}

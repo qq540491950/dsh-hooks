@@ -1,15 +1,41 @@
 {
   "name": "dsh-hooks",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "private": true,
-  "description": "DSH Host 插件：按项目读取 <projectRoot>/.dsh/hooks.json 与 $DSH_HOME/hooks.json，运行通用 hooks 格式的配置。",
+  "description": "DSH Host 插件：按项目读取 <projectRoot>/.dsh/hooks.json 与 $DSH_HOME/hooks.json，运行通用 hooks 格式的配置；并在设置页提供可视化管理（order 920）。",
   "type": "module",
   "main": "lib/index.js",
   "exports": {
     ".": "./lib/index.js",
     "./package.json": "./package.json"
   },
+  "scripts": {
+    "build": "node tools/build.ts",
+    "typecheck": "tsc -b --clean && tsc -b",
+    "typecheck:tools": "tsc -p tsconfig.tools.json",
+    "typecheck:tools:wip": "tsc -p tsconfig.tools.wip.json",
+    "lint": "eslint .",
+    "format": "prettier --write --no-error-on-unmatched-pattern \"src/**/*.{ts,tsx}\" \"tools/**/*.ts\" \"*.{json,js,mjs}\"",
+    "format:check": "prettier --check --no-error-on-unmatched-pattern \"src/**/*.{ts,tsx}\" \"tools/**/*.ts\" \"*.{json,js,mjs}\"",
+    "verify": "node tools/verify.mjs",
+    "check": "pnpm format:check && pnpm lint && pnpm verify"
+  },
+  "engines": {
+    "node": ">=22.18",
+    "dsh": "0.2.0-rc.2"
+  },
+  "packageManager": "pnpm@12.5.1",
   "peerDependencies": {
     "@deepseek-ai/cordis": "~4.0.4"
+  },
+  "devDependencies": {
+    "@types/node": "^26.6.5",
+    "@types/react": "~18.3.1",
+    "esbuild": "^0.28.2",
+    "eslint": "^10.12.0",
+    "eslint-plugin-react-hooks": "^7.1.1",
+    "prettier": "^3.9.10",
+    "typescript": "~5.9.3",
+    "typescript-eslint": "^8.71.2"
   }
 }

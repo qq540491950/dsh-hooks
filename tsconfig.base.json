@@ -1,0 +1,28 @@
+{
+  // 两半共享的编译选项。每一半只覆盖 lib / jsx / types —— 差异全部写在
+  // tsconfig.{host,client}.json 里，一眼能看出隔离边界。（tsconfig 支持注释。）
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "ESNext",
+    "moduleResolution": "Bundler",
+
+    "strict": true,
+    "noUncheckedIndexedAccess": true,
+    "exactOptionalPropertyTypes": true,
+    "noImplicitOverride": true,
+    "noFallthroughCasesInSwitch": true,
+    "noUnusedLocals": true,
+    "noUnusedParameters": true,
+
+    "verbatimModuleSyntax": true,
+    "isolatedModules": true,
+
+    // 自检直接 import 源码（Node ≥22.18 会剥类型），而 Node 的 ESM 解析器不接受
+    // 无扩展名的相对路径，所以相对 import 一律写 .ts；声明产物里会被改写成 .js。
+    "allowImportingTsExtensions": true,
+    "rewriteRelativeImportExtensions": true,
+
+    "forceConsistentCasingInFileNames": true,
+    "skipLibCheck": true
+  }
+}

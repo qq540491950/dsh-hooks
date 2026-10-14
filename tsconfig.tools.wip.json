@@ -1,0 +1,7 @@
+{
+  // 「进度表」：把整个 tools/** 都纳入类型检查，但**故意不进 `pnpm check`**。
+  // 它的用途是量化"tools/verify 离严格干净还差多少"，而不是当门槛——
+  // 数字只许下降，不许靠 `any` / `as` / `@ts-expect-error` 把它抹平。
+  "extends": "./tsconfig.tools.json",
+  "include": ["tools/**/*.ts"]
+}

@@ -464,6 +464,16 @@ window.__ModuleLoader__.load({
 - 反向验证：**双向**注入 —— ① 关掉版本通道 → 预期 2 条报错；② 把"内容变了"看成"没变"（最危险的陈旧方向）→ 预期 1 条报错。两次都精确命中且还原后 68/68。
 - **未实测（需要重启 DSH）**：真实 `ctx.fs` 的 `version` 在 Windows 上是否真的随内容变化（本机未采样）；每次事件点多 2 次 `stat` 的实际开销（计划里按 ~10–100µs 估）。
 
+### P2 —— 完成（本次提交）
+
+- 产出：`package.json`（scripts / engines / packageManager / devDeps，版本 0.2.1）、`tsconfig.base.json`、`tsconfig.host.json`、`tsconfig.client.json`、`tsconfig.tools.json`、`tsconfig.tools.wip.json`、根 `tsconfig.json`（两半的 project references）、`eslint.config.js`、`pnpm-workspace.yaml`、`pnpm-lock.yaml`；`.gitignore` 补 `lib/.types/`。
+- 关键决策：**不产 `lib/types/**`**。composite + `emitDeclarationOnly` 的声明产物落在**被 gitignore 的 `lib/.types/`**，`package.json` 里也**不设 `types`** —— 本包是 private + 路径行装载，没有类型入口需求，于是直接绕开 mcp-manager 已知的两个坑（committed `.d.ts` 里仍是 `.ts` 说明符；指纹覆盖不到 `lib/types` 导致过期抓不出来）。
+- 验收：`pnpm install` 成功（26.9s，pnpm 12.5.1，`lockfileVersion: '9.0'`）；`pnpm check`（format:check + lint + verify）全绿，`verify` 仍 **68/68**；三个 tsconfig **语法与选项组合验证通过** —— `tsc -p` 只报 `TS18003: No inputs were found`（`src/` 还不存在，属预期），没有"未知选项 / composite 冲突 / 空 glob"之类的配置错误。
+- 偏离计划两处（都记账）：
+  1. `format` / `format:check` 加了 `--no-error-on-unmatched-pattern`，并把 `yml/yaml` 从 glob 里去掉。原因：P2 时 `src/**` 不存在，prettier 对空 glob **退出码 2**；而 `*.{yml,yaml}` 会把 `pnpm-lock.yaml` 这种工具生成物重排（第一次跑就改了它）。代价：glob 写错时不再报错 → **待办**：P3 之后在 verify 里加一条"format/lint 的 glob 指向真实存在的目录"断言（对应 mcp-manager 的 E11/E12）。
+  2. `pnpm check` 目前**不含 typecheck**（此时没有任何 `src/`，`tsc -b` 必然 TS18003）。**P3 落地后立刻把 `pnpm typecheck && pnpm typecheck:tools` 加回 `check`**。
+- **未实测**：typecheck 门本身（无输入）；eslint 的类型感知规则（无 `src/` 文件，`pnpm lint` 现在是"全部被 ignore → 0 文件"的通过）。
+
 ### 下一步
 
 P2（TS 工具链配置 + `pnpm install`）→ P3（协议层搬 TS + `tools/build.ts` + verify 迁移）。**P5 才需要第一次重启**（客户端半边首次发布），宿主侧的在线验收可以在那时合并做一次。

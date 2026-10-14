@@ -1,0 +1,16 @@
+{
+  // 构建脚本（P2 起只有 tools/build.ts 进这道门）。刻意**放掉四个"风格型"严格开关**：
+  // 自检/构建脚本里大量是测试替身与按下标取值的写法，开着只会产出几百条噪音错误；
+  // `strict` 仍然生效（隐式 any、never 误用、缺属性、参数类型错误照旧拦）。
+  "extends": "./tsconfig.base.json",
+  "compilerOptions": {
+    "noEmit": true,
+    "lib": ["ES2022"],
+    "types": ["node"],
+    "noUncheckedIndexedAccess": false,
+    "exactOptionalPropertyTypes": false,
+    "noUnusedLocals": false,
+    "noUnusedParameters": false
+  },
+  "include": ["tools/build.ts"]
+}
