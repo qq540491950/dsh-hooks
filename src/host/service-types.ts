@@ -16,12 +16,33 @@ export interface FsTarget {
   readonly displayPath: string
 }
 
-/** `stat()` 的结果子集。`version` 形如 `dev:ino:size:mtimeNs:ctimeNs`（部分 provider 没有）。 */
+/**
+ * `stat()` 的结果子集。
+ *
+ * **已核实（P4b，`cordis_inspect_query` host Service `fs` 的精确契约）**：
+ * ```ts
+ * interface FsInfo { version: FsVersion; type: 'file'|'directory'|'other'; size?: number }
+ * ```
+ * 即 **`version` 是必填的**，所以 C2 的版本核对通道在真实 provider 上**总是可用**。
+ * 这里仍声明成可选是**防御性**的：退化分支（provider 没有 version → 退回 TTL）有自己的断言，
+ * 而声明成必填会让那些分支变成"多余判断"。
+ */
 export interface FsInfo {
   readonly type?: string
   readonly size?: number
   /** 刻意带上 `null`：服务返回值是不可信运行时数据，可能给 null。 */
   readonly version?: string | null | undefined
+}
+
+/** 写入意图（官方 `FsWriteIntent`，逐字对齐）。 */
+export type FsWriteIntent = { kind: 'createIfAbsent' } | { kind: 'replaceIfVersion'; version: string }
+
+/** `writeText` 的结果：包含本次写入产生的**新版本号**（可用于连续编辑）。 */
+export interface FsWriteOutcome {
+  readonly operation: 'create' | 'update'
+  readonly version: string
+  readonly before: string | null
+  readonly after: string
 }
 
 /** 文件监听回调：`error` 只在监听器自身出错时给。 */
@@ -30,8 +51,23 @@ export type FsChanged = (error?: Error) => void
 /** `ctx.fs`（dsh-fs-sandbox 注册）。 */
 export interface FsService {
   resolve(path: string, opts?: { cwd?: string; signal?: AbortSignal }): Promise<FsTarget>
-  stat(target: FsTarget): Promise<FsInfo | undefined>
-  readText(target: FsTarget): Promise<string>
+  stat(target: FsTarget, signal?: AbortSignal): Promise<FsInfo | undefined>
+  readText(target: FsTarget, signal?: AbortSignal): Promise<string>
+  /**
+   * 原子地创建或替换 UTF-8 文本。
+   *
+   * - `expected` 守卫**意图与时效性**：文件存在用 `replaceIfVersion`（版本不符 → 抛
+   *   `FS_STALE_VERSION`），不存在用 `createIfAbsent`。**绝不允许省略**（省略 = 无条件覆盖）。
+   * - `sandboxPolicy` 是**按调用**给的模式与 workspace 根 —— 与 hook 子进程同理（AGENTS §1.6）：
+   *   必须传**调用会话**的策略，拿不到才省略。
+   */
+  writeText(
+    target: FsTarget,
+    content: string,
+    expected?: FsWriteIntent,
+    signal?: AbortSignal,
+    sandboxPolicy?: OpaqueSandboxPolicy,
+  ): Promise<FsWriteOutcome>
   /** 可选：不是每个 provider 都支持监听（不支持时插件退化成 TTL 兜底）。 */
   watch?(target: FsTarget, changed: FsChanged, signal: AbortSignal): Promise<() => Promise<void>>
 }

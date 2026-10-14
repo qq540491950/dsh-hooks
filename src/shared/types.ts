@@ -23,18 +23,28 @@ export interface ParsedHook {
    * 刻意**只在为 true 时**出现这个键：解析结果会被自检做 `deepStrictEqual`，
    * 而"键存在但为 undefined"与"没有这个键"在那边是两个不同的东西。
    *
-   * 已核实（本轮）：`@deepseek-ai/dsh-hook-protocol` **根本不解析配置文件**
+   * 已核实（P4a）：`@deepseek-ai/dsh-hook-protocol` **根本不解析配置文件**
    * （它只有 matcher 语义、输出 codec、`runCommandHook` 与判决合并），所以"未知字段被拒"的
    * 担心在协议层不成立。真正的要求是**我们自己的 runner 必须认它** —— 否则就成了
    * "UI 显示已停用、别的路径照跑"（AGENTS §2.5）。
    */
   disabled?: boolean
+  /**
+   * **在文件里的真实下标**（`group.hooks` 数组中的位置）。
+   *
+   * 为什么必须单独记：解析会跳过"非 command handler"和"没有 command 的条目"，所以
+   * `parsedIndex !== rawIndex`。写入操作必须按**文件下标**寻址，否则一个被跳过的条目就会让
+   * 编辑落到错误的 hook 上 —— 那是"静默改错用户配置"，比写失败严重得多。
+   */
+  rawIndex: number
 }
 
 /** 规范化后的 group：matcher 属于 group，command/timeout 属于 hook（这是文件本身的形状）。 */
 export interface ParsedGroup {
   matcher?: string
   hooks: ParsedHook[]
+  /** **在文件里的真实下标**（该事件数组中的位置）。理由同 {@link ParsedHook.rawIndex}。 */
+  rawIndex: number
 }
 
 /** 一个 projectRoot 的解析结果（按事件分组）。 */

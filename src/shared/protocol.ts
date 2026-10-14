@@ -120,16 +120,19 @@ export function parseHookConfig(raw: unknown, vars: CommandVars = {}): ParseResu
   const skipped: SkippedHandler[] = []
   const errors: string[] = []
   if (!isObject(raw)) return { groups, skipped, errors }
-  const hooksMap = isObject(raw.hooks) ? raw.hooks : raw
+  const hooksMap = hooksMapOf(raw)
 
   for (const event of HOOK_EVENTS) {
     const rawGroups = hooksMap[event]
     if (!Array.isArray(rawGroups)) continue
     const parsedGroups: ParsedGroup[] = []
-    for (const rawGroup of rawGroups) {
+    // 用**文件下标**遍历：解析会跳过若干条目，而 rawIndex 必须指向文件里的真实位置。
+    for (let groupIndex = 0; groupIndex < rawGroups.length; groupIndex++) {
+      const rawGroup: unknown = rawGroups[groupIndex]
       if (!isObject(rawGroup) || !Array.isArray(rawGroup.hooks)) continue
       const commands: ParsedHook[] = []
-      for (const rawHook of rawGroup.hooks) {
+      for (let hookIndex = 0; hookIndex < rawGroup.hooks.length; hookIndex++) {
+        const rawHook: unknown = rawGroup.hooks[hookIndex]
         if (!isObject(rawHook)) continue
         const type = typeof rawHook.type === 'string' ? rawHook.type : 'command'
         if (type !== 'command') {
@@ -146,6 +149,7 @@ export function parseHookConfig(raw: unknown, vars: CommandVars = {}): ParseResu
           command: substituteCommand(command, vars),
           ...(timeoutSec !== undefined ? { timeoutSec } : {}),
           ...(disabled ? { disabled: true } : {}),
+          rawIndex: hookIndex,
         })
       }
       if (commands.length === 0) continue
@@ -161,11 +165,21 @@ export function parseHookConfig(raw: unknown, vars: CommandVars = {}): ParseResu
         errors.push(`${diagnostic} on event ${JSON.stringify(event)}`)
         continue
       }
-      parsedGroups.push({ ...(matcher !== undefined ? { matcher } : {}), hooks: commands })
+      parsedGroups.push({ ...(matcher !== undefined ? { matcher } : {}), hooks: commands, rawIndex: groupIndex })
     }
     if (parsedGroups.length > 0) groups[event] = parsedGroups
   }
   return { groups, skipped, errors }
+}
+
+/**
+ * 取"事件映射"层：含 `hooks` 键的 settings 对象，或裸事件映射。
+ *
+ * 导出给写路径用 —— **解析与写入必须用同一条判定**，否则会出现"页面按 A 布局寻址、写盘按
+ * B 布局落笔"这种静默改错位置的 bug（AGENTS §2.6 的单规则纪律）。
+ */
+export function hooksMapOf(raw: Record<string, unknown>): Record<string, unknown> {
+  return isObject(raw.hooks) ? raw.hooks : raw
 }
 
 /** 用户级在前、项目级在后；同一事件的数组拼接（通用的合并语义）。 */

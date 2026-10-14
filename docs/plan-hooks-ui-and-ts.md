@@ -509,6 +509,12 @@ window.__ModuleLoader__.load({
 - **未做（留给 P4b）**：POST 与定点写（`writeText` + 版本锁 + 深比较保留未知键）、有界执行台账（状态色的唯一证据来源）、试运行（复用 `runPoint`）。**`capabilities.writable` 现在是 `false`**，页面据此显示只读横幅。
 - **未实测（需要重启 DSH）**：真实 `/api/hooks` 的鉴权与围栏（403/401）、以及页面能否真的拉到数据。
 
-### 下一步
+### P4b —— 完成（本次提交）：写路径（纯函数区）
 
-**P4b**：`POST /api/hooks` 与定点写 —— `writeText` + 版本锁（`replaceIfVersion` / `createIfAbsent`）+ **深比较证明未知键没丢**（否则拒写）、有界执行台账、试运行复用 `runPoint`。之后 **P5** 出客户端只读页，那一步需要一次重启。
+- 产出：`src/host/write.ts`（`DocStyle` / `detectStyle` / `serialize` / 9 个定点 op / `applyOp` / `preservationProblem` / `parseHooksRequest`）；`ParsedGroup.rawIndex` + `ParsedHook.rawIndex`（**文件里的真实下标**，因为解析会跳过若干条目，`parsedIndex !== rawIndex`）；`hooksMapOf()` 导出给写路径共用（解析与写入必须是同一条布局判定）。
+- 开工前核实了 `ctx.fs` 的**精确契约**（`cordis_inspect_query` host Service `fs`），修正了三条认知：`FsInfo.version` 其实是**必填**（所以 C2 的版本通道总可用）；`FS_STALE_VERSION` 是版本冲突的精确错误码；`writeText` 的第五个参数是 `sandboxPolicy`（必须传调用会话那一份）。
+- **关键取舍**：写盘不走 `fs.editText`，而是"克隆整份文档 + 只改目标节点"，理由写在 [docs/design-notes.md](docs/design-notes.md) §2 —— `disabled` 开/关与 `timeout=null` 都是**增删键**，`editText` 没有可靠锚点（只能猜命令那一行的形状），猜错就是改坏用户文件。代价是"重新序列化"，用手写的不规则格式第一次保存时会被规范化，之后是不动点。
+- 断言：新增 `W` 区 9 条（风格不动点 / 新文件形状 / 每个 op 只动目标 / 越界拒写 / **保留性证明本身能被证伪** / 请求体校验拒绝 16 种畸形输入 / 端到端未知键保留）。自检 **89 → 98**。
+- 反向验证 4 个注入全部精确命中：删除类补偿方向退回 `both`、下标校验放过 `-1`、序列化忽略 tab 缩进、**把保留性证明改成永远返回"没问题"**。还原后 98/98。
+- **写路径自身抓到过一个真 bug**（第一版）：`removeHook` 的补偿方向写成"两侧都抹掉"，于是删除操作会被自己的保留性证明拒写。是 `W：…只动目标` 那条断言把它抓出来的 —— 这正是"证明"存在的意义。
+- **未做（留给 P4c）**：`POST /api/hooks` 的路由接线（版本锁 `replaceIfVersion`/`createIfAbsent`、`FS_STALE_VERSION` → `stale`、`invalid-json` 时**拒写**、沙箱策略透传）、有界执行台账、试运行。

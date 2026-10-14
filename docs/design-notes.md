@@ -70,3 +70,27 @@ tool 都调它，禁止两条路径各写一套逻辑。
 > `@deepseek-ai/dsh-agent-preset/skills/cordis-plugin-development/references/{ui-plugin,user-actions}.md`、
 > 以及本地兄弟插件 `dsh-mcp-manager`（`README.md` §3 四路线比选、`docs/design-notes.md` §3）与
 > `dsh-skill-manager`（只读页仍然用同一条路由 + 用 `Request` 对象做离线自检）。
+
+## 2. 写入：为什么是"克隆整份 + 只改一处 + 保留性证明"，而不是 `fs.editText`
+
+官方 `fs` 服务确实提供 `editText(target, {oldString, newString, replaceAll}, {version})`，契约里
+还写明"版本守卫在匹配**之前**检查，过期的内容会报 `FS_STALE_VERSION`" —— 从"改动最小"的角度看它
+是最优解。**本插件仍然没用它**，理由是它的前提在我们的操作集里不成立：
+
+| 我们的操作 | `editText` 需要什么锚点 | 现实 |
+|---|---|---|
+| 改 `command` | `JSON.stringify(旧命令)` 的**字节级**出现 | 能做到，但只在"该字符串在文件里恰好出现一次"且没有被手写成 `\uXXXX` 转义时才成立 |
+| 开/关 `disabled` | 关闭时删一个键、开启时**插入**一个键 | **没有锚点**。`disabled` 原本不存在时，"插入"只能靠猜命令那一行的形状（还是猜缩进、逗号、键序）—— 猜错就是改坏用户文件 |
+| `timeout` 设为 `null` | 同上（删键） | 同上 |
+| 新增/删除/移动整条 | 结构性改写 | 本来就不适合 |
+
+所以本插件的机制是：**克隆整份原始 JSON 树 → 只改目标那一个节点 → 序列化**。
+
+- 未知键能留下来，是**结构上不可能丢**（我们从不从"解析后的视图"重建文档），而不是"重建之后再比对"。
+- 代价：**重新序列化**。用手写的、格式不规则的 `hooks.json` 第一次保存时，会顺带被规范成"探测到的缩进 + LF + 结尾换行"。之后它就是**不动点**（`serialize(parse(text), detectStyle(text)) === text`，有断言），所以后续编辑的 diff 一定只落在改动那一处。
+- 补偿措施：`preservationProblem()` 仍然每次都比对 —— 它守护的是"**我声明改了什么**"这份声明本身。第一版把 `removeHook` 的补偿方向写成"两侧都抹掉"，结果是删除操作会被自己的证明拒写；那条断言当场把它抓了出来。
+
+> 出处：`cordis_inspect_query`（platform: host, provider: Service, `{"service":"fs"}`）—— 已核实
+> `FsWriteIntent` 的确切形状、`FS_STALE_VERSION` 这个错误码、以及 `writeText` 的第五个参数是
+> `sandboxPolicy`（**必须传调用会话的那一份**，与 hook 子进程同样理由：AGENTS §1.6）。
+

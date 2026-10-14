@@ -43,6 +43,15 @@ import {
 import { DEFAULT_TIMEOUT_MS, HOOK_EVENTS, NEGATIVE_TTL_MS, POSITIVE_TTL_MS } from '../src/shared/constants.ts'
 // 数据面：路由注册与**纯函数**快照构造都直接 import 源码，不需要挂载插件就能测。
 import { HOOKS_ROUTE, buildSnapshot, registerHooksRoute } from '../src/host/data-plane.ts'
+// 写路径：定点操作、风格探测、保留性证明 —— 全是纯函数，直接单测。
+import {
+  applyOp,
+  detectStyle,
+  parseHooksRequest,
+  preservationProblem,
+  serialize,
+  starterText,
+} from '../src/host/write.ts'
 
 const HERE = path.dirname(fileURLToPath(import.meta.url))
 const LIB = path.join(HERE, '..', 'lib', 'index.js')
@@ -139,6 +148,21 @@ test('E：构建脚本自身没变（改了 build.ts 也要重建）', () => {
     manifest.builder.sha256,
     'tools/build.ts 在构建之后被改过 —— 跑 pnpm build 重新生成产物',
   )
+})
+
+test('E：功能标记必须真的出现在产物里（源码存在 ≠ 已交付）', () => {
+  // esbuild 只从入口 `src/host/index.ts` 沿 import 打包：**没有任何模块 import 的文件会被静默丢掉**，
+  // 而"源码改了没重建""指纹对得上"这些断言全部照样通过 —— 插件实际没有那个功能。
+  // P4b 的 write.ts 就真的没进产物（接线留到 P4c），这条断言是唯一能发现"忘了接线"的机器检查。
+  // 运维提示：新增必须交付的模块时，把它的**唯一标记字符串**加到这个列表里。
+  const source = fs.readFileSync(LIB, 'utf8')
+  const markers = [
+    '/api/hooks', // data-plane.ts：设置页路由
+    // TODO(P4c)：接线写路径后把 write.ts 的标记加进来（例如「改写会动到目标之外的字段」）
+  ]
+  for (const marker of markers) {
+    assert.ok(source.includes(marker), `产物里应当出现 ${marker} —— 检查它所在的模块是不是没被 import 进去`)
+  }
 })
 
 test('E：src/** 下没有漏进指纹的文件', () => {
@@ -287,14 +311,17 @@ test('matcher：非法正则按不匹配处理并给出诊断', () => {
 
 test('parseHookConfig：接受 hooks 段与裸事件映射两种形状', () => {
   const wrapped = parseHookConfig({ hooks: { PreToolUse: [{ hooks: [{ type: 'command', command: 'a' }] }] } })
-  assert.deepEqual(wrapped.groups.PreToolUse[0].hooks, [{ command: 'a' }])
+  assert.deepEqual(wrapped.groups.PreToolUse[0].hooks, [{ command: 'a', rawIndex: 0 }])
   const bare = parseHookConfig({ PreToolUse: [{ hooks: [{ command: 'a' }] }] })
-  assert.deepEqual(bare.groups.PreToolUse[0].hooks, [{ command: 'a' }])
+  assert.deepEqual(bare.groups.PreToolUse[0].hooks, [{ command: 'a', rawIndex: 0 }])
 })
 
 test('parseHookConfig：timeout 是秒，缺省时不写', () => {
   const r = parseHookConfig({ hooks: { PostToolUse: [{ hooks: [{ command: 'a', timeout: 30 }, { command: 'b' }] }] } })
-  assert.deepEqual(r.groups.PostToolUse[0].hooks, [{ command: 'a', timeoutSec: 30 }, { command: 'b' }])
+  assert.deepEqual(r.groups.PostToolUse[0].hooks, [
+    { command: 'a', timeoutSec: 30, rawIndex: 0 },
+    { command: 'b', rawIndex: 1 },
+  ])
 })
 
 test('parseHookConfig：非 command handler 跳过并记录', () => {
@@ -317,6 +344,9 @@ test('parseHookConfig：非 command handler 跳过并记录', () => {
   ])
   assert.equal(r.groups.PreToolUse[0].hooks.length, 1)
   assert.equal(r.groups.Stop, undefined)
+  // rawIndex 必须是**文件里的真实下标**：被跳过的是第 0 条，保留下来的这条是第 1 条。
+  // 这条断言就是写路径寻址安全的地基 —— 拿 parsedIndex 去写会改错 hook。
+  assert.equal(r.groups.PreToolUse[0].hooks[0].rawIndex, 1)
 })
 
 test('parseHookConfig：非法 matcher 只跳过该 group', () => {
@@ -330,7 +360,9 @@ test('parseHookConfig：非法 matcher 只跳过该 group', () => {
   })
   assert.equal(r.errors.length, 1)
   assert.equal(r.groups.PreToolUse.length, 1)
-  assert.deepEqual(r.groups.PreToolUse[0].hooks, [{ command: 'good' }])
+  assert.deepEqual(r.groups.PreToolUse[0].hooks, [{ command: 'good', rawIndex: 0 }])
+  // 同理：被跳过的 group 在文件里是第 0 个，保留下来的这个 group 的 rawIndex 必须是 1。
+  assert.equal(r.groups.PreToolUse[0].rawIndex, 1)
 })
 
 test('parseHookConfig：UserPromptSubmit / Stop 丢弃 matcher', () => {
@@ -1909,6 +1941,277 @@ await test('P：handler 抛错 → 500 信封，且**没有 data**（错误契�
   assert.equal(body.detail, 'boom', '技术原文放 detail，页面主文案自己措辞')
   assert.equal(body.data, undefined, '失败响应不该有 data')
   assert.deepEqual(data.events, [], '补空形状之后仍然可断言，而不是崩在第一处解引用')
+})
+
+//#endregion
+
+//#region P2. 写路径：定点操作 + 保留性证明（纯函数，不碰 fs）
+
+const RICH_DOC = {
+  _comment: '本机 demo 配置（改文件前先读这一行）',
+  hooks: {
+    PreToolUse: [
+      {
+        matcher: 'pwsh',
+        hooks: [
+          { type: 'command', command: 'echo a' },
+          { command: 'echo b', timeout: 30 },
+        ],
+      },
+    ],
+    Stop: [{ hooks: [{ command: 'echo stop' }] }],
+  },
+}
+
+/** 取一次必须成功的改写结果（失败时直接断言失败，附上原因）。 */
+function applied(doc, op) {
+  const result = applyOp(doc, { file: 'project', ...op })
+  assert.equal(result.ok, true, `applyOp 应当成功：${JSON.stringify(result)}`)
+  return result.applied
+}
+
+test('W：风格探测与序列化是不动点（我们写的文件，后续编辑只会是最小 diff）', () => {
+  const canonical = JSON.stringify(RICH_DOC, null, 2) + '\n'
+  const style = detectStyle(canonical)
+  assert.deepEqual(style, { indent: '  ', eol: '\n', finalNewline: true })
+  assert.equal(serialize(JSON.parse(canonical), style), canonical, '2 空格 + LF + 结尾换行必须逐字节还原')
+
+  const tabs = '{\n\t"hooks": {}\n}\n'
+  assert.equal(detectStyle(tabs).indent, '\t')
+  assert.equal(serialize(JSON.parse(tabs), detectStyle(tabs)), tabs, 'tab 缩进也要还原')
+
+  const crlf = '{\r\n  "hooks": {}\r\n}\r\n'
+  assert.equal(serialize(JSON.parse(crlf), detectStyle(crlf)), crlf, 'CRLF 与结尾换行都要保持')
+
+  const noFinalNewline = '{\n  "hooks": {}\n}'
+  assert.equal(detectStyle(noFinalNewline).finalNewline, false)
+  assert.equal(
+    serialize(JSON.parse(noFinalNewline), detectStyle(noFinalNewline)),
+    noFinalNewline,
+    '原本没有结尾换行就不要凭空加一个',
+  )
+})
+
+test('W：新文件内容是"能被解析成空配置"的自解释形状', () => {
+  const text = starterText({ indent: '  ', eol: '\n', finalNewline: true })
+  const parsed = parseHookConfig(JSON.parse(text))
+  assert.deepEqual(parsed.errors, [])
+  assert.deepEqual(parsed.groups, {})
+  assert.deepEqual(Object.keys(JSON.parse(text)), ['hooks'])
+})
+
+test('W：setHookCommand 只动目标 hook，未知键原样保留', () => {
+  const { doc, changes } = applied(RICH_DOC, {
+    op: 'setHookCommand',
+    event: 'PreToolUse',
+    groupIndex: 0,
+    hookIndex: 1,
+    command: 'echo B',
+  })
+  assert.equal(doc.hooks.PreToolUse[0].hooks[1].command, 'echo B')
+  assert.equal(doc.hooks.PreToolUse[0].hooks[0].command, 'echo a', '另一条 hook 不许动')
+  assert.equal(doc._comment, RICH_DOC._comment, '未知键必须原样保留')
+  assert.equal(doc.hooks.Stop[0].hooks[0].command, 'echo stop', '别的事件不许动')
+  assert.equal(doc.hooks.PreToolUse[0].matcher, 'pwsh', 'group 上的 matcher 不许动')
+  assert.equal(preservationProblem(RICH_DOC, doc, changes), undefined)
+  assert.notEqual(doc, RICH_DOC, '必须返回新文档，不许原地改调用方的对象')
+  assert.equal(RICH_DOC.hooks.PreToolUse[0].hooks[1].command, 'echo b', '原文档必须一个字节都没变')
+})
+
+test('W：disabled 开=写键、关=删键；timeout=null 也是删键（不留噪音）', () => {
+  const on = applied(RICH_DOC, {
+    op: 'setHookDisabled',
+    event: 'PreToolUse',
+    groupIndex: 0,
+    hookIndex: 0,
+    disabled: true,
+  })
+  assert.equal(on.doc.hooks.PreToolUse[0].hooks[0].disabled, true)
+  assert.equal(preservationProblem(RICH_DOC, on.doc, on.changes), undefined)
+
+  const off = applied(on.doc, {
+    op: 'setHookDisabled',
+    event: 'PreToolUse',
+    groupIndex: 0,
+    hookIndex: 0,
+    disabled: false,
+  })
+  assert.equal('disabled' in off.doc.hooks.PreToolUse[0].hooks[0], false, '关掉要删键，不要留 disabled:false')
+  assert.equal(preservationProblem(on.doc, off.doc, off.changes), undefined)
+
+  const noTimeout = applied(RICH_DOC, {
+    op: 'setHookTimeout',
+    event: 'PreToolUse',
+    groupIndex: 0,
+    hookIndex: 1,
+    timeoutSec: null,
+  })
+  assert.equal('timeout' in noTimeout.doc.hooks.PreToolUse[0].hooks[1], false)
+  assert.equal(preservationProblem(RICH_DOC, noTimeout.doc, noTimeout.changes), undefined)
+
+  const withTimeout = applied(RICH_DOC, {
+    op: 'setHookTimeout',
+    event: 'PreToolUse',
+    groupIndex: 0,
+    hookIndex: 0,
+    timeoutSec: 45,
+  })
+  assert.equal(withTimeout.doc.hooks.PreToolUse[0].hooks[0].timeout, 45)
+  assert.equal(preservationProblem(RICH_DOC, withTimeout.doc, withTimeout.changes), undefined)
+})
+
+test('W：addHook / removeHook / moveHook / removeGroup 只动目标（含顺序语义）', () => {
+  const added = applied(RICH_DOC, {
+    op: 'addHook',
+    event: 'PreToolUse',
+    groupIndex: 0,
+    command: 'echo c',
+    timeoutSec: 5,
+  })
+  assert.equal(added.doc.hooks.PreToolUse[0].hooks.length, 3)
+  assert.deepEqual(added.doc.hooks.PreToolUse[0].hooks[2], { type: 'command', command: 'echo c', timeout: 5 })
+  assert.equal(preservationProblem(RICH_DOC, added.doc, added.changes), undefined)
+
+  const removed = applied(RICH_DOC, { op: 'removeHook', event: 'PreToolUse', groupIndex: 0, hookIndex: 0 })
+  assert.equal(removed.doc.hooks.PreToolUse[0].hooks.length, 1)
+  assert.equal(removed.doc.hooks.PreToolUse[0].hooks[0].command, 'echo b')
+  assert.equal(preservationProblem(RICH_DOC, removed.doc, removed.changes), undefined)
+
+  // 顺序即执行顺序，所以"上移/下移"是语义操作，不是界面装饰。
+  const moved = applied(RICH_DOC, {
+    op: 'moveHook',
+    event: 'PreToolUse',
+    groupIndex: 0,
+    hookIndex: 0,
+    direction: 1,
+  })
+  assert.deepEqual(
+    moved.doc.hooks.PreToolUse[0].hooks.map((hook) => hook.command),
+    ['echo b', 'echo a'],
+  )
+  assert.equal(preservationProblem(RICH_DOC, moved.doc, moved.changes), undefined)
+
+  const dropped = applied(RICH_DOC, { op: 'removeGroup', event: 'PreToolUse', groupIndex: 0 })
+  assert.equal(dropped.doc.hooks.PreToolUse.length, 0)
+  assert.equal(dropped.doc.hooks.Stop.length, 1, '别的事件不许动')
+  assert.equal(dropped.doc._comment, RICH_DOC._comment)
+  assert.equal(preservationProblem(RICH_DOC, dropped.doc, dropped.changes), undefined)
+})
+
+test('W：越界寻址一律拒写（宁可失败，也不许落到别的节点上）', () => {
+  const notFound = [
+    { op: 'setHookCommand', event: 'PreToolUse', groupIndex: 9, hookIndex: 0, command: 'x' },
+    { op: 'setHookCommand', event: 'PreToolUse', groupIndex: 0, hookIndex: 9, command: 'x' },
+    { op: 'setHookDisabled', event: 'PreToolUse', groupIndex: 0, hookIndex: 2, disabled: true },
+    { op: 'removeHook', event: 'Stop', groupIndex: 0, hookIndex: 1 },
+    { op: 'removeGroup', event: 'PreToolUse', groupIndex: 3 },
+    { op: 'setGroupMatcher', event: 'Notification', groupIndex: 0, matcher: null },
+    { op: 'addHook', event: 'Notification', groupIndex: 0, command: 'x', timeoutSec: null },
+  ]
+  for (const one of notFound) {
+    const result = applyOp(RICH_DOC, { file: 'project', ...one })
+    assert.equal(result.ok, false, `${one.op} 越界必须被拒`)
+    assert.equal(result.reason, 'not-found', `${one.op} 的原因码应当是 not-found`)
+  }
+  // 移到数组外是另一种原因码：位置本身合法，但目标不存在。
+  const outside = applyOp(RICH_DOC, {
+    file: 'project',
+    op: 'moveHook',
+    event: 'PreToolUse',
+    groupIndex: 0,
+    hookIndex: 0,
+    direction: -1,
+  })
+  assert.equal(outside.ok, false)
+  assert.equal(outside.reason, 'out-of-range')
+})
+
+test('W：保留性证明能抓住"改写顺手丢了字段"（证明本身也要能被证伪）', () => {
+  const { changes } = applied(RICH_DOC, {
+    op: 'setHookCommand',
+    event: 'PreToolUse',
+    groupIndex: 0,
+    hookIndex: 0,
+    command: 'echo A',
+  })
+
+  // 对照：只改目标那一个字段 → 证明必须通过
+  const clean = JSON.parse(JSON.stringify(RICH_DOC))
+  clean.hooks.PreToolUse[0].hooks[0].command = 'echo A'
+  assert.equal(preservationProblem(RICH_DOC, clean, changes), undefined)
+
+  // 注入：顺手把 `_comment` 弄丢了 → 必须被抓住（调用方据此**拒写**）
+  const lossy = JSON.parse(JSON.stringify(RICH_DOC))
+  lossy.hooks.PreToolUse[0].hooks[0].command = 'echo A'
+  delete lossy._comment
+  const problem = preservationProblem(RICH_DOC, lossy, changes)
+  assert.equal(typeof problem, 'string', '丢了未知键必须被证明抓到')
+  assert.ok(problem.includes('目标之外的字段'), `提示要能看出性质：${String(problem)}`)
+
+  // 注入二：顺手把 timeout 也改了 → 同样必须被抓住
+  const extra = JSON.parse(JSON.stringify(RICH_DOC))
+  extra.hooks.PreToolUse[0].hooks[0].command = 'echo A'
+  extra.hooks.PreToolUse[0].hooks[1].timeout = 999
+  assert.equal(typeof preservationProblem(RICH_DOC, extra, changes), 'string', '多改了字段也要被抓到')
+})
+
+test('W：请求体校验拒绝畸形输入（不可信输入不许进 applyOp）', () => {
+  const malformed = [
+    null,
+    'x',
+    42,
+    [],
+    { op: 'setHookCommand', file: 'other', event: 'PreToolUse', groupIndex: 0, hookIndex: 0, command: 'x' },
+    { op: 'nope', file: 'project' },
+    { op: 'setHookCommand', file: 'project', event: 'PreToolUse', groupIndex: -1, hookIndex: 0, command: 'x' },
+    { op: 'setHookCommand', file: 'project', event: 'PreToolUse', groupIndex: '0', hookIndex: 0, command: 'x' },
+    { op: 'setHookCommand', file: 'project', event: 'PreToolUse', groupIndex: 0, hookIndex: 1.5, command: 'x' },
+    { op: 'setHookCommand', file: 'project', event: 'PreToolUse', groupIndex: 0, hookIndex: 0, command: '' },
+    { op: 'setHookCommand', file: 'project', event: 'Notification', groupIndex: 0, hookIndex: 0, command: 'x' },
+    { op: 'setHookDisabled', file: 'project', event: 'PreToolUse', groupIndex: 0, hookIndex: 0, disabled: 'yes' },
+    { op: 'setHookTimeout', file: 'project', event: 'PreToolUse', groupIndex: 0, hookIndex: 0, timeoutSec: 0 },
+    { op: 'setHookTimeout', file: 'project', event: 'PreToolUse', groupIndex: 0, hookIndex: 0, timeoutSec: -5 },
+    { op: 'moveHook', file: 'project', event: 'PreToolUse', groupIndex: 0, hookIndex: 0, direction: 0 },
+    { op: 'setGroupMatcher', file: 'project', event: 'PreToolUse', groupIndex: 0, matcher: 5 },
+    { op: 'removeHook', file: 'project', event: 'PreToolUse', groupIndex: 0 },
+  ]
+  for (const body of malformed) {
+    const parsed = parseHooksRequest(body)
+    assert.equal(parsed.ok, false, `应当被拒：${JSON.stringify(body)}`)
+    assert.ok(typeof parsed.reason === 'string' && parsed.reason.length > 0, '拒了要给得出原因')
+  }
+
+  const good = parseHooksRequest({
+    op: 'setHookCommand',
+    file: 'project',
+    event: 'PreToolUse',
+    groupIndex: 0,
+    hookIndex: 0,
+    command: 'x',
+  })
+  assert.equal(good.ok, true)
+  assert.equal(good.request.event, 'PreToolUse')
+  assert.equal(good.request.command, 'x')
+
+  const create = parseHooksRequest({ op: 'createFile', file: 'user' })
+  assert.equal(create.ok, true)
+  assert.equal(create.request.file, 'user')
+})
+
+test('W：改写 → 序列化 → 再解析，未知键仍在（端到端）', () => {
+  const text = JSON.stringify(RICH_DOC, null, 2) + '\n'
+  const { doc } = applied(JSON.parse(text), {
+    op: 'setHookCommand',
+    event: 'Stop',
+    groupIndex: 0,
+    hookIndex: 0,
+    command: 'echo STOP',
+  })
+  const written = serialize(doc, detectStyle(text))
+  const reparsed = JSON.parse(written)
+  assert.equal(reparsed._comment, RICH_DOC._comment, '写盘再读回来，未知键必须还在')
+  assert.equal(reparsed.hooks.Stop[0].hooks[0].command, 'echo STOP')
+  assert.deepEqual(parseHookConfig(reparsed).errors, [], '写出来的东西必须仍然是合法配置')
 })
 
 //#endregion

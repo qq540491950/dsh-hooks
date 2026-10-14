@@ -63,8 +63,15 @@
 - **未知键必须原样保留。** 现在 `.dsh/hooks.json` 第一行就是 `_comment`（活文档）；任何"解析→重建→写回"都必须证明除目标字段外**逐字段深比较相等**，否则**拒写并报错**（这是 `dsh-mcp-manager` 写盘前 `composeEntries` 断言的同构物）。
 - 缩进、行尾、结尾换行按**原文件探测**后保持；不带 BOM；不要因为一次编辑把整个文件重排（用户会看到整文件 diff）。
 - **客户端不许回传整份文件**：只发 `{file, op, event, groupIndex, hookIndex, patch}` 这样的定点操作，宿主读→改→写。回传整份 = 静默丢字段的老事故。
+- **已核实的官方写入契约（P4b，`cordis_inspect_query` host Service `fs`）**：`FsInfo.version` 是**必填**的（所以 C2 的版本通道在真实 provider 上总是可用）；`FsWriteIntent = {kind:'createIfAbsent'} | {kind:'replaceIfVersion', version}`；版本不符抛 **`FS_STALE_VERSION`**；`writeText(target, content, expected?, signal?, sandboxPolicy?)` —— **`sandboxPolicy` 必须传调用会话的那一份**（与 hook 子进程同理，§1.6）。
+- **寻址一律用文件下标**：`ParsedGroup.rawIndex` / `ParsedHook.rawIndex` 是**文件里的真实下标**，因为解析会跳过非 command handler、没有 command 的条目、matcher 非法的 group（`parsedIndex !== rawIndex`）。拿 parsed 下标去写 = 静默改错 hook。越界一律拒写（`not-found`），不许"就近"落笔。
 
-**2.4 [边界] 源文保留优先于"重新序列化"。** 能用 `fs.editText(target, {oldString, newString, replaceAll:false}, {version})` 精确定位的那几个操作（改 `command` / `timeout` / `disabled`）就用它——它**只动那一段字节**。只有结构性操作（新增 / 删除 / 移动整条）才重建文档，且重建必须走 §2.3 的深比较断言。
+**2.4 [边界] 写入只走一条路径：克隆整份文档 + 只改目标节点 + 保留性证明。**
+- **不做"解析 → 重建 → 写回"**：那是丢字段的老事故来源。`src/host/write.ts` 的机制是克隆原始 JSON 树之后**只改目标那一个节点** —— 未知键能留下是**结构上不可能丢**，不是"重建之后再比对一下"。
+- `preservationProblem(original, updated, changes)` **仍然必须跑**：它检查的是"我声明改了什么"这份声明本身 —— `Change.area` 方向写错、漏声明一处，都会当场被测出来并**拒写**。它已经抓到过一次真 bug：`removeHook` 的补偿方向写成 `both`，会让删除类操作被自己的证明拒写（第一版就是这样）。
+- **刻意不用 `fs.editText`**：它要的是**字节级精确的 oldString 锚点**，而 `setHookDisabled` 开/关、`setHookTimeout(null)` 都是"增删一个键"，锚点只能靠猜命令所在那一行的形状 —— 猜错就是改坏用户文件。取舍与代价见 [docs/design-notes.md](docs/design-notes.md) §2。
+- 写盘一律 `ctx.fs.writeText(target, text, expected, signal, sandboxPolicy)`，`expected` **必给**（见 §2.3）。
+- 探测并保持缩进 / 行尾 / 结尾换行。我们写出的文件是**不动点**（再解析再序列化逐字节相同），所以后续编辑的 diff 一定只落在改动的那一处。
 
 **2.5 [边界] 启停必须落在文件里，不许只存内存或私有状态文件。** 用 hook 对象上的 `disabled: true`（与 DSH loader 行的字段名一致）。只存 sidecar 状态会导致"UI 显示已停用、别的消费者照跑"。
 **核对结论（本轮已完成，结论与计划相反地更宽松）**：`@deepseek-ai/dsh-hook-protocol` **根本不解析配置文件** —— 它只有 matcher 语义、输出 codec、`runCommandHook(已解析的 hook)` 与判决合并。所以"未知字段被拒"的担心在协议层**不成立**，`disabled` 可以安全落在 hook 对象上。
@@ -146,6 +153,7 @@
 - `lib/**` **只能**由 `pnpm build` 产出。手改产物等于下次构建被静默覆盖，而且指纹立刻对不上（自检 `E` 区当场红）。
 - 改了 `src/**` **必须重建**：先 `pnpm build`，再 `node tools/verify.ts`。忘重建会得到 `E：指纹覆盖到的每个源文件都没有变` 这条精确报错。
 - 两把锁：① `lib/.build-manifest.json` 指纹（每个源文件 + 产物的 sha256，自检 `E` 区逐项重算）；② 提交前 `git diff --exit-code lib/`（构建必须幂等——`tools/build.ts` 刻意不写时间戳）。
+- **源码存在 ≠ 已交付**：esbuild 只从入口 `src/host/index.ts` 沿 import 打包，**没有任何模块 import 的文件会被静默丢掉**（P4b 的 `write.ts` 一开始就是这样：产物里根本没有它，而所有指纹断言照样全绿）。所以每个"必须交付的模块"都要在自检 `E` 区留一个**唯一标记字符串**的断言（现在有 `/api/hooks`）。
 - 每个阶段结束必须：`node tools/verify.ts` PASS（条数**不减少**）+ 无 BOM / 无 `U+FFFD` / LF。
 - **任何中间态都必须是一个能被现有 profile 行加载的模块**：`lib/index.js` 就是 profile 里那条 `file://` 路径指向的文件，它不能"暂时坏着"。
 
