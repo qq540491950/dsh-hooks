@@ -5,12 +5,22 @@
   "description": "DSH Host 插件：按项目读取 <projectRoot>/.dsh/hooks.json 与 $DSH_HOME/hooks.json，运行通用 hooks 格式的配置；并在设置页提供可视化管理（order 920）。",
   "type": "module",
   "main": "lib/index.js",
+  "icon": "./icon.svg",
+  "files": [
+    "lib/**",
+    "!lib/.types/**",
+    "icon.svg",
+    "locale/*.json",
+    "README.md"
+  ],
   "exports": {
     ".": "./lib/index.js",
     "./client": "./lib/client.js",
-    "./package.json": "./package.json"
+    "./package.json": "./package.json",
+    "./locale/*.json": "./locale/*.json"
   },
   "dsh": {
+    "manifestVersion": 1,
     "client": {
       "platform": "web"
     }

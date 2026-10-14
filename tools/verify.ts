@@ -98,6 +98,74 @@ test('A：package.json 的客户端半边契约（exports["./client"] + dsh.clie
   assert.ok(fs.existsSync(path.join(HERE, '..', entry)), 'exports["./client"] 必须指向真实存在的文件')
 })
 
+test('A：发布元数据（icon / locale / exports / files）—— 每一条失效都是静默的', () => {
+  const root = path.join(HERE, '..')
+  const pkg = JSON.parse(fs.readFileSync(path.join(root, 'package.json'), 'utf8'))
+
+  // ① `icon` 在**顶层**：官方 `dsh-app-boot` 读的是 `manifest.icon`
+  //    （源码 `iconOf(manifest?.icon, manifestPath)`）。写成 `dsh.icon` 没人看。
+  assert.equal(typeof pkg.icon, 'string', 'icon 必须是 package.json 的**顶层**字段')
+  const iconPath = path.join(root, pkg.icon)
+  assert.ok(fs.existsSync(iconPath), `icon 文件必须存在：${pkg.icon}`)
+  assert.ok(fs.readFileSync(iconPath, 'utf8').trimStart().startsWith('<svg'), 'icon 必须是 SVG/PNG/JPEG/WebP')
+  assert.ok(fs.statSync(iconPath).size <= 256 * 1024, 'icon 必须 ≤ 256 KiB（官方限制）')
+
+  // ② locale：官方按 `<包>/locale/en.json` 找**英文兜底**、其余语言必须同目录
+  //    （源码 `optionalResourcePath(`${specifier}/locale/en.json`)` + "must share the English locale directory"）。
+  for (const file of ['locale/en.json', 'locale/zh.json']) {
+    const full = path.join(root, file)
+    assert.ok(fs.existsSync(full), `缺少 ${file}`)
+    const parsed = JSON.parse(fs.readFileSync(full, 'utf8'))
+    assert.equal(typeof parsed.meta.title, 'string', `${file} 必须有 meta.title`)
+    assert.ok(parsed.meta.title.length > 0, `${file} 的 meta.title 不许为空`)
+    assert.equal(typeof parsed.meta.description, 'string', `${file} 必须有 meta.description`)
+  }
+  assert.equal(
+    pkg.exports['./locale/*.json'],
+    './locale/*.json',
+    'locale 必须进 exports：否则 subpath 解析被 exports 挡住，界面静默不显示名字与图标',
+  )
+
+  // ③ files 白名单：产物与展示元数据要进包；源码 / 工具 / 文档 / 活配置**不许**进包
+  for (const required of ['lib/**', 'icon.svg', 'locale/*.json', 'README.md']) {
+    assert.ok(pkg.files.includes(required), `files 必须包含 ${required}`)
+  }
+  for (const forbidden of ['src', 'tools', 'docs', 'AGENTS.md', '.tmp', 'node_modules', '.dsh']) {
+    assert.ok(
+      !pkg.files.some((entry) => entry === forbidden || entry.startsWith(`${forbidden}/`)),
+      `files 不许包含 ${forbidden}（源码与活配置不进包）`,
+    )
+  }
+  assert.equal(pkg.dsh.manifestVersion, 1, 'dsh.manifestVersion 声明清单格式版本')
+  // `lib/**` 会把 `lib/.types/**`（tsc 的中间产物）一起带进包 —— 它们既不在 exports 里（拿不到）、
+  // 又会随手过期。`npm pack --dry-run` 实测抓到的就是这个。
+  assert.ok(pkg.files.includes('!lib/.types/**'), 'files 必须排除 lib/.types/**（tsc 中间产物不该发布）')
+})
+
+test('A：编码纪律（src/** + tools/** + lib/** 无 BOM、无 U+FFFD、LF、结尾换行）', () => {
+  const root = path.join(HERE, '..')
+  const walk = (dir, out = []) => {
+    for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+      const full = path.join(dir, entry.name)
+      if (entry.isDirectory()) walk(full, out)
+      else out.push(full)
+    }
+    return out
+  }
+  const files = [...walk(path.join(root, 'src')), ...walk(path.join(root, 'tools')), ...walk(path.join(root, 'lib'))]
+  assert.ok(files.length > 10, '应当扫到源码与产物（否则这条断言是空的）')
+  const problems = []
+  for (const file of files) {
+    const bytes = fs.readFileSync(file)
+    if (bytes[0] === 0xef && bytes[1] === 0xbb && bytes[2] === 0xbf) problems.push(`${file}: 有 BOM`)
+    const text = bytes.toString('utf8')
+    if (text.includes('\uFFFD')) problems.push(`${file}: 有 U+FFFD（编码坏了）`)
+    if (text.includes('\r\n')) problems.push(`${file}: 有 CRLF`)
+    if (!text.endsWith('\n')) problems.push(`${file}: 结尾没有换行`)
+  }
+  assert.deepEqual(problems, [], '编码问题（AGENTS §4.8 每个阶段都要过这一关）')
+})
+
 test('C：客户端产物是 classic script + 恰好一个 factory + 恰好一个 require', () => {
   const source = fs.readFileSync(CLIENT, 'utf8')
   assert.equal((source.match(/^(import|export) /gm) || []).length, 0, '必须是 classic script，不是 ESM')

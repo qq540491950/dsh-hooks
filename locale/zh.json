@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "Hooks",
+    "description": "按项目读取 hooks 配置（<projectRoot>/.dsh/hooks.json + $DSH_HOME/hooks.json），并在设置页可视化管理。"
+  }
+}

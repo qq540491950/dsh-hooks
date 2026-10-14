@@ -410,6 +410,19 @@ window.__ModuleLoader__.load({
   14 行反向验证记录、7 条自欺陷阱。
 - 文档不影响产物：`node tools/verify.ts` 仍是 121 全绿，`pnpm check` 全绿。
 
+### P8a —— 完成（本次提交）：发布准备（机器可验证的部分）+ 编码纪律机检
+
+- **不去猜官方字段位置，去读运行时源码**（判据权威顺序）。三条都从 asar 里读出来的：
+  ① `icon` 是 **`package.json` 顶层字段** —— `dsh-app-boot/lib/index.js` 里是 `iconOf(manifest?.icon, manifestPath)`，写成 `dsh.icon` 没人看；
+  ② locale 是 **`<包>/locale/en.json` 英文兜底 + 其余语言同目录** —— 源码 `optionalResourcePath(`${specifier}/locale/en.json`)` + 注释 "must share the English locale directory"（不同目录会**抛错**）；
+  ③ **`locale/*.json` 必须进 `exports`** —— 否则 subpath 解析被 `exports` 挡住，界面**静默**不显示名字与图标（最容易漏、最难发现的一条）。
+- 产出：顶层 `icon` + `icon.svg`（`currentColor`，跟随主题，≤ 256 KiB）+ `locale/{en,zh}.json` + `exports["./locale/*.json"]` + `files` 白名单 + `dsh.manifestVersion: 1`。
+- **`npm pack --dry-run` 交叉验证抓到一个真问题**：`lib/**` 会把 **`lib/.types/**`（18 个 tsc 中间产物）**一起打进包 —— 它们既不在 `exports` 里（拿不到）又会随手过期。加 `!lib/.types/**` 后：**8 个文件 / ~128 KiB**，该进的都进了、不该进的都没进、密钥扫描干净。
+- **新增两条 `A` 区断言**（发布元数据 + 编码纪律）。后者的意义是：**编码检查从"每个阶段手工跑一次"变成机检** —— 无 BOM / 无 `U+FFFD` / LF / 结尾换行，覆盖 `src/**` + `tools/**` + `lib/**`。手工检查会漏，机检不会。
+- 断言：121 → **123**（两条新 `test()`；另有断言加在既存 test 里，故条数不变）。
+- **未做（留给 P8b，需要用户先重启一次）**：真实 UI 走查（7 组渲染、四种空/坏文案、试运行、最近执行、删掉 `.dsh/hooks.json` 后的表现、外部编辑后的冲突提示）；`install_bundle` 三条路线的临时 profile 验证（本包走路线 1，不做也无妨）。
+- **需要用户决定**：`private: true` 摘不摘、`license` 用什么（定了之后把 `LICENSE` 加进 `files`）、包名 `dsh-hooks` 是否被占。
+
 ---
 
 ## 6. 风险与缓解

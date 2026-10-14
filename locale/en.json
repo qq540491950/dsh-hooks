@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "Hooks",
+    "description": "Per-project hooks configuration (<projectRoot>/.dsh/hooks.json + $DSH_HOME/hooks.json) with a visual settings page."
+  }
+}

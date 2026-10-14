@@ -487,6 +487,33 @@ node tools/verify.ts --config "D:\some\project\.dsh\hooks.json"
 | 格式化 / 自动修复类 hook 没生效 | v0.1.0 会**静默**失效（退出码非 2、输出非 JSON ⇒ 按非阻断失败处理，动作照常放行）。升级到 v0.2.0 后 hook 按会话档跑即可落盘；仍不行就看该 hook 自己的 stderr |
 
 
+## 发布（`npm pack` 会打进去什么）
+
+**装载路线：路线 1「路径行」** —— profile 直接指向 `lib/index.js` 的绝对路径。本包**没有**声明
+`dsh.bundle.patch`，也不走 `install_bundle`（两条路是替代关系，见上文「安装」）。
+
+`files` 白名单是刻意收窄的。`npm pack --dry-run` 实测（`node .tmp/pack-scan.mjs`）打出来的是：
+
+```
+README.md   icon.svg   lib/.build-manifest.json   lib/client.js   lib/index.js
+locale/en.json   locale/zh.json   package.json            # 8 个文件 / ~128 KiB
+```
+
+- **`lib/.types/**` 必须排除**：`lib/**` 会把 tsc 的中间产物一起带进包，它们既不在 `exports` 里
+  （拿不到）、又会随手过期。这条有断言（`files` 必须含 `!lib/.types/**`）——`npm pack` 实测抓到的就是这个。
+- **`src/` `tools/` `docs/` `AGENTS.md` `.tmp/` 一律不进包**（有断言）。
+- **展示元数据**（官方 `dsh-app-boot` 的 `readPluginMeta` / `metaOf` 读，**不需要激活插件**）：
+  - `icon` 是 **`package.json` 的顶层字段**（不是 `dsh.icon`）：相对包根、≤ 256 KiB、SVG/PNG/JPEG/WebP。
+    官方源码里是 `iconOf(manifest?.icon, manifestPath)`。
+  - `locale/en.json` 是**英文兜底**，其余语言必须与它**同目录**（官方按 `<包>/locale/en.json` 找，
+    并且会因为"不在同一目录"直接抛错）。
+  - `locale/*.json` **必须进 `exports`** —— 否则 subpath 解析被 `exports` 挡住，界面**静默**地不显示
+    名字与图标（这是最容易漏、也最难发现的一条）。内容形如 `{"meta":{"title":…,"description":…}}`。
+- **发布前扫密钥**：`node .tmp/pack-scan.mjs` 会扫 API key / GitHub token / 内网地址形状，并交叉核对
+  "该进的进了、不该进的没进"（当前：干净 ✅）。
+- **未决（需要你定）**：`private: true` 与 `license`。要发 npm 必须先摘掉 `private`；而 `license` 是
+  法律声明，我不替你编 —— 你定了之后再把 `LICENSE` 加进 `files`。
+
 ## 实现约束（改代码前必读）
 
 - **零 import**：本文件由 Loader 以 `file:///...` 绝对路径加载，裸模块说明符（`@deepseek-ai/*`）
