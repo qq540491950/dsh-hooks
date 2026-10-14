@@ -51,4 +51,8 @@ export const styles = `
   color: var(--dsw-alias-text-primary, inherit); }
 .dsh-hooks__btn:hover:not(:disabled) { background: var(--dsw-alias-bg-module-platform, rgba(127,127,127,.12)); }
 .dsh-hooks__btn:disabled { opacity: .5; cursor: default; }
+.dsh-hooks__editor { font-family: var(--dsw-font-mono, monospace); font-size: 12px; line-height: 1.4; min-width: 0;
+  flex: 1 1 auto; resize: vertical; padding: 2px 6px; border-radius: 6px;
+  border: .5px solid var(--dsw-alias-settings-card-stroke, rgba(127,127,127,.35));
+  background: var(--dsw-alias-bg-module-platform, transparent); color: var(--dsw-alias-text-primary, inherit); }
 `

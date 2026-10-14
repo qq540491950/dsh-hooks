@@ -8,9 +8,14 @@
  *
  * ## UI 纪律在这里的体现
  *   - §3.6：**7 个事件永远全列**（含 0 条），两个来源也永远都列 ——"空"和"不存在"必须长得不一样；
- *   - §3.7：**一条错误只允许一个渲染点** —— 行内操作（启停 / 新建）的失败写进**页面级**通道；
+ *   - §3.7：**一条错误只允许一个渲染点** —— 行内操作（启停 / 编辑 / 新建）的失败写进**页面级**通道；
  *   - §3.8：每行的颜色**只**来自执行台账（`lastRun`）与 `disabled`；没有记录就是灰"未运行"；
- *   - §3.9：文件不存在 / JSON 非法 / 沙箱拒绝 / matcher 非法**分别说清**，且不把内部错误原文当主文案。
+ *   - §3.9：文件不存在 / JSON 非法 / 沙箱拒绝 / matcher 非法**分别说清**，且不把内部错误原文当主文案；
+ *   - §3.10：`command` 是 **mono + multiline**（真 `<textarea>`），`timeout` 只要 mono。
+ *
+ * ## 状态都放在最外层
+ * 子组件**不许用 hook**（`tools/verify.ts` 的假 React 只支持无 hook 的子组件）。这不是巧合：
+ * 行内编辑的状态（正在编辑哪一行、草稿是什么）由 `HooksSection` 持有，行组件只收 props。
  */
 
 import { Fragment, h, useEffect, useState } from './react.ts'
@@ -76,6 +81,22 @@ function statusOf(hook: HookView): { className: string; label: string } {
 /** 行内操作的回调：行组件自己不知道怎么写，由最外层统一发请求并处理错误。 */
 type Toggle = (file: FileView, event: string, groupRawIndex: number, hook: HookView) => void
 
+/** 一条 hook 的身份键：**文件 + 事件 + 两个原始下标**（就是寻址用的那三元组）。 */
+function rowKey(file: FileView, event: string, groupRawIndex: number, hookIndex: number): string {
+  return `${file.kind}|${event}|${String(groupRawIndex)}|${String(hookIndex)}`
+}
+
+/** 行内编辑命令的状态与动作。 */
+type Editor = {
+  /** 正在编辑的那一行的身份键（空串 = 没有在编辑）。**一次只编辑一行**：简单、可断言。 */
+  key: string
+  draft: string
+  start: (key: string, command: string) => void
+  change: (value: string) => void
+  cancel: () => void
+  save: (file: FileView, event: string, groupRawIndex: number, hook: HookView) => void
+}
+
 /** 一条 hook。 */
 function HookRow(props: {
   hook: HookView
@@ -85,23 +106,73 @@ function HookRow(props: {
   writable: boolean
   busy: boolean
   onToggle: Toggle
+  editor: Editor
 }): Jsx {
-  const { hook, file, event, groupRawIndex, writable, busy, onToggle } = props
+  const { hook, file, event, groupRawIndex, writable, busy, onToggle, editor } = props
+  const key = rowKey(file, event, groupRawIndex, hook.rawIndex)
+  const editing = editor.key === key
   const status = statusOf(hook)
   const run = hook.lastRun
   const title = run === null ? status.label : `${status.label}\n${run.stderr || run.stdout || '(无输出)'}`
   return (
     <div className="dsh-hooks__hook">
       <span className={status.className} title={title} />
-      <span className="dsh-hooks__cmd" title={hook.command}>
-        {hook.command}
-      </span>
-      {hook.disabled ? <span className="dsh-hooks__tag">已停用</span> : null}
-      <span className="dsh-hooks__meta" title="超时（未写则为默认值）">
-        {hook.timeoutSec === null ? `${String(hook.defaultTimeoutSec)}s 默认` : `${String(hook.timeoutSec)}s`}
-      </span>
-      {writable ? (
+      {editing ? null : (
+        <>
+          <span className="dsh-hooks__cmd" title={hook.command}>
+            {hook.command}
+          </span>
+          {hook.disabled ? <span className="dsh-hooks__tag">已停用</span> : null}
+          <span className="dsh-hooks__meta" title="超时（未写则为默认值）">
+            {hook.timeoutSec === null ? `${String(hook.defaultTimeoutSec)}s 默认` : `${String(hook.timeoutSec)}s`}
+          </span>
+        </>
+      )}
+      {writable && editing ? (
         <span className="dsh-hooks__actions">
+          {/* command 是 mono + multiline（§3.10）：真 `<textarea>`，不是 input。 */}
+          <textarea
+            className="dsh-hooks__editor"
+            value={editor.draft}
+            rows={1}
+            onChange={(changeEvent) => {
+              editor.change(changeEvent.target.value)
+            }}
+          />
+          <button
+            type="button"
+            className="dsh-hooks__btn"
+            disabled={busy}
+            onClick={() => {
+              editor.save(file, event, groupRawIndex, hook)
+            }}
+          >
+            保存
+          </button>
+          <button
+            type="button"
+            className="dsh-hooks__btn"
+            disabled={busy}
+            onClick={() => {
+              editor.cancel()
+            }}
+          >
+            取消
+          </button>
+        </span>
+      ) : null}
+      {writable && !editing ? (
+        <span className="dsh-hooks__actions">
+          <button
+            type="button"
+            className="dsh-hooks__btn"
+            disabled={busy}
+            onClick={() => {
+              editor.start(key, hook.command)
+            }}
+          >
+            编辑
+          </button>
           <button
             type="button"
             className="dsh-hooks__btn"
@@ -126,8 +197,9 @@ function GroupBlock(props: {
   writable: boolean
   busy: boolean
   onToggle: Toggle
+  editor: Editor
 }): Jsx {
-  const { group, file, event, writable, busy, onToggle } = props
+  const { group, file, event, writable, busy, onToggle, editor } = props
   return (
     <div className="dsh-hooks__groups">
       <div className="dsh-hooks__matcher">
@@ -144,6 +216,7 @@ function GroupBlock(props: {
           writable={writable}
           busy={busy}
           onToggle={onToggle}
+          editor={editor}
         />
       ))}
     </div>
@@ -176,8 +249,9 @@ function SourceCard(props: {
   busy: boolean
   onToggle: Toggle
   onCreate: (file: FileView) => void
+  editor: Editor
 }): Jsx {
-  const { file, writable, busy, onToggle, onCreate } = props
+  const { file, writable, busy, onToggle, onCreate, editor } = props
   return (
     <div className="dsh-hooks__card">
       <div className="dsh-hooks__cardhead">
@@ -223,6 +297,7 @@ function SourceCard(props: {
                 writable={writable}
                 busy={busy}
                 onToggle={onToggle}
+                editor={editor}
               />
             ))}
           </Fragment>
@@ -239,6 +314,9 @@ export function HooksSection(): Jsx {
   const [busy, setBusy] = useState(false)
   /** 写成功后 +1 → 重新取数，保证页面显示的是**写完之后**的状态。 */
   const [nonce, setNonce] = useState(0)
+  /** 正在编辑哪一行（空串 = 没有）。**一次只编辑一行**。 */
+  const [editingKey, setEditingKey] = useState('')
+  const [draft, setDraft] = useState('')
 
   useEffect(() => {
     const controller = new AbortController()
@@ -285,8 +363,12 @@ export function HooksSection(): Jsx {
     setBanner(null)
     void (async () => {
       const outcome = await requestWrite(intent)
-      if (outcome.ok) setNonce((value) => value + 1)
-      else setBanner({ code: outcome.error ?? 'internal', detail: outcome.detail ?? '' })
+      if (outcome.ok) {
+        setNonce((value) => value + 1)
+        setEditingKey('')
+      } else {
+        setBanner({ code: outcome.error ?? 'internal', detail: outcome.detail ?? '' })
+      }
       setBusy(false)
     })()
   }
@@ -304,6 +386,33 @@ export function HooksSection(): Jsx {
 
   const onCreate = (file: FileView): void => {
     runWrite({ file: file.kind, op: 'createFile' })
+  }
+
+  const editor: Editor = {
+    key: editingKey,
+    draft,
+    start: (key, command) => {
+      setEditingKey(key)
+      setDraft(command)
+    },
+    change: (value) => {
+      setDraft(value)
+    },
+    cancel: () => {
+      setEditingKey('')
+      setDraft('')
+    },
+    save: (file, event, groupRawIndex, hook) => {
+      // **只发定点操作**：命令是唯一被改的字段，其余一切由宿主原样保留（§2.3/§2.4）。
+      runWrite({
+        file: file.kind,
+        op: 'setHookCommand',
+        event,
+        groupIndex: groupRawIndex,
+        hookIndex: hook.rawIndex,
+        command: draft,
+      })
+    },
   }
 
   if (phase.kind === 'loading') {
@@ -367,6 +476,7 @@ export function HooksSection(): Jsx {
           busy={busy}
           onToggle={onToggle}
           onCreate={onCreate}
+          editor={editor}
         />
       ))}
     </div>

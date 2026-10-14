@@ -23,12 +23,12 @@
     },
     {
       "output": "lib/client.js",
-      "outputSha256": "2042282b6942ff3c20d4300eb04993f21690f30673a448e77f3bafdb61b277fd",
+      "outputSha256": "1a505ea9b612d8fefca650337f23874ab2e8dfbad909dec0f8790163ed541d56",
       "inputs": {
         "src/client/index.ts": "4e9ec5ff0aad13cfdb0ed173efad3a607d24193d5751958e03b83735f03b1f0b",
         "src/client/react.ts": "015dcb18d88be6b65954ada347271c5724b0a5f41e7f72737df1bb4643772946",
-        "src/client/section.tsx": "aca7a4bd619bab96636cf36806587447110d999459e615eb0ac376250191696f",
-        "src/client/styles.ts": "6e67becceba5a810454c6cfcb6a624d435c9de7bdd045622e8d5989d5d705c33",
+        "src/client/section.tsx": "7bc0966cd54b51605fd12844417a187cf07b0387777048e58d296474e20f4ab5",
+        "src/client/styles.ts": "f238a8121bd768175210e5e532082e6dfd83288db2eb2c0396f580abf23d691a",
         "src/client/wire.ts": "2120d8be60afc2b06f98b061fc09c96a8dee35fa479cec17b339b102b6476653",
         "src/client/write.ts": "d44be27e535ed54d9ec3684bd8f8b1f82967a82eb429620e5d832295a3a7147e",
         "src/shared/constants.ts": "99b1c7c62f24e7609c939f5c9a24b98d4cc37b5107196008bbd76f265222f138",

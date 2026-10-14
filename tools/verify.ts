@@ -235,6 +235,9 @@ function createFakeReact() {
       title: typeof props.title === 'string' ? props.title : '',
       // `onClick` 要留着：渲染测试得能**真的点**它（§4.5：事件闭包是当次渲染的，点了要重新渲染再看）。
       onClick: typeof props.onClick === 'function' ? props.onClick : undefined,
+      // 表单控件：渲染测试要能读到**当前值**并模拟输入（§4.5：输入后要重新渲染再看）。
+      value: typeof props.value === 'string' ? props.value : undefined,
+      onChange: typeof props.onChange === 'function' ? props.onChange : undefined,
     })
     flatten(node.children, out)
     return out
@@ -483,8 +486,8 @@ await test('D：点"停用"发的是定点写请求（file + 原始下标 + 目�
   const component = componentFromArtifact(harness.React)
   const nodes = await renderSection(component, harness, { ok: true, data: minimalSnapshot() })
   const buttons = writeButtons(nodes)
-  assert.equal(buttons.length, 1, '可写时每条 hook 一个启停按钮（这里只有一条 hook）')
-  assert.equal(typeof buttons[0].onClick, 'function', '按钮必须真的带 onClick')
+  assert.equal(buttons.length, 2, '可写时一行两个按钮：编辑、停用（这里只有一条 hook）')
+  assert.equal(typeof buttons[1].onClick, 'function', '按钮必须真的带 onClick')
 
   const calls = []
   globalThis.fetch = async (_url: string, options: { method?: string; body?: string } = {}) => {
@@ -497,7 +500,7 @@ await test('D：点"停用"发的是定点写请求（file + 原始下标 + 目�
           : { ok: true, data: minimalSnapshot() },
     }
   }
-  buttons[0].onClick()
+  buttons[1].onClick()
   await new Promise((resolve) => setTimeout(resolve, 0))
   await new Promise((resolve) => setTimeout(resolve, 0))
 
@@ -513,7 +516,8 @@ await test('D：写失败按错误码分别说清，且只渲染在页面级通�
   const harness = createFakeReact()
   const component = componentFromArtifact(harness.React)
   const nodes = await renderSection(component, harness, { ok: true, data: minimalSnapshot() })
-  const button = writeButtons(nodes)[0]
+  // 索引 1 是"停用"（索引 0 是"编辑"）—— 这里要触发的是写请求。
+  const button = writeButtons(nodes)[1]
 
   globalThis.fetch = async () => ({
     json: async () => ({ ok: false, error: 'stale', detail: 'FS_STALE_VERSION: 期望 v1' }),
@@ -534,6 +538,60 @@ await test('D：写失败按错误码分别说清，且只渲染在页面级通�
   assert.ok(joined.includes('生效 1 条'), '失败**不**清空已有内容 —— 用户要对着旧内容决定下一步')
   const banners = after.filter((node) => typeof node.className === 'string' && node.className.includes('banner--error'))
   assert.equal(banners.length, 1, '一条错误只允许一个渲染点（§3.7）')
+})
+
+await test('D：行内编辑命令 —— 文本框里是当前命令，保存发的是定点写请求', async () => {
+  const harness = createFakeReact()
+  const component = componentFromArtifact(harness.React)
+  const first = await renderSection(component, harness, { ok: true, data: minimalSnapshot() })
+
+  // 没在编辑时：一行两个按钮（编辑、停用）
+  const idle = writeButtons(first)
+  assert.equal(idle.length, 2, '一行应当有"编辑"和"停用"两个按钮')
+  idle[0].onClick()
+
+  // 点"编辑"后重新渲染（§4.5：事件闭包是当次渲染的）
+  harness.begin()
+  const editing = harness.flatten(component())
+  const textarea = editing.find(
+    (node) => typeof node.className === 'string' && node.className.includes('dsh-hooks__editor'),
+  )
+  assert.ok(textarea !== undefined, 'command 必须是 mono+multiline 的真 textarea（§3.10）')
+  assert.equal(textarea.value, 'echo a', '文本框里应当是**当前**命令（不是空的）')
+
+  // 模拟输入，再重新渲染
+  textarea.onChange({ target: { value: 'echo b' } })
+  harness.begin()
+  const typed = harness.flatten(component())
+  const typedBox = typed.find(
+    (node) => typeof node.className === 'string' && node.className.includes('dsh-hooks__editor'),
+  )
+  assert.equal(typedBox.value, 'echo b', '输入必须真的进了草稿状态')
+
+  // 点"保存"：断言发出的**请求体逐字段**
+  const calls = []
+  globalThis.fetch = async (_url: string, options: { method?: string; body?: string } = {}) => {
+    const method = options.method ?? 'GET'
+    calls.push({ method, body: typeof options.body === 'string' ? JSON.parse(options.body) : null })
+    return { json: async () => ({ ok: true, data: { file: 'project', version: 'v2' } }) }
+  }
+  writeButtons(typed)[0].onClick()
+  await new Promise((resolve) => setTimeout(resolve, 0))
+  await new Promise((resolve) => setTimeout(resolve, 0))
+
+  assert.equal(calls[0].method, 'POST')
+  assert.deepEqual(
+    calls[0].body,
+    {
+      file: 'project',
+      op: 'setHookCommand',
+      event: 'PreToolUse',
+      groupIndex: 0,
+      hookIndex: 0,
+      command: 'echo b',
+    },
+    '只改命令这一个字段，其余一切交给宿主原样保留（§2.3/§2.4）',
+  )
 })
 
 //#endregion
