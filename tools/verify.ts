@@ -184,6 +184,229 @@ await test('C：假 loader 真跑 factory —— 经 ctx.inject(["slots"]) 注�
 
 //#endregion
 
+//#region D. 真实渲染（假 React + 假 fetch；渲染的是**产物里注册到座位上的那个组件**）
+
+/**
+ * 极简假 React —— 只够跑本插件这一个组件。
+ * `useState` **按位置**发值（§4.6 记的维护陷阱）：`cursor` 每次渲染归零，值跨渲染保留。
+ * `useEffect` 只收集、由驱动执行一次（对应 `[]` 依赖）。`<style>` 的内容不算页面文案。
+ */
+function createFakeReact() {
+  const store = { values: [], effects: [], dirty: false }
+  let cursor = 0
+  const React = {
+    createElement: (type, props, ...children) => ({ type, props: props ?? {}, children: children.flat(Infinity) }),
+    Fragment: 'Fragment',
+    useState(initial) {
+      const index = cursor++
+      if (!(index in store.values)) store.values[index] = initial
+      return [
+        store.values[index],
+        (value) => {
+          store.values[index] = value
+          store.dirty = true
+        },
+      ]
+    },
+    useEffect: (effect) => {
+      store.effects.push(effect)
+    },
+    useMemo: (compute) => compute(),
+    useCallback: (fn) => fn,
+  }
+  const flatten = (node, out = []) => {
+    if (node === null || node === undefined || typeof node === 'boolean') return out
+    if (Array.isArray(node)) {
+      for (const child of node) flatten(child, out)
+      return out
+    }
+    if (typeof node === 'string' || typeof node === 'number') {
+      out.push({ text: String(node) })
+      return out
+    }
+    if (node.type === 'style') return out
+    // **展开函数组件**：这才是最小必要的"reconcile" —— 不展开的话 `SourceCard`/`EventRow`/
+    // `HookRow` 的内部永远渲染不出来（第一版就踩了这个坑：断言看到 0 个事件名）。
+    // 限制：只支持**不用 hook 的子组件**（本页只有最外层用 useState/useEffect）。
+    if (typeof node.type === 'function') return flatten(node.type(node.props), out)
+    const props = node.props ?? {}
+    out.push({
+      className: typeof props.className === 'string' ? props.className : '',
+      title: typeof props.title === 'string' ? props.title : '',
+    })
+    flatten(node.children, out)
+    return out
+  }
+  return {
+    React,
+    store,
+    flatten,
+    begin: () => {
+      cursor = 0
+      store.effects = []
+      store.dirty = false
+    },
+  }
+}
+
+/** 从**产物**里取出注册到座位上的那个组件 —— 页面真正渲染的就是它。 */
+function componentFromArtifact(react) {
+  const source = fs.readFileSync(CLIENT, 'utf8')
+  const loads = []
+  new Function('window', source)({ __ModuleLoader__: { load: (config) => loads.push(config) } })
+  let component = null
+  const scope = {
+    slots: {
+      inject: (_key, callback) => callback(),
+      register: (_options, registered) => {
+        component = registered
+        return () => {}
+      },
+    },
+  }
+  loads[0]
+    .factory(() => react)
+    .apply({
+      inject: (_services, callback) => {
+        callback(scope)
+        return () => {}
+      },
+    })
+  assert.equal(typeof component, 'function', '座位注册必须给出一个组件函数')
+  return component
+}
+
+/** 渲染一次 + 跑完 effect 引发的重渲染。 */
+async function renderSection(component, harness, respond) {
+  globalThis.fetch = async () => ({ json: async () => respond })
+  const pass = () => {
+    harness.begin()
+    return component()
+  }
+  let tree = pass()
+  for (const effect of harness.store.effects) effect()
+  // async IIFE 要跨好几个微任务才走到 setPhase；多让两轮宏任务过去。
+  await new Promise((resolve) => setTimeout(resolve, 0))
+  await new Promise((resolve) => setTimeout(resolve, 0))
+  if (harness.store.dirty) tree = pass()
+  return harness.flatten(tree)
+}
+
+await test('D：真实渲染 —— 7 个事件全列、三态分别说清、状态色只来自台账', async () => {
+  // 造一个"什么情况都有"的快照：三态文件各一个 + 四种状态的 hook。
+  const run = (exitCode, decision) => ({ at: 1, exitCode, decision, durationMs: 12, stdout: '', stderr: 'out' })
+  const hook = (rawIndex, command, extra = {}) => ({
+    rawIndex,
+    command,
+    timeoutSec: null,
+    defaultTimeoutSec: 600,
+    disabled: false,
+    lastRun: null,
+    ...extra,
+  })
+  const groups = [
+    {
+      file: 'project',
+      rawIndex: 0,
+      matcher: 'pwsh',
+      matcherOk: true,
+      matcherProblem: null,
+      hooks: [
+        hook(0, 'echo never-run'),
+        hook(1, 'echo ok', { lastRun: run(0, 'pass') }),
+        hook(2, 'echo deny', { lastRun: run(0, 'deny') }),
+        hook(3, 'echo off', { disabled: true }),
+      ],
+    },
+  ]
+  const fileOf = (kind, state, own = []) => {
+    let hookCount = 0
+    let disabledCount = 0
+    for (const group of own) {
+      for (const one of group.hooks) {
+        if (one.disabled) disabledCount += 1
+        else hookCount += 1
+      }
+    }
+    return {
+      kind,
+      path: kind === 'user' ? 'C:/u/.dsh/hooks.json' : 'D:/proj/.dsh/hooks.json',
+      state,
+      message: state === 'error' ? 'FsError: cannot read text: Unexpected token {' : null,
+      version: null,
+      hookCount,
+      skipped: [],
+      matcherErrors: [],
+      events: HOOK_EVENTS.map((event) => ({
+        event,
+        groups: event === 'PreToolUse' ? own : [],
+        hookCount: event === 'PreToolUse' ? hookCount : 0,
+        disabledCount: event === 'PreToolUse' ? disabledCount : 0,
+        runCount: 0,
+      })),
+    }
+  }
+  const snapshot = {
+    route: '/api/hooks',
+    projectRoot: 'D:/proj',
+    cwd: 'D:/proj',
+    cwdSource: 'session',
+    files: [fileOf('project', 'ok', groups), fileOf('user', 'error')],
+    events: [],
+    total: { hookCount: 4, disabledCount: 1, groupCount: 1 },
+    staleInUse: false,
+    capabilities: { writable: true },
+  }
+
+  const harness = createFakeReact()
+  const component = componentFromArtifact(harness.React)
+  const nodes = await renderSection(component, harness, { ok: true, data: snapshot })
+  const texts = nodes.filter((node) => node.text !== undefined).map((node) => node.text)
+  // JSX 的 `{...}` 插值会变成**独立子节点**，所以像"生效 4 条"这种文案会被切成好几段；
+  // 断言子串时要按文档顺序拼起来看（精确匹配事件名仍用 `texts`）。
+  const joined = texts.join('')
+
+  // ① 7 个事件**全列**（两张卡各 7 个）——"空"与"不存在"必须长得不一样（§3.6）
+  for (const event of HOOK_EVENTS) {
+    assert.equal(texts.filter((text) => text === event).length, 2, `${event} 必须在两张文件卡里都出现（含 0 条）`)
+  }
+  assert.ok(joined.includes('没有配置'), '0 条的事件必须明说"没有配置"，而不是消失')
+  // ② 三态分别说清（§3.9）
+  assert.ok(joined.includes('读不出来'), 'error 必须说"读不出来"（≠ 没有配置）')
+  assert.ok(joined.includes('已读取'), 'ok 必须说"已读取"')
+  assert.ok(!joined.includes('FsError'), '绝不把内部错误原文当文案 —— 本次渲染里它一次都不该出现')
+  assert.ok(joined.includes('生效 4 条'), '总数必须来自快照')
+  assert.ok(joined.includes('已停用'), '停用要有可见标签')
+
+  // ③ 状态色**只**来自台账与 disabled（§3.8）
+  const dots = nodes.filter((node) => typeof node.className === 'string' && node.className.includes('dsh-hooks__dot'))
+  assert.equal(dots.length, 4, '每条 hook 恰好一个状态点')
+  assert.ok(!dots[0].className.includes('--'), '没有记录 → 灰（"没报错就报绿"是被禁的）')
+  assert.ok(dots[1].className.includes('--ok'), 'exitCode 0 + pass → 绿')
+  assert.ok(dots[2].className.includes('--deny'), 'decision deny → 红')
+  assert.ok(!dots[3].className.includes('--ok'), '已停用不许画绿')
+  assert.ok(dots[0].title.includes('未运行'), '灰点必须能解释自己')
+})
+
+await test('D：真实渲染 —— 取数失败时主文案是人话，技术原文只作补充', async () => {
+  const harness = createFakeReact()
+  const component = componentFromArtifact(harness.React)
+  const nodes = await renderSection(component, harness, {
+    ok: false,
+    error: 'internal',
+    detail: 'FsError: cannot list D:/proj/.dsh',
+  })
+  const texts = nodes.filter((node) => node.text !== undefined).map((node) => node.text)
+  assert.ok(texts[0].includes('宿主在读取配置时出错了'), '主文案必须是我们自己的话（§3.9）')
+  assert.ok(!texts[0].includes('FsError'), '绝不把内部错误原文当主文案')
+  assert.ok(
+    texts.some((text) => text.includes('FsError: cannot list')),
+    '技术原文只能作为补充出现在下面（排查要用得上）',
+  )
+})
+
+//#endregion
+
 //#region E. 构建指纹：产物必须就是当前源码的产物（"过期但全绿"的唯一防线）
 
 // `lib/**` 是**提交进版本库**的产物，所以必须能断言"它没过期"。没有这一区的话，
