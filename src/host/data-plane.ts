@@ -12,7 +12,7 @@
  * 页面不允许自己解析 JSON，否则两套解析器必然漂移成"页面说配好了、运行时不认"。
  */
 
-import { HOOK_EVENTS, DEFAULT_TIMEOUT_MS, type HookEvent } from '../shared/constants.ts'
+import { HOOKS_ROUTE, HOOK_EVENTS, DEFAULT_TIMEOUT_MS, type HookEvent } from '../shared/constants.ts'
 import { messageOf } from '../shared/guards.ts'
 import { matcherDiagnostic } from '../shared/protocol.ts'
 import type { ParsedGroup, ParsedGroups, SkippedHandler } from '../shared/types.ts'
@@ -20,13 +20,10 @@ import { latestRunFor, type LedgerEntry } from './ledger.ts'
 import { parseHooksRequest, type FileKind, type HooksRequest } from './write.ts'
 
 /**
- * 本插件注册的浏览器路由。
- *
- * 宿主 `register()` 与客户端 `fetch()` 必须**逐字一致**，所以它是唯一常量而不是两处字面量。
- * 必须以 `/api/` 开头（`connection.fetch` 自己校验），并因此自带 Host/Origin 围栏（403）与
- * 浏览器鉴权（401）。
+ * 本插件注册的浏览器路由 —— 定义在 `src/shared/constants.ts`，**两半共用同一个字面量**
+ * （宿主注册它、客户端 fetch 它；不一致就是静默 404）。这里只是转出，方便调用方 import。
  */
-export const HOOKS_ROUTE = '/api/hooks'
+export { HOOKS_ROUTE }
 
 /** 一个来源（项目级 / 用户级）的磁盘状态 + 解析结果。 */
 export interface SourceInspection {

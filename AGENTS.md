@@ -115,7 +115,8 @@
 
 **3.1 [边界] 绝不硬编码颜色。** 深色主题下 `--dsw-alias-brand-primary` **近白色**，写 `#fff` 就是白底白字。十六进制只允许作 `var()` 的 fallback。状态色用 `--dsw-alias-state-*-primary`。
 
-**3.2 [边界] 视觉与尺寸进注入的样式表，绝不写 inline。** inline `background` 压过 `:hover`（按钮永远没有悬停反馈），inline `height` 压过样式表。唯一例外：圆点颜色（走 token）。注入必须**幂等且能刷新**：`<style id=...>` 已存在时**比较 textContent 并原地更新**（客户端半边会热替换，"存在就 return"会让新加的 CSS 永远不出现）。
+**3.2 [边界] 视觉与尺寸进注入的样式表，绝不写 inline。** inline `background` 压过 `:hover`（按钮永远没有悬停反馈），inline `height` 压过样式表。唯一例外：圆点颜色（走 token）。
+**本插件的注入方式（刻意偏离字面写法）**：样式是 `src/client/styles.ts` 里的一个 CSS 字符串，由组件渲染成 `<style>{styles}</style>` 元素 —— 官方 `references/ui-plugin.md` 明确认可"组件局部样式以 React 元素渲染，卸载时随之移除"。这比往 `document` 注入 `<style id>` 更稳：**根本不存在**"`<style id>` 已存在就 return → 新加的 CSS 永远不出现"那个坑（每条渲染都是新元素，天然最新）。代价：不能靠 `#id` 去更新既有样式（也不需要）。
 
 **3.3 [边界] 座位注册字段白名单里没有 `icon`。** 本轮核对 `dsh-client-ui-slots/lib/index.js` 的 `register()`：`entry.options` 逐字段展开，只有 `key/id/order/label/priority/select/inject/children/store/locale/registrant` 会被拷贝，**`icon` 被静默丢弃**；导航图标由官方 `navIcon(id)` 硬编码查表、未知 id 兜底成齿轮。**不要学 `dsh-mcp-manager` 的「打 data 属性 + CSS 覆盖」**——那依赖官方 DOM 结构，一改就静默失效（`dsh-skill-manager` 已明确否决）。本插件第一版就用兜底齿轮。
 **注意区分两个「icon」**：这里说的是**座位注册参数**；`package.json` 里的 **manifest 级 `icon`** 是另一套机制且**官方支持**（Plugin Manager 卡片 / bundle 详情 / 设置里的插件清单会读它，不需要激活插件）——见 §7。

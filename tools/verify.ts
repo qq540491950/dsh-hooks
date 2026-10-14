@@ -57,6 +57,7 @@ import {
 
 const HERE = path.dirname(fileURLToPath(import.meta.url))
 const LIB = path.join(HERE, '..', 'lib', 'index.js')
+const CLIENT = path.join(HERE, '..', 'lib', 'client.js')
 const NODE = process.execPath
 
 let passed = 0
@@ -84,6 +85,104 @@ function test(title, fn) {
 }
 
 const tmpRoots = []
+
+//#region C. 客户端半边：包契约 + 产物协议 + 假 loader 真跑 factory
+
+test('A：package.json 的客户端半边契约（exports["./client"] + dsh.client.platform）', () => {
+  const pkg = JSON.parse(fs.readFileSync(path.join(HERE, '..', 'package.json'), 'utf8'))
+  // 声明了 dsh.client 却没有 exports["./client"] 时，官方运行时校验器会**直接抛错**。
+  assert.equal(pkg.dsh.client.platform, 'web', '只有 platform === "web" 才会发布客户端半边')
+  const entry = pkg.exports['./client']
+  assert.equal(typeof entry, 'string', 'exports["./client"] 只接受字符串（或带字符串 default 的对象）')
+  assert.equal(entry, './lib/client.js', '路径是相对 manifest 目录的（bundle 按 dirname(package.json) 解析）')
+  assert.ok(fs.existsSync(path.join(HERE, '..', entry)), 'exports["./client"] 必须指向真实存在的文件')
+})
+
+test('C：客户端产物是 classic script + 恰好一个 factory + 恰好一个 require', () => {
+  const source = fs.readFileSync(CLIENT, 'utf8')
+  assert.equal((source.match(/^(import|export) /gm) || []).length, 0, '必须是 classic script，不是 ESM')
+  assert.equal((source.match(/\.load\(/g) || []).length, 1, '只能注册一个 factory')
+  assert.equal(
+    (source.match(/window\.__ModuleLoader__/g) || []).length,
+    1,
+    '产物里只能有**一处**真正的注册调用（wrapper 由构建脚本注入；注释里的提及不算）',
+  )
+  const requires = source.match(/\brequire\s*\(/g) || []
+  assert.equal(requires.length, 1, '只允许一个 require（源码里手写第二个就会被这条抓住）')
+  assert.ok(source.includes('require("react")'), '而且只能取平台种子模块 react')
+  assert.ok(source.includes('id: "dsh-hooks"'), 'id 必须等于 package.json 的 name')
+})
+
+await test('C：假 loader 真跑 factory —— 经 ctx.inject(["slots"]) 注册 hooks/920', async () => {
+  const source = fs.readFileSync(CLIENT, 'utf8')
+  const loads = []
+  // 源码里写的是 `window.__ModuleLoader__`，所以喂一个假 window 进去（局部作用域，不污染全局）。
+  new Function('window', source)({ __ModuleLoader__: { load: (config) => loads.push(config) } })
+  assert.equal(loads.length, 1, '脚本执行时必须恰好注册一次')
+  assert.equal(loads[0].id, 'dsh-hooks')
+  assert.equal(typeof loads[0].factory, 'function')
+
+  // materialize：假 require 只认 react（第二个种子模块会让这条断言红）。
+  const fakeReact = {
+    createElement: () => null,
+    Fragment: {},
+    useCallback: (value) => value,
+    useEffect: () => {},
+    useMemo: (compute) => compute(),
+    useState: (initial) => [initial, () => {}],
+  }
+  const exported = loads[0].factory((name) => {
+    assert.equal(name, 'react', '客户端只允许取种子模块 react')
+    return fakeReact
+  })
+  assert.equal(typeof exported.apply, 'function', '平台调用的是 exports.apply')
+
+  // 调 apply：断言顺序与参数 —— inject(["slots"]) → slots.inject("settings.section") → register(...)
+  const injectedServices = []
+  const slotInjections = []
+  const registrations = []
+  const scope = {
+    slots: {
+      inject: (key, callback) => {
+        slotInjections.push(key)
+        return callback()
+      },
+      register: (options, component) => {
+        registrations.push({ options, component })
+        return () => {}
+      },
+    },
+  }
+  const ctx = {
+    inject: (services, callback) => {
+      injectedServices.push(services)
+      callback(scope)
+      return () => {}
+    },
+  }
+  exported.apply(ctx)
+
+  assert.deepEqual(
+    injectedServices,
+    [['slots']],
+    '必须在 ctx.inject(["slots"]) 里注册（缺 slots 的宿主里保持 inactive）',
+  )
+  assert.deepEqual(
+    slotInjections,
+    ['settings.section'],
+    '必须走 slots.inject：未声明的座位直接 register 会抛 slot "..." is not declared',
+  )
+  assert.equal(registrations.length, 1)
+  const options = registrations[0].options
+  assert.equal(options.name, 'settings.section')
+  assert.equal(options.id, 'hooks', 'list 座位必须给唯一 id')
+  assert.equal(options.order, 920, 'order 必须排在 mcp/900 与 skills/910 之后')
+  assert.equal(typeof options.label, 'function', 'label 可以是 thunk（官方按 locale 重新求值）')
+  assert.equal(options.label(), 'Hooks')
+  assert.equal(typeof registrations[0].component, 'function')
+})
+
+//#endregion
 
 //#region E. 构建指纹：产物必须就是当前源码的产物（"过期但全绿"的唯一防线）
 
@@ -1764,11 +1863,13 @@ await test('P：路由注册契约（路径以 /api/ 开头、GET+POST、buffere
   assert.equal(typeof route.fetch, 'function')
 })
 
-await test('P：路由字面量与共享常量逐字一致，且原样出现在产物里', () => {
+await test('P：路由字面量与共享常量逐字一致，且原样出现在两份产物里', () => {
   assert.equal(HOOKS_ROUTE, '/api/hooks')
   const host = fs.readFileSync(LIB, 'utf8')
-  assert.ok(host.includes(`"${HOOKS_ROUTE}"`), '产物里应当出现与共享常量一致的路由字面量')
-  // TODO(P5)：客户端产物里必须出现**同一个**字面量 —— 两侧不一致就是静默 404。
+  assert.ok(host.includes(`"${HOOKS_ROUTE}"`), '宿主产物里应当出现与共享常量一致的路由字面量')
+  // 两条产物的路由**必须逐字一致** —— 不一致就是静默 404（AGENTS §2.12）。
+  const client = fs.readFileSync(CLIENT, 'utf8')
+  assert.ok(client.includes(`"${HOOKS_ROUTE}"`), '客户端产物里必须是**同一个**字面量（不一致就是静默 404）')
 })
 
 await test('P：没有 connection 服务时插件照常工作（数据面是便利设施，不是硬依赖）', async () => {

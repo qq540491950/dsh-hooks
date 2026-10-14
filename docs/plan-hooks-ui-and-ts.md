@@ -538,3 +538,13 @@ window.__ModuleLoader__.load({
 - 反向验证 3 个注入全部精确命中并还原：台账匹配忽略 command、台账不再封顶、**`rawIndex` 改用解析后的下标**（写操作会改错 hook —— 这条同时打红了两条断言）。
 - **过程中自检又抓到我自己的测试错误**：把"全局上限"和"单会话上限"混在同一次灌入里，于是先触到单会话上限（200 ≠ 500）。产品行为是对的，改的是测试。
 - **未做（留给 P4e / P6）**：试运行（复用 `runPoint`，不另写演示执行器）。
+
+### P5a —— 完成（本次提交）：客户端半边（脚手架 + 产物协议 + 只读看板）
+
+- 产出：`src/client/{react,wire,styles,section.tsx,index}.ts(x)`；`tools/build.ts` 增加**浏览器目标**（esbuild `format:'cjs'` + 自注入 factory wrapper → `lib/client.js`）；`package.json` 增加 `exports["./client"]` 与 `dsh.client.platform='web'`；`HOOKS_ROUTE` 从宿主体移进 `src/shared/constants.ts`（**两半必须逐字一致**，不一致就是静默 404）。
+- **产物协议（自检 C 区，4 条）**：classic script（无顶层 import/export）、`.load(` **恰好 1 次**、`window.__ModuleLoader__` **恰好 1 处**（注释里的提及不算，所以横幅特意不写 `window.` 前缀）、`require` **恰好 1 处且是 `react`**、`id === package.json.name`。还有一条**假 loader 真跑 factory**：喂假 `window` → 取 factory → 喂假 `require('react')` → 调 `exports.apply(fakeCtx)`，断言顺序是 `ctx.inject(['slots'])` → `slots.inject('settings.section')` → `register({name,id:'hooks',order:920,label:()=>'Hooks'}, Component)`。
+- 只读看板的内容：项目根 / "无法确定当前项目"、`staleInUse` 横幅、两个来源卡（三态**分别**说清：不存在 ≠ 读不出来）、每张卡 7 个事件行（含 0 条）、group 的 matcher 与非法诊断、每条 hook 的命令/超时/停用标签、以及**只由台账决定的**状态点（§3.8）。
+- 断言：110 → **113**。反向验证 3 个注入全部精确命中并还原：`platform` 改成非 web、产物 `id` 不等于包名、座位 `order` 退回 910。
+- **自检立刻抓到我自己的断言错误**：`exports["./client"]` 的值是 `"./lib/client.js"`（带 `./`），我断言成了 `"lib/client.js"` —— 一秒就红了，这正是断言该做的事。
+- **未做（留给 P5b）**：真实渲染测试（假 React + 假 DOM 的 `D` 区：7 个事件全列、三态文案、状态点颜色只来自台账）。**这一步不需要再重启**（客户端半边构建后由客户端 HMR 替换）。
+- **风格偏离（已记进 AGENTS §3.2）**：样式不是往 `document` 注入 `<style id>`，而是 `styles.ts` 的字符串 + 组件渲染 `<style>` 元素（官方 `ui-plugin.md` 认可这种写法）。好处是彻底避开"存在就 return → 新 CSS 永不出现"那个坑。

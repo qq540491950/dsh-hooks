@@ -89,9 +89,70 @@ async function buildHost(): Promise<TargetResult> {
   return { output: outfile, outputSha256: await hashOf(outfile), inputs: fingerprints }
 }
 
+/**
+ * 构建浏览器半边 → `lib/client.js`。
+ *
+ * ## 为什么产物是"classic script + 我们自己注入的 wrapper"
+ * 平台的浏览器加载器（`@deepseek-ai/dsh-client-modules`）期望的是：一个普通脚本执行时向
+ * `window.__ModuleLoader__` 注册**一个** lazy factory，`id` 等于包名。所以：
+ *   - esbuild 用 `format: 'cjs'`（**不是 ESM**）打包出内层代码；
+ *   - 外层由本脚本注入 factory 包装（源码里因此**不许**手写 `window.__ModuleLoader__`，AGENTS §2.2）；
+ *   - `react` 标成 external：它是平台种子模块，**必须**以 `require("react")` 的形式出现（恰好一处）。
+ */
+async function buildClient(pkgName: string): Promise<TargetResult> {
+  const inputs = [...(await listFiles('src/client')), ...(await listFiles('src/shared'))]
+  const outfile = 'lib/client.js'
+  const built = await esbuild.build({
+    entryPoints: [join(ROOT, 'src/client/index.ts')],
+    bundle: true,
+    format: 'cjs',
+    platform: 'browser',
+    target: 'es2022',
+    charset: 'utf8',
+    minify: false,
+    // 用内存产物：外层要自己包一层 factory，不能直接落盘。
+    write: false,
+    // 平台种子模块只有 react。其余 `@deepseek-ai/dsh-client-*` 一律不许运行时 require
+    // （官方 practices 禁止，eslint 也禁）—— 所以这里只有这一个 external。
+    external: ['react'],
+    jsx: 'transform',
+    jsxFactory: 'h',
+    jsxFragment: 'Fragment',
+    logLevel: 'warning',
+  })
+  const inner = built.outputFiles[0].text
+  const indented = inner
+    .split('\n')
+    .map((line) => (line.length === 0 ? '' : `\t${line}`))
+    .join('\n')
+  const script = [
+    '/**',
+    ' * ⚠️ 本文件由 tools/build.ts 从 src/** 生成 —— **不要直接编辑**（AGENTS §0/§4.8）。',
+    ' * 浏览器半边：一个 classic script（**不是 ESM**），执行时只做一件事 ——',
+    ' * 向 `__ModuleLoader__` 注册一个 lazy factory；`id` 必须等于 package.json 的 name。',
+    ' * wrapper 由构建脚本注入，所以源码里不许手写 `__ModuleLoader__`。',
+    ' */',
+    'window.__ModuleLoader__.load({',
+    `\tid: ${JSON.stringify(pkgName)},`,
+    '\tfactory: (require) => {',
+    '\t\tvar module = { exports: {} };',
+    '\t\tvar exports = module.exports;',
+    '\t\tObject.defineProperty(exports, Symbol.toStringTag, { value: "Module" });',
+    indented,
+    '\t\treturn module.exports;',
+    '\t},',
+    '});',
+    '',
+  ].join('\n')
+  await writeFile(join(ROOT, outfile), script, 'utf8')
+  const fingerprints: Record<string, string> = {}
+  for (const input of inputs) fingerprints[input] = await hashOf(input)
+  return { output: outfile, outputSha256: await hashOf(outfile), inputs: fingerprints }
+}
+
 const pkg = JSON.parse(await readFile(join(ROOT, 'package.json'), 'utf8')) as { name: string }
 
-const targets: TargetResult[] = [await buildHost()]
+const targets: TargetResult[] = [await buildHost(), await buildClient(pkg.name)]
 
 const manifest = {
   tool: `esbuild@${esbuild.version}`,

@@ -51,6 +51,16 @@ export const HOOK_EVENTS = [
   'SubagentStop',
 ] as const
 
+/**
+ * 设置页数据面的路由。
+ *
+ * **两半共用的唯一字面量**：宿主用 `ctx.connection.fetch.register()` 注册它，浏览器半边用
+ * `fetch()` 调它。两侧不一致就是**静默 404**，所以它必须放在 shared 里而不是各写一份。
+ * 必须以 `/api/` 开头（`connection.fetch` 自己校验），也正因此会自动带上 Host/Origin 围栏（403）
+ * 与浏览器鉴权（401）。选型论证见 docs/design-notes.md §1。
+ */
+export const HOOKS_ROUTE = '/api/hooks'
+
 /** 事件名联合类型。 */
 export type HookEvent = (typeof HOOK_EVENTS)[number]
 
