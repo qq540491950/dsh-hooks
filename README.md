@@ -73,8 +73,11 @@ node tools/verify.ts   # 唯一必跑的自检
       name: 'file:///D:/project/dsh-plugins/dsh-hooks/lib/index.js'
 ```
 
-无 `config:` 段（与 `dsh-continue` / `dsh-mcp-manager` 同样的"路径行"装载方式），
-**不需要 pnpm install，不需要联网**。
+无 `config:` 段 —— 这是**路线 1「路径行」**装载：profile 直接指向 `lib/index.js` 的 `file://`
+绝对路径，**不需要 pnpm install，不需要联网，也不需要 `dsh.bundle.patch`**。
+（同目录的 `dsh-continue` 也用这条路；但 **`dsh-mcp-manager` 不是** —— 它走的是路线 2「bundle」，
+即 `package.json` 里的 `dsh.bundle.patch` + 一个 `cordis.patch.yml`，由 `plugin_manager
+install_bundle` 安装。两条路是**替代关系**，别把它们的字段混着抄。）
 
 ### ⚠️ 必须重启 DSH
 
@@ -405,25 +408,59 @@ node tools/verify.ts --config "D:\some\project\.dsh\hooks.json"
 会列出：识别到哪些事件、每个 group 的 matcher 与 timeout、被跳过的非 command handler、
 以及 matcher 诊断。**写配置之后先跑这个**，比等重启看日志快得多。
 
-## 设置页数据面（`/api/hooks`，P4a 已就位）
+## 设置页数据面（`/api/hooks`，读写就位）
 
-给设置页「Hooks」用的**只读**数据面，由宿主半边用 `ctx.connection.fetch.register()` 注册：
+给设置页「Hooks」用的数据面，由宿主半边用 `ctx.connection.fetch.register()` 注册。
+**读、定点写、试运行**都挂在这一条路由上：
 
 - **为什么是这条通道**（7 条候选逐条否决：Remote / `$events` / client-store / 构建期快照 …）：
   [docs/design-notes.md](docs/design-notes.md) §1。
 - `GET /api/hooks[?sessionId=…]` → `{ok:true, data:HooksSnapshot}`；失败 → `{ok:false, error, detail?}`，
   **没有 `data`**（页面必须先补空形状再解引用）。
+- `POST /api/hooks` 三种意图，**全部是定点操作**（客户端**绝不回传整份文件**，那会静默丢字段）：
+  - **定点写**：`{op:'setHookCommand'|'setHookTimeout'|'setHookDisabled'|'setGroupMatcher'|'addHook'|'removeHook'|'moveHook'|'removeGroup'|'createFile', file, event, groupIndex, hookIndex, …}`。
+    机制是**克隆整份 JSON 树 + 只改目标节点 + 保留性证明**，未知键（例如第一行的 `_comment`）
+    在结构上不可能丢；写盘带**版本锁**（存在用 `replaceIfVersion`、不存在用 `createIfAbsent`）。
+  - **试运行**：`{op:'dryRun', file, event, groupIndex, hookIndex}` —— 与真实运行**共用同一条执行
+    路径**（同一个 `runSingleHook`、同一个 payload builder），但**不写执行台账**（预演不该给状态上色）。
+  - **错误码分得很细**，页面据此把失败**分别**说清（这是硬要求，不许糊成一句"保存失败"）：
+    `stale` / `exists` / `not-preservable` / `invalid-json` / `no-project` / `no-version` → 409；
+    `absent` / `not-found` → 404；`sandbox` → 403；`bad-op` / `bad-json` → 400。
+- 寻址一律用**文件下标**（`rawIndex`）：解析会跳过 matcher 非法的 group 与没有 command 的条目，
+  拿"解析后的数组位置"去找 = 静默改错/跑错那一行。越界一律拒（`not-found`）。
 - 快照的硬不变式：**7 个事件永远全列**（含 0 条）、**两个来源永远都列**、`disabled` 单独计数
   （生效条数不含它）、`staleInUse` 如实反映"文件坏了但运行中的还是上一份可用配置"。
-- `capabilities.writable` 现在是 **`false`** —— 页面据此显示只读横幅，而不是让用户点了没反应；
-  写入（P4b / P6）落地后翻成 `true`。
+- `capabilities.writable` 是 **`true`**（路由注册了 POST）；为 `false` 时页面显示只读横幅，
+  而不是让用户点了没反应。
+- **每行还带执行证据**：`lastRun`（真实的 `exitCode` / `decision` / 耗时 / 输出）与 `runCount`。
+  匹配条件是 **`event + command` 两者都要** —— 命令改过之后旧记录不再匹配，行退回灰"未运行"，
+  **绝不会拿旧命令的结果给新命令画绿**。台账有界（全局 500 / 单会话 200），输出截断后才进快照。
 - **没有会话上下文**时 `cwd` / `projectRoot` 一律是 `null` 并标注来源（`cwdSource`），
   **不拿 `process.cwd()` 顶上**。
 - 当前载体没有 `connection` 服务（如 shell 载体）时不注册数据面，但 **hooks 照常工作**。
 - 离线自检覆盖：注册契约（路径 / 方法 / `requestBody`）+ handler 行为（直接用
   `new Request('http://127.0.0.1/api/hooks')` 调 handler），见 `tools/verify.ts` 的 `P` 区。
 
-界面本身在 P5 落地；那一步需要**重启一次 DSH**（客户端半边首次发布才需要）。
+## 设置页「Hooks」（`settings.section`，`order: 920`）
+
+浏览器半边（`src/client/**` → `lib/client.js`）注册在设置导航里，排在 MCP（900）、Skills（910）之后：
+
+- **两个来源永远都列**（项目级 / 用户级），含"文件不存在"与"读不出来"——「空」和「不存在」必须长得
+  不一样，否则用户只能得出"这功能没做"，而**他的判断没错，是界面在撒谎**。
+- **7 个事件分组永远全渲染**（含 0 条）。
+- 每行：状态点（**只**来自执行台账与 `disabled`）+ 命令（等宽）+ 超时 + 四个动作
+  **试运行 / 编辑 / 停用（启用）/ 删除**。
+- **删除是两步**：点"删除"只变成"确认删除 / 取消"，**第一步不发请求**（它是唯一丢数据的操作）。
+- 错误**只有一个渲染点**：行内操作（启停 / 编辑 / 删除 / 试运行）的失败写进**页面级**横幅，
+  表单内的错误留在表单里。
+- 写入成功后**重新取数**，绝不在本地猜新状态（那会和宿主的答案漂移）。
+- 样式：CSS 字符串 + 组件渲染 `<style>` 元素（官方 `ui-plugin.md` 认可的写法）；颜色一律走
+  `var(--dsw-alias-*)` token，**绝不硬编码**（深色主题下 `--dsw-alias-brand-primary` 近白色，
+  写 `#fff` 就是白底白字）。
+- 导航图标用官方兜底齿轮：座位注册的字段白名单里**没有 `icon`**，不要学"打 data 属性 + CSS 覆盖"
+  那条路（依赖官方 DOM 结构，一改就静默失效）。
+- **首次出现需要重启一次 DSH**（`dsh-client-modules` 在启动时扫描 `exports["./client"]`）；
+  之后改 UI 不需要重启（客户端半边构建后由客户端 HMR 替换）。
 
 ## 故障排查
 
