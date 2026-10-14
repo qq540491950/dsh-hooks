@@ -68,7 +68,14 @@ import {
   parseHookConfig,
   parseHookOutput,
 } from '../shared/protocol.ts'
-import type { HookOutput, HookPayload, InjectionMessage, MergedOutput, ParsedGroups } from '../shared/types.ts'
+import type {
+  HookOutput,
+  HookPayload,
+  InjectionMessage,
+  MergedOutput,
+  ParsedGroups,
+  ParsedHook,
+} from '../shared/types.ts'
 import type {
   AgentLike,
   FsTarget,
@@ -78,7 +85,13 @@ import type {
   SubagentInfo,
   ToolExecution,
 } from './service-types.ts'
-import { registerHooksRoute, type HooksInspection, type SourceInspection } from './data-plane.ts'
+import {
+  registerHooksRoute,
+  type DryRunOutcome,
+  type DryRunRequest,
+  type HooksInspection,
+  type SourceInspection,
+} from './data-plane.ts'
 // 写路径的纯函数区：定点操作、风格、保留性证明、请求体校验（业务语义只有这一份）。
 import {
   DEFAULT_STYLE,
@@ -666,6 +679,60 @@ export function apply(ctx: HostContext): void {
     return undefined
   }
 
+  /**
+   * 跑一条 hook 真正需要的上下文（`RunContext` 里只有这三项与执行有关）。
+   *
+   * 单独抠出来是为了让**试运行**能用同一个函数：它没有"当前事件点的完整配置"，
+   * 但完全具备这三项。用 `Pick` 而不是另写一个函数 —— 那就是"演示用执行器"的开端（§2.10）。
+   */
+  type ExecutionContext = Pick<RunContext, 'cwd' | 'projectRoot' | 'sandboxPolicy'>
+
+  /**
+   * 跑**一条** hook。
+   *
+   * **试运行与真实运行共用这一条路径**（AGENTS §2.10）：只有 `signal` / timeout / 沙箱档位允许不同，
+   * payload 必须由同一个 builder 产出。两者唯一的差别在**调用方**：真实运行把结果记进执行台账，
+   * 试运行不记（台账是状态色的唯一依据，§3.8；一次试运行不该把那一行画绿）。
+   */
+  async function runSingleHook(
+    hook: ParsedHook,
+    point: HookEvent,
+    context: ExecutionContext,
+    payload: HookPayload,
+    signal: AbortSignal | undefined,
+  ): Promise<{ output: HookOutput; durationMs: number }> {
+    const sandboxPolicy = context.sandboxPolicy
+    const started = Date.now()
+    const timeoutMs = hook.timeoutSec !== undefined ? hook.timeoutSec * 1000 : DEFAULT_TIMEOUT_MS
+    let output: HookOutput
+    try {
+      const request: ShellRunRequest = {
+        command: hook.command,
+        workdir: context.cwd,
+        timeoutMs,
+        stdin: JSON.stringify(payload) + '\n',
+        signal,
+        env: { DSH_PROJECT_DIR: context.projectRoot },
+        // 关键：hook 子进程按**调用会话**的档位与会话 cwd 跑，而不是部署默认档。
+        // 拿不到策略时整条字段省略（回退部署策略），绝不让 hook 跑不起来。
+        ...(sandboxPolicy !== undefined ? { sandboxPolicy: sandboxPolicy.passthrough } : {}),
+      }
+      const spec = shell.resolve(request)
+      const execution = await shell.execute(spec)
+      const result = await execution.result()
+      output = parseHookOutput(
+        result.exitCode === null || result.exitCode === undefined ? undefined : result.exitCode,
+        result.stdout?.text,
+        result.stderr?.text,
+        point,
+      )
+    } catch (error) {
+      // 起不来 / 崩溃 / 基础设施失败：非阻断，只记。
+      output = parseHookOutput(undefined, '', messageOf(error), point)
+    }
+    return { output, durationMs: Date.now() - started }
+  }
+
   /** 跑一个事件点上所有匹配的 hook（串行，配置顺序），返回折叠后的结果。 */
   async function runPoint(
     context: RunContext,
@@ -686,38 +753,11 @@ export function apply(ctx: HostContext): void {
         // `disabled: true` 在这里**被真正跳过** —— 这是 AGENTS §2.5 的诚实性要求：
         // 开关落在文件里，而本插件的执行路径必须认它，否则"UI 显示已停用、实际照跑"。
         if (hook.disabled === true) continue
-        const started = Date.now()
-        const timeoutMs = hook.timeoutSec !== undefined ? hook.timeoutSec * 1000 : DEFAULT_TIMEOUT_MS
-        let output: HookOutput
-        try {
-          const request: ShellRunRequest = {
-            command: hook.command,
-            workdir: context.cwd,
-            timeoutMs,
-            stdin: JSON.stringify(payload) + '\n',
-            signal,
-            env: { DSH_PROJECT_DIR: context.projectRoot },
-            // 关键：hook 子进程按**调用会话**的档位与会话 cwd 跑，而不是部署默认档。
-            // 拿不到策略时整条字段省略（回退部署策略），绝不让 hook 跑不起来。
-            ...(sandboxPolicy !== undefined ? { sandboxPolicy: sandboxPolicy.passthrough } : {}),
-          }
-          const spec = shell.resolve(request)
-          const execution = await shell.execute(spec)
-          const result = await execution.result()
-          output = parseHookOutput(
-            result.exitCode === null || result.exitCode === undefined ? undefined : result.exitCode,
-            result.stdout?.text,
-            result.stderr?.text,
-            point,
-          )
-        } catch (error) {
-          // 起不来 / 崩溃 / 基础设施失败：非阻断，只记。
-          output = parseHookOutput(undefined, '', messageOf(error), point)
-        }
-        const durationMs = Date.now() - started
+        // 试运行与真实运行**共用这一条路径**（§2.10）；差别只在下面的"记台账"这一步。
+        const { output, durationMs } = await runSingleHook(hook, point, context, payload, signal)
         // 记台账：这是"这一行现在是什么颜色"的**唯一**依据（§3.8）。记的是实际发生的事实。
         ledger.push({
-          at: started,
+          at: Date.now() - durationMs,
           sessionId: typeof payload.session_id === 'string' ? payload.session_id : '',
           event: point,
           command: hook.command,
@@ -740,7 +780,7 @@ export function apply(ctx: HostContext): void {
 
   //#region payload 构造（对齐官方桥的字段形状）
 
-  function basePayload(agent: AgentLike | undefined, event: HookEvent, context: RunContext): HookPayload {
+  function basePayload(agent: AgentLike | undefined, event: HookEvent, context: ExecutionContext): HookPayload {
     return {
       session_id: agent?.session?.header?.id ?? '',
       // DSH 的会话日志是 zstd 压缩的，shell 脚本读不了，这里与官方桥保持一致恒为空串。
@@ -906,7 +946,7 @@ export function apply(ctx: HostContext): void {
   // 只有 Web 载体才提供 connection。没有它就不注册数据面 —— 设置页没了，但 hooks 照跑：
   // 数据面是便利设施，不是硬依赖（也正因为如此，自检的假 ctx 不必实现它）。
   if (ctx.connection !== undefined) {
-    registerHooksRoute(ctx.connection, { inspect, write: handleWrite })
+    registerHooksRoute(ctx.connection, { inspect, write: handleWrite, dryRun: dryRunHook })
   } else {
     info('dsh-hooks: 当前载体没有 connection 服务，设置页数据面未注册（hooks 本身不受影响）')
   }
@@ -1025,6 +1065,68 @@ export function apply(ctx: HostContext): void {
     const cwd = found.agent?.session?.header?.cwd
     const projectRoot = typeof cwd === 'string' && cwd.length > 0 ? await projectRootFor(cwd) : null
     return writeHookFile(request, projectRoot, signal, sandboxPolicyFor(found.agent))
+  }
+
+  //#endregion
+
+  //#region 数据面：试运行（与真实运行共用执行路径，但**不进台账**）
+
+  /**
+   * 试运行**一条** hook：按文件下标找到它 → 用同一个执行路径跑 → 把结果原样回给页面。
+   *
+   * 与真实运行只有两条差异（§2.10 允许的）：
+   *   ① **不写执行台账** —— 台账是状态色的唯一依据（§3.8），一次试运行不该把那一行画绿；
+   *   ② payload 多一个 `dry_run: true` 标记（同一个 builder 产出，只多这一个字段），
+   *      免得 hook 分不清自己在预演还是真跑。
+   * 沙箱档位**沿用调用会话**，与真实运行一致 —— 试运行绝不放宽权限（§1.6）。
+   */
+  async function dryRunHook(
+    request: DryRunRequest,
+    sessionId: string | undefined,
+    signal: AbortSignal,
+  ): Promise<DryRunOutcome> {
+    const found = agentForSession(sessionId)
+    const cwd = found.agent?.session?.header?.cwd
+    const projectRoot = typeof cwd === 'string' && cwd.length > 0 ? await projectRootFor(cwd) : null
+    const path =
+      request.file === 'user'
+        ? joinPath(dshHome(), HOOKS_FILE)
+        : projectRoot === null
+          ? undefined
+          : joinPath(projectRoot, PROJECT_DIR, HOOKS_FILE)
+    if (path === undefined) return { ok: false, error: 'no-project' }
+
+    const read = await readJsonFile(path, signal)
+    if (read.state === 'error') return { ok: false, error: 'invalid-json', detail: read.message }
+    if (read.state === 'absent') return { ok: false, error: 'absent' }
+
+    // 寻址一律用**文件下标**（§2.3）：页面给的 groupIndex / hookIndex 是 `rawIndex`，
+    // 不是解析后的数组位置 —— 解析会跳过 matcher 非法的 group 与没有 command 的条目。
+    const parsed = parseHookConfig(read.raw, { projectDir: projectRoot ?? '' })
+    const group = (parsed.groups[request.event] ?? []).find((candidate) => candidate.rawIndex === request.groupIndex)
+    if (group === undefined) return { ok: false, error: 'not-found', detail: '这个分组不在文件里（可能刚被改过）' }
+    const hook = group.hooks.find((candidate) => candidate.rawIndex === request.hookIndex)
+    if (hook === undefined) return { ok: false, error: 'not-found', detail: '这一条不在文件里（可能刚被改过）' }
+
+    const context: ExecutionContext = {
+      cwd: cwd ?? '',
+      projectRoot: projectRoot ?? '',
+      sandboxPolicy: sandboxPolicyFor(found.agent),
+    }
+    const payload = { ...basePayload(found.agent, request.event, context), dry_run: true } as HookPayload
+    const { output, durationMs } = await runSingleHook(hook, request.event, context, payload, signal)
+    return {
+      ok: true,
+      run: {
+        command: hook.command,
+        // `null` = 子进程没起来（与台账里的语义一致，页面据此显示"启动失败"而不是绿）。
+        exitCode: output.exitCode ?? null,
+        decision: output.decision ?? 'pass',
+        durationMs,
+        stdout: output.stdout,
+        stderr: output.stderr,
+      },
+    }
   }
 
   //#endregion

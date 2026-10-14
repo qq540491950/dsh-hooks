@@ -13,11 +13,11 @@
  */
 
 import { HOOKS_ROUTE, HOOK_EVENTS, DEFAULT_TIMEOUT_MS, type HookEvent } from '../shared/constants.ts'
-import { messageOf } from '../shared/guards.ts'
+import { messageOf, isObject } from '../shared/guards.ts'
 import { matcherDiagnostic } from '../shared/protocol.ts'
 import type { ParsedGroup, ParsedGroups, SkippedHandler } from '../shared/types.ts'
 import { latestRunFor, type LedgerEntry } from './ledger.ts'
-import { parseHooksRequest, type FileKind, type HooksRequest } from './write.ts'
+import { isHookEvent, parseHooksRequest, type FileKind, type HooksRequest } from './write.ts'
 
 /**
  * 本插件注册的浏览器路由 —— 定义在 `src/shared/constants.ts`，**两半共用同一个字面量**
@@ -382,10 +382,52 @@ export interface WriteOutcome {
   version?: string
 }
 
-/** 路由需要的两个能力：读快照、定点写。 */
+/** 试运行请求。**不是写操作**：它不碰文件，也不进执行台账。 */
+export interface DryRunRequest {
+  file: FileKind
+  event: HookEvent
+  /** **文件里的** group 下标（`rawIndex`），不是解析后的数组位置。 */
+  groupIndex: number
+  /** **文件里的** hook 下标（`rawIndex`）。 */
+  hookIndex: number
+}
+
+/** 试运行结果。`exitCode: null` = 子进程没起来（与台账里的语义一致）。 */
+export interface DryRunOutcome {
+  ok: boolean
+  error?: string
+  detail?: string
+  run?: {
+    command: string
+    exitCode: number | null
+    decision: string
+    durationMs: number
+    stdout: string
+    stderr: string
+  }
+}
+
+/** 校验试运行请求。畸形请求一律 400，绝不让它走到执行路径。 */
+function parseDryRunRequest(body: unknown): { ok: true; request: DryRunRequest } | { ok: false; reason: string } {
+  if (!isObject(body)) return { ok: false, reason: '请求体不是对象' }
+  const { file, event, groupIndex, hookIndex } = body
+  if (file !== 'project' && file !== 'user') return { ok: false, reason: 'file 必须是 project / user' }
+  if (typeof event !== 'string') return { ok: false, reason: 'event 不是支持的 7 个事件之一' }
+  if (!isHookEvent(event)) return { ok: false, reason: 'event 不是支持的 7 个事件之一' }
+  if (typeof groupIndex !== 'number' || !Number.isInteger(groupIndex) || groupIndex < 0) {
+    return { ok: false, reason: 'groupIndex 必须是非负整数' }
+  }
+  if (typeof hookIndex !== 'number' || !Number.isInteger(hookIndex) || hookIndex < 0) {
+    return { ok: false, reason: 'hookIndex 必须是非负整数' }
+  }
+  return { ok: true, request: { file, event, groupIndex, hookIndex } }
+}
+
+/** 路由需要的三个能力：读快照、定点写、试运行。 */
 export interface RouteDeps {
   inspect(sessionId: string | undefined): Promise<HooksInspection>
   write(request: HooksRequest, sessionId: string | undefined, signal: AbortSignal): Promise<WriteOutcome>
+  dryRun(request: DryRunRequest, sessionId: string | undefined, signal: AbortSignal): Promise<DryRunOutcome>
 }
 
 /**
@@ -439,6 +481,20 @@ export function registerHooksRoute(connection: ConnectionFetchBridge, deps: Rout
             body = await request.json()
           } catch {
             return jsonResponse(400, { ok: false, error: 'bad-json' })
+          }
+          // 试运行**不是写操作**：它在写路径之前分流，走的是"读 + 执行"，不碰文件也不进台账。
+          if (isObject(body) && body.op === 'dryRun') {
+            const parsedDryRun = parseDryRunRequest(body)
+            if (!parsedDryRun.ok) return jsonResponse(400, { ok: false, error: 'bad-op', detail: parsedDryRun.reason })
+            const outcome = await deps.dryRun(parsedDryRun.request, sessionId, request.signal)
+            if (!outcome.ok) {
+              return jsonResponse(statusFor(outcome.error), {
+                ok: false,
+                error: outcome.error ?? 'dry-run-failed',
+                ...(outcome.detail !== undefined ? { detail: outcome.detail } : {}),
+              })
+            }
+            return jsonResponse(200, { ok: true, data: { run: outcome.run } })
           }
           const parsed = parseHooksRequest(body)
           if (!parsed.ok) return jsonResponse(400, { ok: false, error: 'bad-op', detail: parsed.reason })

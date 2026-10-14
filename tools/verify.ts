@@ -2649,6 +2649,65 @@ await test('P：行级状态来自真实执行；命令一改就回落到"未运
   })
 })
 
+await test('P：试运行真的跑了那条命令，而且**不进执行台账**（§2.10 + §3.8）', async () => {
+  await withIsolatedHome(async () => {
+    const dir = await makeProject()
+    // 两条 hook：试运行必须打到**被指定的那一条**（下标寻址），不是"第一条"。
+    const first = await script(dir, 'first.cjs', 'process.exit(0)')
+    const second = await script(dir, 'second.cjs', "process.stderr.write('dry ok');process.exit(2)")
+    await writeHooks(dir, {
+      hooks: { PreToolUse: [{ matcher: 'pwsh', hooks: [{ command: cmd(first) }, { command: cmd(second) }] }] },
+    })
+    const conn = makeConnection()
+    const { agent } = fakeAgent(dir)
+    const h = await mount({ connection: conn.connection, fs: makeFs({ version: true }), initiator: agent })
+
+    // ① 试运行第 2 条：真的执行了，结果原样回来
+    const run = await postRoute(conn.routes[0], {
+      op: 'dryRun',
+      file: 'project',
+      event: 'PreToolUse',
+      groupIndex: 0,
+      hookIndex: 1,
+    })
+    assert.equal(run.status, 200)
+    assert.equal(run.body.ok, true)
+    assert.equal(run.data.run.command, cmd(second), '必须跑**被指定的那一条**（下标寻址，不是第一条）')
+    assert.equal(run.data.run.exitCode, 2, '真实退出码要如实带回')
+    assert.ok(run.data.run.stderr.includes('dry ok'), 'stderr 也要带回来（页面要给人看）')
+    assert.ok(typeof run.data.run.durationMs === 'number')
+
+    // ② **试运行不进台账**：状态色只能来自真实运行（§3.8）
+    const afterDry = await callRoute(conn.routes[0])
+    const dryPre = afterDry.data.events.find((event) => event.event === 'PreToolUse')
+    assert.equal(dryPre.runCount, 0, '试运行绝不能进执行台账 —— 否则一次预演就把那一行画绿了')
+    assert.equal(dryPre.groups[0].hooks[1].lastRun, null, '试运行之后那一行仍然是灰的"未运行"')
+
+    // ③ 真实运行才记台账 —— 两条路必须可区分
+    await h.listeners.get('tools/pre-execute')[0]({ name: 'pwsh', arguments: {}, callId: 'c', agent }, nextAllow)
+    const afterReal = await callRoute(conn.routes[0])
+    const realPre = afterReal.data.events.find((event) => event.event === 'PreToolUse')
+    assert.equal(realPre.runCount, 2, '真实运行把**匹配到的每一条**都记进台账')
+    assert.ok(realPre.groups[0].hooks[1].lastRun !== null, '真实跑过之后那一行才有记录')
+
+    // ④ 越界下标 → 404（不许"就近"跑一条）
+    const outOfRange = await postRoute(conn.routes[0], {
+      op: 'dryRun',
+      file: 'project',
+      event: 'PreToolUse',
+      groupIndex: 0,
+      hookIndex: 9,
+    })
+    assert.equal(outOfRange.status, 404)
+    assert.equal(outOfRange.body.error, 'not-found')
+
+    // ⑤ 畸形请求 → 400，且一次执行都没发生
+    const malformed = await postRoute(conn.routes[0], { op: 'dryRun', file: 'project', event: 'Nope', hookIndex: 0 })
+    assert.equal(malformed.status, 400)
+    assert.equal(malformed.body.error, 'bad-op')
+  })
+})
+
 await test('P：files[].events 是可寻址视图（file + rawIndex），下标直接能用来发写操作', async () => {
   await withIsolatedHome(async () => {
     const dir = await makeProject()
