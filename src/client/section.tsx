@@ -95,6 +95,11 @@ type Editor = {
   change: (value: string) => void
   cancel: () => void
   save: (file: FileView, event: string, groupRawIndex: number, hook: HookView) => void
+  /** 正在等"确认删除"的那一行（空串 = 没有）。**第一步不发请求**。 */
+  confirmKey: string
+  askRemove: (key: string) => void
+  cancelRemove: () => void
+  remove: (file: FileView, event: string, groupRawIndex: number, hook: HookView) => void
 }
 
 /** 一条 hook。 */
@@ -111,6 +116,7 @@ function HookRow(props: {
   const { hook, file, event, groupRawIndex, writable, busy, onToggle, editor } = props
   const key = rowKey(file, event, groupRawIndex, hook.rawIndex)
   const editing = editor.key === key
+  const confirming = editor.confirmKey === key
   const status = statusOf(hook)
   const run = hook.lastRun
   const title = run === null ? status.label : `${status.label}\n${run.stderr || run.stdout || '(无输出)'}`
@@ -161,7 +167,7 @@ function HookRow(props: {
           </button>
         </span>
       ) : null}
-      {writable && !editing ? (
+      {writable && !editing && !confirming ? (
         <span className="dsh-hooks__actions">
           <button
             type="button"
@@ -182,6 +188,42 @@ function HookRow(props: {
             }}
           >
             {hook.disabled ? '启用' : '停用'}
+          </button>
+          <button
+            type="button"
+            className="dsh-hooks__btn"
+            disabled={busy}
+            onClick={() => {
+              // **第一步只改状态、不发请求** —— 删除是唯一丢数据的操作。
+              editor.askRemove(key)
+            }}
+          >
+            删除
+          </button>
+        </span>
+      ) : null}
+      {writable && confirming && !editing ? (
+        <span className="dsh-hooks__actions">
+          <span className="dsh-hooks__meta">删除这一条？</span>
+          <button
+            type="button"
+            className="dsh-hooks__btn"
+            disabled={busy}
+            onClick={() => {
+              editor.remove(file, event, groupRawIndex, hook)
+            }}
+          >
+            确认删除
+          </button>
+          <button
+            type="button"
+            className="dsh-hooks__btn"
+            disabled={busy}
+            onClick={() => {
+              editor.cancelRemove()
+            }}
+          >
+            取消
           </button>
         </span>
       ) : null}
@@ -317,6 +359,8 @@ export function HooksSection(): Jsx {
   /** 正在编辑哪一行（空串 = 没有）。**一次只编辑一行**。 */
   const [editingKey, setEditingKey] = useState('')
   const [draft, setDraft] = useState('')
+  /** 正在等"确认删除"的那一行（空串 = 没有）。 */
+  const [confirmKey, setConfirmKey] = useState('')
 
   useEffect(() => {
     const controller = new AbortController()
@@ -366,6 +410,7 @@ export function HooksSection(): Jsx {
       if (outcome.ok) {
         setNonce((value) => value + 1)
         setEditingKey('')
+        setConfirmKey('')
       } else {
         setBanner({ code: outcome.error ?? 'internal', detail: outcome.detail ?? '' })
       }
@@ -391,6 +436,7 @@ export function HooksSection(): Jsx {
   const editor: Editor = {
     key: editingKey,
     draft,
+    confirmKey,
     start: (key, command) => {
       setEditingKey(key)
       setDraft(command)
@@ -411,6 +457,22 @@ export function HooksSection(): Jsx {
         groupIndex: groupRawIndex,
         hookIndex: hook.rawIndex,
         command: draft,
+      })
+    },
+    askRemove: (key) => {
+      setConfirmKey(key)
+      setEditingKey('')
+    },
+    cancelRemove: () => {
+      setConfirmKey('')
+    },
+    remove: (file, event, groupRawIndex, hook) => {
+      runWrite({
+        file: file.kind,
+        op: 'removeHook',
+        event,
+        groupIndex: groupRawIndex,
+        hookIndex: hook.rawIndex,
       })
     },
   }

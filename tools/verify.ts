@@ -486,7 +486,7 @@ await test('D：点"停用"发的是定点写请求（file + 原始下标 + 目�
   const component = componentFromArtifact(harness.React)
   const nodes = await renderSection(component, harness, { ok: true, data: minimalSnapshot() })
   const buttons = writeButtons(nodes)
-  assert.equal(buttons.length, 2, '可写时一行两个按钮：编辑、停用（这里只有一条 hook）')
+  assert.equal(buttons.length, 3, '可写时一行三个按钮：编辑、停用、删除（这里只有一条 hook）')
   assert.equal(typeof buttons[1].onClick, 'function', '按钮必须真的带 onClick')
 
   const calls = []
@@ -547,7 +547,7 @@ await test('D：行内编辑命令 —— 文本框里是当前命令，保存�
 
   // 没在编辑时：一行两个按钮（编辑、停用）
   const idle = writeButtons(first)
-  assert.equal(idle.length, 2, '一行应当有"编辑"和"停用"两个按钮')
+  assert.equal(idle.length, 3, '一行应当有"编辑"、"停用"、"删除"三个按钮')
   idle[0].onClick()
 
   // 点"编辑"后重新渲染（§4.5：事件闭包是当次渲染的）
@@ -591,6 +591,46 @@ await test('D：行内编辑命令 —— 文本框里是当前命令，保存�
       command: 'echo b',
     },
     '只改命令这一个字段，其余一切交给宿主原样保留（§2.3/§2.4）',
+  )
+})
+
+await test('D：删除是两步 —— 第一步只改状态不发请求，第二步才发 removeHook', async () => {
+  const harness = createFakeReact()
+  const component = componentFromArtifact(harness.React)
+  const first = await renderSection(component, harness, { ok: true, data: minimalSnapshot() })
+
+  const calls = []
+  globalThis.fetch = async (_url: string, options: { method?: string; body?: string } = {}) => {
+    const method = options.method ?? 'GET'
+    calls.push({ method, body: typeof options.body === 'string' ? JSON.parse(options.body) : null })
+    return { json: async () => ({ ok: true, data: { file: 'project', version: 'v2' } }) }
+  }
+
+  // 第一步：点"删除"（索引 2）。**绝不能发请求**。
+  writeButtons(first)[2].onClick()
+  await new Promise((resolve) => setTimeout(resolve, 0))
+  assert.equal(calls.length, 0, '第一步绝不能发请求 —— 删除是唯一丢数据的操作，点错了没有 undo')
+
+  harness.begin()
+  const confirming = harness.flatten(component())
+  const joined = confirming
+    .filter((node) => node.text !== undefined)
+    .map((node) => node.text)
+    .join('')
+  assert.ok(joined.includes('删除这一条？'), '必须变成确认态（界面上要说清"这一步还没删"）')
+  const confirmButtons = writeButtons(confirming)
+  assert.equal(confirmButtons.length, 2, '确认态只剩"确认删除"和"取消"')
+  assert.ok(joined.includes('确认删除'), '第二个按钮必须是明确的"确认删除"，不是含混的"确定"')
+
+  // 第二步：点"确认删除" → 这时才发请求。
+  confirmButtons[0].onClick()
+  await new Promise((resolve) => setTimeout(resolve, 0))
+  assert.equal(calls.length, 1, '两步之后恰好一次写请求')
+  assert.equal(calls[0].method, 'POST')
+  assert.deepEqual(
+    calls[0].body,
+    { file: 'project', op: 'removeHook', event: 'PreToolUse', groupIndex: 0, hookIndex: 0 },
+    '删除也是定点操作：宿主拿这两个**文件下标**定位要删的那一条',
   )
 })
 
