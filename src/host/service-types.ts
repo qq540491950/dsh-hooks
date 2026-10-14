@@ -79,6 +79,19 @@ export interface ShellService {
   execute(spec: ShellSpec): Promise<ShellExecution>
 }
 
+/** `ctx.connection`（dsh-client-connection 注册；只有 Web 载体才提供）。 */
+export interface ConnectionService {
+  readonly fetch: {
+    /** 注册一条精确路由，挂在 webServer 的 `/api` 前缀下（自带围栏与鉴权）。 */
+    register(route: {
+      path: string
+      methods: string[]
+      requestBody: 'buffered' | 'streaming'
+      fetch: (request: Request) => Promise<Response>
+    }): unknown
+  }
+}
+
 /** `ctx.logger`（cordis 内建，不在 inject 列表里，只做出席检查）。 */
 export interface LoggerLike {
   warn(message: string): void
@@ -175,6 +188,11 @@ export interface HostContext {
   readonly fs: FsService
   readonly shell: ShellService
   readonly logger?: LoggerLike | undefined
+  /**
+   * 浏览器载体才提供。**刻意可选**：shell 载体（无 Web 半边）里它就是 undefined，
+   * 那时设置页数据面不注册，但 hooks 本身必须照常工作 —— 数据面是便利设施，不是硬依赖。
+   */
+  readonly connection?: ConnectionService | undefined
   get(name: 'sandboxPolicy'): SandboxPolicyService | undefined
   get(name: 'agents'): AgentsService | undefined
   get(name: string): unknown

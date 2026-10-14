@@ -17,6 +17,18 @@ export interface CommandVars {
 export interface ParsedHook {
   command: string
   timeoutSec?: number
+  /**
+   * `disabled: true` = 这条 hook 被停用（runner 跳过它）。
+   *
+   * 刻意**只在为 true 时**出现这个键：解析结果会被自检做 `deepStrictEqual`，
+   * 而"键存在但为 undefined"与"没有这个键"在那边是两个不同的东西。
+   *
+   * 已核实（本轮）：`@deepseek-ai/dsh-hook-protocol` **根本不解析配置文件**
+   * （它只有 matcher 语义、输出 codec、`runCommandHook` 与判决合并），所以"未知字段被拒"的
+   * 担心在协议层不成立。真正的要求是**我们自己的 runner 必须认它** —— 否则就成了
+   * "UI 显示已停用、别的路径照跑"（AGENTS §2.5）。
+   */
+  disabled?: boolean
 }
 
 /** 规范化后的 group：matcher 属于 group，command/timeout 属于 hook（这是文件本身的形状）。 */

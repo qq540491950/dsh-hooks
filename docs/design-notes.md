@@ -1,0 +1,72 @@
+# 设计记录：为什么是这些做法
+
+> 这份文件回答"**为什么不用另一条路**"。结论背后是**官方源码 + 两个已上线的兄弟插件**的实测，
+> 不是我偏好。取证的原始出处都标了行号/路径，方便版本升级后复查。
+> 与 [AGENTS.md](../AGENTS.md) 的分工：AGENTS 写"必须怎么做"，这里写"为什么不是别的做法"。
+
+## 1. 通道选型：设置页怎么拿到 hooks 配置
+
+### 1.1 问题
+
+设置页「Hooks」（`settings.section` 座位 `hooks/920`）跑在**浏览器**里，而 `hooks.json` 在
+**Host 进程**手里。页面读不到任何文件，所以页面与宿主之间**必须**有一条通道 —— 这不是偏好问题，
+是平台结构决定的。
+
+### 1.2 候选与结论
+
+| 路线 | 结论 | 理由（证据） |
+|---|---|---|
+| **A** 客户端直接读文件 | ❌ 不可能 | 浏览器没有 `fs`。宿主半边也没有 DOM/React，渲染不了设置页座位 |
+| **B** 构建时把配置打进客户端 bundle | ❌ 不能用 | 配置按项目、运行时变化；构建期快照必然过期 → 正是"界面在撒谎" |
+| **C** `@deepseek-ai/dsh-client-store` 当通道 | ❌ 不是通道 | 它是**浏览器本地**的 observable/快照原语（Immer + `localStorage`），"不提供跨设备同步"、不连宿主。可以拿来**放**快照，但拿不到快照 |
+| **D** 自建 Remote 命名空间（`ctx.typert.register()` + `remote.$mount()`） | ❌ 不选 | 官方机制，但要手写严格 codec（**客户端 bundle 里没有 zod 种子模块**），且能力集**构建期固定**。`dsh-mcp-manager` 在同类场景下评估后否掉了它（其 README §3 的 C 路线） |
+| **E** `$events` 事件流推送 | ❌ 不选 | `dsh-client-connection` 的流是 API Gateway 自己的 **generation / 增量 listener** 通道（先发 `{type:'ready'…}` 再发事件），不是给插件推业务状态的公开面。而且设置页是"打开才需要数据"，请求/响应天然更简单，推送要多处理重连与乱序 |
+| **F** session command + `ctx.remote.commands.execute()` | ❌ 不适用 | 官方 `user-actions.md` 推荐的"一个操作两个调用方"**入口**，适合**有 session** 的 agent tool/命令；设置页与 session 无绑定，而我们的操作对象是**配置文件**而不是会话 |
+| **G** `ctx.connection.fetch.register()` 精确路由 `/api/hooks` | ✅ **采用** | 见下 |
+
+### 1.3 为什么是 G
+
+官方 `@deepseek-ai/dsh-client-connection` README 自述本包职责就是"浏览器与 Host 之间的协议层：
+Remote RPC、带重连的事件流投递、**精确 Fetch 路由**、`/api` HTTP 桥与浏览器信任栅栏"，并明确
+"Host half **始终**提供与载体无关的 RPC 注册表和精确 `GET`/`HEAD`/`POST` 路由注册表"。
+
+于是我们白拿三样东西，一样都不用自己实现：
+
+1. **鉴权**：路由挂在 webServer 的 `/api` 前缀下 → 先过 Host/Origin 围栏（失败 **403**）再过浏览器
+   会话 cookie 鉴权（失败 **401**）。启动令牌换成 host-only / `HttpOnly` / `SameSite=Strict` 的
+   签名 cookie，绑定 hostname + port，默认 30 天。**自己写这套是纯风险**。
+2. **生命周期**：`connection.fetch` 是 caller-context 求值的 getter，`register()` 会把 disposer
+   挂到**调用方 scope** —— 插件卸载即摘除路由。
+3. **零 import**：宿主半边照旧可以零裸 import（本插件的硬约束）。
+
+还有两条官方契约细节被写进了实现：
+
+- 路径**必须以 `/api/` 开头**（`connection.fetch` 自己校验）。
+- `requestBody` 必须在 bridge **读取任何字节之前**声明为 `'buffered'` 或流式；
+  我们选 `'buffered'`（POST 体积只有几百字节；默认上限 `maxRequestBodyBytes` 300 MiB）。
+- 客户端断开时**处理函数会收到 abort 信号** —— 写入路径要把它透传给 `ctx.fs`。
+
+### 1.4 这条路线的代价（记账）
+
+- 路由字面量必须在**宿主与客户端两份产物里逐字一致** → 自检里断言两份产物都含同一字面量。
+- 客户端必须传**绝对 URL**：`dsh-skill-manager` README 记着真实报错
+  `Failed to parse URL from "/api/skill-manager"`。
+- 路由/鉴权问题**离线测不出来**，重启后要在线上点一次。
+- 可离线测的部分：注册契约（路径/方法/`requestBody`）与 handler 行为 —— 直接用
+  `new Request('http://127.0.0.1/api/hooks', {method:'GET'})` 调 handler（`dsh-skill-manager`
+  的自检就是这么做的），不需要浏览器。
+
+### 1.5 与官方 "一个操作两个调用方" 的关系
+
+官方 `references/user-actions.md` 要求：**操作只实现一次**（一个 Host service 方法），UI 与 agent
+tool 都调它，禁止两条路径各写一套逻辑。
+
+本条对本插件的约束：**所有写入语义只写在宿主侧的一个模块里，路由只是它的适配层**。
+这样将来要把同一批操作暴露成 agent tool 时，不需要重写任何业务逻辑 —— 也不会出现
+"UI 里能改、工具里改了另一个地方"的漂移。
+
+> 出处：`app.asar → @deepseek-ai/dsh-client-connection/README.zh.md`（协议层与信任栅栏）、
+> `@deepseek-ai/dsh-client-store/README.zh.md`（本地状态原语）、
+> `@deepseek-ai/dsh-agent-preset/skills/cordis-plugin-development/references/{ui-plugin,user-actions}.md`、
+> 以及本地兄弟插件 `dsh-mcp-manager`（`README.md` §3 四路线比选、`docs/design-notes.md` §3）与
+> `dsh-skill-manager`（只读页仍然用同一条路由 + 用 `Request` 对象做离线自检）。

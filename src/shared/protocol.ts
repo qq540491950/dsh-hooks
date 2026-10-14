@@ -139,9 +139,13 @@ export function parseHookConfig(raw: unknown, vars: CommandVars = {}): ParseResu
         const command = rawHook.command
         if (typeof command !== 'string' || command.length === 0) continue
         const timeoutSec = typeof rawHook.timeout === 'number' && rawHook.timeout > 0 ? rawHook.timeout : undefined
+        // `disabled` 由**解析层保留**、由**执行层跳过**：页面需要看见停用的 hook（用户才能重新启用），
+        // 而 runner 不能跑它。在解析层就丢掉的话，页面只能显示"这条不存在"。
+        const disabled = rawHook.disabled === true
         commands.push({
           command: substituteCommand(command, vars),
           ...(timeoutSec !== undefined ? { timeoutSec } : {}),
+          ...(disabled ? { disabled: true } : {}),
         })
       }
       if (commands.length === 0) continue

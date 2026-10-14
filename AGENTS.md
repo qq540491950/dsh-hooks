@@ -66,7 +66,9 @@
 
 **2.4 [边界] 源文保留优先于"重新序列化"。** 能用 `fs.editText(target, {oldString, newString, replaceAll:false}, {version})` 精确定位的那几个操作（改 `command` / `timeout` / `disabled`）就用它——它**只动那一段字节**。只有结构性操作（新增 / 删除 / 移动整条）才重建文档，且重建必须走 §2.3 的深比较断言。
 
-**2.5 [边界] 启停必须落在文件里，不许只存内存或私有状态文件。** 用 hook 对象上的 `disabled: true`（与 DSH loader 行的字段名一致）。只存 sidecar 状态会导致"UI 显示已停用、别的消费者照跑"。⚠️ **改这条之前先核对** `@deepseek-ai/dsh-hook-protocol` 是否拒绝未知字段；若拒绝，就把开关放到 group 层并同步 README。
+**2.5 [边界] 启停必须落在文件里，不许只存内存或私有状态文件。** 用 hook 对象上的 `disabled: true`（与 DSH loader 行的字段名一致）。只存 sidecar 状态会导致"UI 显示已停用、别的消费者照跑"。
+**核对结论（本轮已完成，结论与计划相反地更宽松）**：`@deepseek-ai/dsh-hook-protocol` **根本不解析配置文件** —— 它只有 matcher 语义、输出 codec、`runCommandHook(已解析的 hook)` 与判决合并。所以"未知字段被拒"的担心在协议层**不成立**，`disabled` 可以安全落在 hook 对象上。
+**因此纪律变成两条**：① `parseHookConfig` **保留** `disabled`（只在为 `true` 时写这个键，避免破坏 `deepStrictEqual` 断言），执行层 `runPoint` **跳过**它；② 必须有"disabled 的 hook 真的没跑"的**真子进程**断言（哨兵法：让它写一个文件，文件必须不存在）—— 否则它还是"界面停用、实际照跑"。
 
 **2.6 [边界] 解析规则只有一份。** UI 展示的"生效配置"必须就是 hook 实际会跑的那一份：同一个 `parseHookConfig`、同一个 projectRoot 解析、同一个 `matcherDiagnostic`、同一份用户级+项目级合并。**禁止为页面另写一套解析器**（两套必然漂移，页面会"看起来配好了"而运行时不认）。
 
@@ -86,6 +88,16 @@
 **2.10 [边界] 试运行与真实运行共用同一条执行路径。** 只有 `signal` / timeout / 沙箱档位允许不同；payload 必须由**同一个** builder 产出。禁止另写"演示用"执行器——那必然出现"试运行通过、真实失败"。试运行也必须带上 §1.6 的会话沙箱策略。
 
 **2.11 [边界] 执行台账有界。** "最近执行"只存**固定容量环形缓冲**（每 session ~200 / 全局 ~500），`ctx.effect` 里清理；stdout/stderr 截断（字节上限）后再进快照。**不许**无界增长，也不许把 hook 的完整输出塞进 HTTP 响应。
+
+**2.12 [边界] 设置页数据面只走 `ctx.connection.fetch.register()` 的精确路由。**
+选型论证在 [docs/design-notes.md](docs/design-notes.md) §1（含 7 条候选的否决理由）。落地纪律：
+- 路由**必须**是 `/api/<名字>`（`connection.fetch` 自己校验），字面量只能有一处（`HOOKS_ROUTE`），**宿主与客户端两份产物里必须逐字一致** —— 不一致就是静默 404。
+- `requestBody` 必须在 bridge 读字节之前声明；POST 体积小，用 `'buffered'`。
+- 成功 `{ok:true, data}`，失败 `{ok:false, error, detail?}` 且 **没有 `data`**；`detail` 只放技术原文，**绝不作为页面主文案**（§3.9）。
+- **`connection` 是可选服务**：shell 载体没有 Web 半边时数据面不注册，但 **hooks 必须照常工作**（数据面是便利设施，不是硬依赖）。
+- 快照里的"生效配置"**必须取 `configFor()` 的缓存**（就是 runner 正在用的那一份），而不是路由里重新解析一遍 —— 后者会得到"磁盘刚的样子"，在 fail-open 场景下与 runner 不一致，页面就在撒谎。
+- 没有会话上下文时 `cwd` / `projectRoot` 一律给 `null` 并如实标注来源，**不许拿 `process.cwd()` 顶上**。
+- 可离线测：注册契约靠捕获 `register()`，handler 行为靠**直接 `new Request(...)` 调 handler**（绝对 URL）—— 不需要浏览器。
 
 ## 3. UI 纪律
 

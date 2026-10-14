@@ -40,7 +40,9 @@ import {
   parseHookOutput,
   joinPath,
 } from '../src/shared/protocol.ts'
-import { DEFAULT_TIMEOUT_MS, NEGATIVE_TTL_MS, POSITIVE_TTL_MS } from '../src/shared/constants.ts'
+import { DEFAULT_TIMEOUT_MS, HOOK_EVENTS, NEGATIVE_TTL_MS, POSITIVE_TTL_MS } from '../src/shared/constants.ts'
+// 数据面：路由注册与**纯函数**快照构造都直接 import 源码，不需要挂载插件就能测。
+import { HOOKS_ROUTE, buildSnapshot, registerHooksRoute } from '../src/host/data-plane.ts'
 
 const HERE = path.dirname(fileURLToPath(import.meta.url))
 const LIB = path.join(HERE, '..', 'lib', 'index.js')
@@ -684,8 +686,28 @@ function makeCtx(options = {}) {
       if (service === 'sandboxPolicy') return options.sandboxPolicy
       return undefined
     },
+    // 只有显式传了才存在 —— 与真实载体的可选性一致（shell 载体没有 Web 半边），
+    // 所以默认的假 ctx 顺带覆盖了"没有 connection 时插件照常工作"这一支。
+    connection: options.connection,
   }
   return { ctx, listeners, logs, disposers, agents }
+}
+
+/** 捕获 `connection.fetch.register()` 的路由声明，并给出一个能直接调用 handler 的入口。 */
+function makeConnection() {
+  const routes = []
+  const connection = {
+    fetch: {
+      register(route) {
+        routes.push(route)
+        return () => {}
+      },
+    },
+  }
+  const get = (request) => routes[0].fetch(request)
+  /** 用绝对 URL 造请求：`dsh-skill-manager` 记过相对路径会 `Failed to parse URL`。 */
+  const request = (query = '') => new Request(`http://127.0.0.1/api/hooks${query}`, { method: 'GET' })
+  return { routes, connection, get, request }
 }
 
 /** 造临时项目目录（带 .git 标记，让 projectRoot 解析命中最内层）。 */
@@ -1581,6 +1603,312 @@ await test('集成：SubagentStart 的 hook 也按子会话的策略跑', async 
     workspaceRoot: dir,
     byChild: true,
   })
+})
+
+//#endregion
+
+//#region P. 数据面 /api/hooks（只读快照）
+
+// 全部离线：注册契约靠捕获 `connection.fetch.register()`，handler 行为靠**直接用 Request
+// 调 handler**（与 dsh-skill-manager 的自检同款）—— 不需要浏览器，也不需要重启 DSH。
+
+/** 取响应并**先补空形状**：失败响应没有 `data`，直接解引用会在第一处崩掉（AGENTS §4.4）。 */
+async function callRoute(route, query = '') {
+  const response = await route.fetch(new Request(`http://127.0.0.1/api/hooks${query}`, { method: 'GET' }))
+  const body = await response.json()
+  const emptyData = {
+    route: '',
+    projectRoot: null,
+    cwd: null,
+    cwdSource: 'none',
+    files: [],
+    events: [],
+    total: { hookCount: 0, disabledCount: 0, groupCount: 0 },
+    staleInUse: false,
+    capabilities: { writable: false },
+  }
+  const data = body !== null && typeof body === 'object' && body.data ? body.data : emptyData
+  return { status: response.status, body, data }
+}
+
+/** 造一个空的检视结果（纯函数测试用）。 */
+function emptyInspection(overrides = {}) {
+  return {
+    projectRoot: '/p',
+    cwd: '/p',
+    cwdSource: 'session',
+    sources: [],
+    effective: {},
+    staleInUse: false,
+    ...overrides,
+  }
+}
+
+/** 造一个来源检视结果。 */
+function sourceInspection(kind, groups, overrides = {}) {
+  return {
+    kind,
+    path: kind === 'project' ? '/p/.dsh/hooks.json' : '/home/hooks.json',
+    state: 'ok',
+    message: null,
+    version: 'v1',
+    groups,
+    skipped: [],
+    matcherErrors: [],
+    ...overrides,
+  }
+}
+
+await test('P：路由注册契约（路径以 /api/ 开头、GET、buffered）', async () => {
+  const conn = makeConnection()
+  await mount({ connection: conn.connection })
+  assert.equal(conn.routes.length, 1, '应当恰好注册一条路由')
+  const route = conn.routes[0]
+  assert.equal(route.path, '/api/hooks')
+  assert.ok(
+    route.path.startsWith('/api/'),
+    'connection.fetch 要求路径以 /api/ 开头，否则拿不到 Host/Origin 围栏与浏览器鉴权',
+  )
+  assert.deepEqual(route.methods, ['GET'])
+  assert.equal(route.requestBody, 'buffered', '必须在 bridge 读字节之前声明请求体处理方式')
+  assert.equal(typeof route.fetch, 'function')
+})
+
+await test('P：路由字面量与共享常量逐字一致，且原样出现在产物里', () => {
+  assert.equal(HOOKS_ROUTE, '/api/hooks')
+  const host = fs.readFileSync(LIB, 'utf8')
+  assert.ok(host.includes(`"${HOOKS_ROUTE}"`), '产物里应当出现与共享常量一致的路由字面量')
+  // TODO(P5)：客户端产物里必须出现**同一个**字面量 —— 两侧不一致就是静默 404。
+})
+
+await test('P：没有 connection 服务时插件照常工作（数据面是便利设施，不是硬依赖）', async () => {
+  const h = await mount({})
+  assert.equal(h.listeners.get('tools/pre-execute').length, 1, '路由缺失不该影响事件接线')
+  assert.ok(
+    h.logs.some((entry) => entry.message.includes('设置页数据面未注册')),
+    '应当如实说明数据面没注册，而不是静默',
+  )
+})
+
+await test('P：快照恒为 7 个事件（含 0 条），顺序即事件表顺序', () => {
+  const snapshot = buildSnapshot(emptyInspection())
+  assert.equal(snapshot.events.length, 7, '7 个事件分组必须全部渲染，含 0 条')
+  assert.deepEqual(
+    snapshot.events.map((event) => event.event),
+    [...HOOK_EVENTS],
+    '顺序必须与事件表一致（不是按有无内容排序）',
+  )
+  assert.ok(
+    snapshot.events.every((event) => event.hookCount === 0 && event.groups.length === 0),
+    '没有配置时每个事件都应当是 0 条、0 组',
+  )
+  assert.deepEqual(snapshot.total, { hookCount: 0, disabledCount: 0, groupCount: 0 })
+})
+
+await test('P：快照把 disabled 单独计数（不许把"已停用"算成"在跑"）', () => {
+  const groups = {
+    PreToolUse: [
+      {
+        matcher: 'pwsh',
+        hooks: [{ command: 'a' }, { command: 'b', disabled: true }],
+      },
+    ],
+  }
+  const snapshot = buildSnapshot(emptyInspection({ effective: groups }))
+  const pre = snapshot.events.find((event) => event.event === 'PreToolUse')
+  assert.equal(pre.hookCount, 1, '生效条数必须**不含**已停用的那条')
+  assert.equal(pre.disabledCount, 1, '停用条数单独计数')
+  assert.equal(snapshot.total.disabledCount, 1)
+  assert.equal(pre.groups[0].hooks.length, 2, '页面仍要能看见停用的那条（否则没法重新启用）')
+  assert.equal(pre.groups[0].hooks[1].disabled, true)
+  assert.equal(pre.groups[0].hooks[0].disabled, false)
+  assert.equal(pre.groups[0].hooks[0].defaultTimeoutSec, 600, '未写 timeout 时要告诉页面默认值')
+  assert.equal(pre.groups[0].hooks[0].timeoutSec, null, '未写就是 null，不要编一个数字')
+})
+
+await test('P：非法 matcher 在快照里被标出来（可分别说清，而不是静默消失）', () => {
+  const groups = { PreToolUse: [{ matcher: '(', hooks: [{ command: 'a' }] }] }
+  const snapshot = buildSnapshot(emptyInspection({ effective: groups }))
+  const pre = snapshot.events.find((event) => event.event === 'PreToolUse')
+  assert.equal(pre.groups.length, 1, '页面要能看见这个 group，才能告诉用户它为什么不跑')
+  assert.equal(pre.groups[0].matcherOk, false)
+  assert.ok(pre.groups[0].matcherProblem.includes('invalid regex matcher'))
+})
+
+await test('P：GET 正常路径 —— 两个来源、合并条数、只读能力位', async () => {
+  await withIsolatedHome(async () => {
+    const dir = await makeProject()
+    await writeHooks(dir, {
+      hooks: {
+        PreToolUse: [{ matcher: 'pwsh', hooks: [{ command: 'p1' }, { command: 'p2', timeout: 30 }] }],
+        Stop: [{ hooks: [{ command: 'p3' }] }],
+      },
+    })
+    await fsp.writeFile(
+      path.join(process.env.DSH_HOME, 'hooks.json'),
+      JSON.stringify({ hooks: { PreToolUse: [{ hooks: [{ command: 'u1' }] }] } }),
+      'utf8',
+    )
+    const conn = makeConnection()
+    const { agent } = fakeAgent(dir)
+    await mount({ connection: conn.connection, fs: makeFs(), initiator: agent })
+
+    const { status, body, data } = await callRoute(conn.routes[0])
+    assert.equal(status, 200)
+    assert.equal(body.ok, true)
+    assert.equal(data.route, '/api/hooks')
+    assert.equal(data.files.length, 2, '两个来源永远都列')
+    assert.deepEqual(
+      data.files.map((file) => file.kind),
+      ['project', 'user'],
+    )
+    assert.ok(
+      data.files.every((file) => file.state === 'ok'),
+      '两份文件都合法时状态应当是 ok',
+    )
+    assert.equal(data.total.hookCount, 4, '项目级 3 条 + 用户级 1 条（PreToolUse 生效必合并）')
+    const pre = data.events.find((event) => event.event === 'PreToolUse')
+    assert.equal(pre.hookCount, 3, 'PreToolUse：项目级 2 + 用户级 1')
+    assert.equal(pre.fromProject, 2)
+    assert.equal(pre.fromUser, 1)
+    // 快照里的组顺序 = **生效顺序**：用户级在前、项目级在后（合并语义，不是展示顺序）。
+    assert.equal(pre.groups.length, 2, '两个来源的 PreToolUse 组都要在')
+    assert.equal(pre.groups[0].hooks[0].command, 'u1', '用户级在前 —— 顺序即执行顺序')
+    assert.equal(pre.groups[1].hooks[0].command, 'p1', '项目级在后')
+    assert.equal(pre.groups[1].hooks[1].timeoutSec, 30, '文件里的 timeout 要带出来（第 2 条才是写了 timeout 的那条）')
+    assert.equal(pre.groups[1].hooks[0].timeoutSec, null, '没写 timeout 就该是 null，不要编一个数字')
+    assert.equal(data.capabilities.writable, false, 'P4a 还是只读：页面据此显示只读横幅')
+    assert.equal(data.staleInUse, false)
+  })
+})
+
+await test('P：GET —— 文件不存在是 absent（合法的空配置），不是 error', async () => {
+  await withIsolatedHome(async () => {
+    const dir = await makeProject()
+    const conn = makeConnection()
+    const { agent } = fakeAgent(dir)
+    await mount({ connection: conn.connection, fs: makeFs(), initiator: agent })
+    const { data } = await callRoute(conn.routes[0])
+    assert.deepEqual(
+      data.files.map((file) => file.state),
+      ['absent', 'absent'],
+      'ENOENT 是"这份配置是空的"，绝不能被当成"读坏了"',
+    )
+    assert.ok(
+      data.files.every((file) => file.message === null),
+      'absent 不该带有错误文案',
+    )
+    assert.equal(data.events.length, 7, '没有配置时 7 个事件仍然全列（否则用户以为功能没做）')
+  })
+})
+
+await test('P：GET —— 文件写坏时如实报 error，同时说清"运行中的还是上一份可用配置"', async () => {
+  await withIsolatedHome(async () => {
+    const dir = await makeProject()
+    const s = await script(dir, 'p.mjs', `process.exit(0)`)
+    await writeHooks(dir, { hooks: { PreToolUse: [{ matcher: 'pwsh', hooks: [{ command: cmd(s) }] }] } })
+    const conn = makeConnection()
+    const captured = []
+    const { agent } = fakeAgent(dir)
+    const h = await mount({ connection: conn.connection, fs: makeFs({ watch: 'capture', captured }), initiator: agent })
+
+    // 先成功加载一次（写入 last-good），再写坏并强制失效 —— 与 fail-open 区同一套路。
+    const handler = h.listeners.get('tools/pre-execute')[0]
+    await handler({ name: 'pwsh', arguments: {}, callId: 'c', agent }, nextAllow)
+    const projectFile = path.join(dir, '.dsh', 'hooks.json')
+    await fsp.writeFile(projectFile, '{"hooks": {', 'utf8')
+    for (const { changed } of captured) changed()
+    await handler({ name: 'pwsh', arguments: {}, callId: 'c2', agent }, nextAllow)
+
+    const { data } = await callRoute(conn.routes[0])
+    const project = data.files.find((file) => file.kind === 'project')
+    assert.equal(project.state, 'error', '磁盘此刻读不出来 → 如实报 error')
+    assert.ok(typeof project.message === 'string' && project.message.length > 0, 'error 要带技术原文（放详情位）')
+    assert.equal(data.staleInUse, true, '生效配置是 last-good 兜底，必须让用户知道')
+    const pre = data.events.find((event) => event.event === 'PreToolUse')
+    assert.equal(pre.hookCount, 1, '运行中的 hook 仍然在跑，页面必须照样显示它们')
+    assert.equal(data.events.length, 7)
+  })
+})
+
+await test('P：GET —— 没有会话上下文时只列用户级，绝不编造项目路径', async () => {
+  await withIsolatedHome(async () => {
+    const conn = makeConnection()
+    // 不传 initiator、agents 也取不到 → cwd 未知。
+    await mount({ connection: conn.connection, fs: makeFs() })
+    const { status, data } = await callRoute(conn.routes[0])
+    assert.equal(status, 200, '这不是错误：用户级配置仍然是有意义的')
+    assert.equal(data.cwd, null)
+    assert.equal(data.cwdSource, 'none')
+    assert.equal(data.projectRoot, null, '不知道项目就是不填，不许拿 process.cwd() 顶上')
+    assert.deepEqual(
+      data.files.map((file) => file.kind),
+      ['user'],
+      '只列用户级',
+    )
+    assert.equal(data.events.length, 7, '即使没有项目，7 个事件也要全列')
+  })
+})
+
+await test('P：GET —— 会话 cwd 来自 initiator（并如实标注来源）', async () => {
+  await withIsolatedHome(async () => {
+    const dir = await makeProject('sub')
+    const conn = makeConnection()
+    const { agent } = fakeAgent(path.join(dir, 'sub'))
+    await mount({ connection: conn.connection, fs: makeFs(), initiator: agent })
+    const { data } = await callRoute(conn.routes[0])
+    assert.equal(data.cwdSource, 'initiator')
+    assert.equal(data.projectRoot, dir, 'projectRoot 应当是最近的含 .git 祖先')
+  })
+})
+
+await test('P：disabled 的 hook 真的不跑（不只是界面显示）', async () => {
+  await withIsolatedHome(async () => {
+    const dir = await makeProject()
+    const running = path.join(dir, 'ran-enabled.txt')
+    const skipped = path.join(dir, 'ran-disabled.txt')
+    const s1 = await script(dir, 'enabled.cjs', `require('fs').writeFileSync(${JSON.stringify(running)}, 'x')`)
+    const s2 = await script(dir, 'disabled.cjs', `require('fs').writeFileSync(${JSON.stringify(skipped)}, 'x')`)
+    await writeHooks(dir, {
+      hooks: {
+        PreToolUse: [
+          {
+            matcher: 'pwsh',
+            hooks: [{ command: cmd(s1) }, { command: cmd(s2), disabled: true }],
+          },
+        ],
+      },
+    })
+    const conn = makeConnection()
+    const { agent } = fakeAgent(dir)
+    const h = await mount({ connection: conn.connection, fs: makeFs(), initiator: agent })
+    await h.listeners.get('tools/pre-execute')[0]({ name: 'pwsh', arguments: {}, callId: 'c', agent }, nextAllow)
+
+    assert.equal(fs.existsSync(running), true, '启用的那条必须跑')
+    assert.equal(
+      fs.existsSync(skipped),
+      false,
+      'disabled 的那条**绝不能**跑 —— 否则就是"UI 显示已停用、实际照跑"（AGENTS §2.5）',
+    )
+    const { data } = await callRoute(conn.routes[0])
+    const pre = data.events.find((event) => event.event === 'PreToolUse')
+    assert.equal(pre.hookCount, 1)
+    assert.equal(pre.disabledCount, 1)
+  })
+})
+
+await test('P：handler 抛错 → 500 信封，且**没有 data**（错误契约）', async () => {
+  const conn = makeConnection()
+  registerHooksRoute(conn.connection, async () => {
+    throw new Error('boom')
+  })
+  const { status, body, data } = await callRoute(conn.routes[0])
+  assert.equal(status, 500)
+  assert.equal(body.ok, false)
+  assert.equal(body.error, 'internal')
+  assert.equal(body.detail, 'boom', '技术原文放 detail，页面主文案自己措辞')
+  assert.equal(body.data, undefined, '失败响应不该有 data')
+  assert.deepEqual(data.events, [], '补空形状之后仍然可断言，而不是崩在第一处解引用')
 })
 
 //#endregion

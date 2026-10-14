@@ -8,14 +8,15 @@
   "targets": [
     {
       "output": "lib/index.js",
-      "outputSha256": "20fe8966d4a00dd96e6a8cb2a578d5e1cf3930bdeb03ba6295f2df14b11052c5",
+      "outputSha256": "de0584ea17afd8807b44688497cc8f178c7746e0be218095e7a9a38688b4a65c",
       "inputs": {
-        "src/host/index.ts": "e5237c077ca9760b9b018160f2c72f3311465a24c59abbf7ecd0d7f90e852e33",
-        "src/host/service-types.ts": "785a080e235bc58fe0786bc50a04dab67b1435d3379b372566ef4cfb597a0e26",
+        "src/host/data-plane.ts": "d8c17ded0e74228e82524e264e2cde74eb38fa1c73fe4b2fce9b1e101793ed99",
+        "src/host/index.ts": "7145df96a530d9d3ba3846e48e09b3653885cc39bca3aa19bc00431fc7b35185",
+        "src/host/service-types.ts": "2e66000655f7cb4d7c682328698d093ba3a9f90af158ac519342115284984da3",
         "src/shared/constants.ts": "f1d90f50b407ff234cd1c790964bdee627837cacaf7adc72cc651078fe9c5840",
         "src/shared/guards.ts": "db789f5bb5c882871ef4a37f3cf060d8a589617ef0cc3f50d2a2483bce99c858",
-        "src/shared/protocol.ts": "55009cc40417eeb40487a8365b765fe72a78fa6d6edc78a37b00b3bf2bc898d6",
-        "src/shared/types.ts": "c857222d33957e6b93783a2b50b570dd8d5a3f21a1732c8ed77684d4087b901d"
+        "src/shared/protocol.ts": "c0d14262b298b27c715285280a77ca163fbb261e88789378ff271770dca25849",
+        "src/shared/types.ts": "f6e4289c47937b564805880e9e5eab2819beb2db17ffdcb4b92e76dbcd4459b5"
       }
     }
   ]

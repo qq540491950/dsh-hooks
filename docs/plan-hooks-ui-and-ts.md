@@ -497,6 +497,18 @@ window.__ModuleLoader__.load({
 - 文档：AGENTS §0 判据改为"看 `lib/.build-manifest.json`"、§4.8 从"迁移期纪律"改写成"产物纪律"、§2.9/§5 的 `verify.mjs` 引用改为 `.ts`；README 新增「源码与构建」小节、把"两条失效通道"改成**三层**（版本核对 / watcher / TTL）。
 - **未实测（需要重启 DSH）**：产物在真实 host 里加载（profile 路径行指向的仍是旧模块实例）。
 
+### P4a —— 完成（本次提交）：只读数据面 + `disabled` 的诚实性
+
+- **开工前先核实了两件事**（结论写进 `docs/design-notes.md` §1）：
+  1. **通道选型**：`dsh-client-store` 是**浏览器本地**存储原语，不是宿主↔客户端通道；官方确实另有 Remote（typert）RPC 与 `$events` 事件流两条路，但兄弟插件已评估并否决 Remote（要手写严格 codec、客户端 bundle 无 zod 种子、能力集构建期固定）。结论：继续用 `connection.fetch.register()` 的精确路由 —— 白拿 `/api` 前缀的 Host/Origin 围栏（403）与浏览器鉴权（401）以及绑 scope 的 disposer。
+  2. **`disabled` 能不能落在 hook 上**（§2.5 要求"改之前先核对"）：`@deepseek-ai/dsh-hook-protocol` **根本不解析配置文件**（只有 matcher 语义、输出 codec、`runCommandHook(已解析的 hook)`、判决合并）→ 协议层不存在"未知字段被拒"的问题。于是纪律从"先核对再决定"变成两条：解析层**保留** `disabled`、执行层**跳过**它，并且必须有**真子进程**断言证明它真的没跑。
+- 产出：`src/host/data-plane.ts`（`HOOKS_ROUTE`、wire 类型、**纯函数** `buildSnapshot`、`registerHooksRoute`）；`src/host/index.ts` 增加 `cwdFor` / `sourceViewOf` / `inspect` 与路由注册；`CacheState` 增加 `stale`；`runPoint` 跳过 `disabled`；`parseHookConfig` 记录 `disabled`。
+- 断言：新增 `P` 区 13 条（注册契约 3 条 + 纯函数快照不变式 3 条 + 真实文件系统上的 handler 行为 7 条）。自检 **76 → 89**。
+- 反向验证 5 个注入，全部精确命中（其中 2 条要先重建产物才认，因为集成断言跑的是 `lib/index.js`）：过滤空事件 → "7 个事件恒全列"红；runner 不跳 `disabled` → 哨兵文件出现、断言红；`staleInUse` 固定 false → 红；无会话时拿 `process.cwd()` 顶上 → 红；500 里塞 `data` → 红。还原后 89/89。
+- 过程中自检抓到**两处我自己的测试错误**（都被修掉，不是产品问题）：断言取错下标（把"用户级组"当成了"项目级组"，顺带确认了 `groups[0]` 是用户级 = 合并顺序正确）；把 `disabled` 哨兵脚本写成 `.mjs` 却在里面用 `require`（ESM 没有 `require`）。
+- **未做（留给 P4b）**：POST 与定点写（`writeText` + 版本锁 + 深比较保留未知键）、有界执行台账（状态色的唯一证据来源）、试运行（复用 `runPoint`）。**`capabilities.writable` 现在是 `false`**，页面据此显示只读横幅。
+- **未实测（需要重启 DSH）**：真实 `/api/hooks` 的鉴权与围栏（403/401）、以及页面能否真的拉到数据。
+
 ### 下一步
 
-**P4**：宿主数据面 —— `GET/POST /api/hooks`（`scope.connection.fetch.register`）、定点写（`writeText` + 版本锁 + 深比较保留未知键）、有界执行台账、试运行复用 `runPoint`。**P5 才需要第一次重启**（客户端半边首次发布），宿主侧的在线验收在那时合并做一次。
+**P4b**：`POST /api/hooks` 与定点写 —— `writeText` + 版本锁（`replaceIfVersion` / `createIfAbsent`）+ **深比较证明未知键没丢**（否则拒写）、有界执行台账、试运行复用 `runPoint`。之后 **P5** 出客户端只读页，那一步需要一次重启。

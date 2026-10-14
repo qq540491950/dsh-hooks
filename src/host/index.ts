@@ -78,6 +78,7 @@ import type {
   SubagentInfo,
   ToolExecution,
 } from './service-types.ts'
+import { registerHooksRoute, type HooksInspection, type SourceInspection } from './data-plane.ts'
 
 /** 插件名。 */
 export const name = 'dsh-hooks'
@@ -112,6 +113,13 @@ interface CacheState {
   expiresAt: number
   versions: VersionSnapshot | undefined
   hasHooks: boolean
+  /**
+   * 当前生效的这份配置是不是**上一次成功读取**的兜底（磁盘此刻读不出来）。
+   *
+   * 记在缓存上而不是每次重新推断：数据面要如实告诉页面"你看到的 hooks 现在仍在跑，
+   * 但文件本身已经坏了" —— 这正是 AGENTS §3.9 要求分别说清的情形之一。
+   */
+  stale: boolean
 }
 
 /** 缓存条目。 */
@@ -472,6 +480,7 @@ export function apply(ctx: HostContext): void {
       expiresAt: Number.POSITIVE_INFINITY,
       versions: undefined,
       hasHooks: false,
+      stale: false,
     }
 
     const promise = (async (): Promise<ResolvedConfig> => {
@@ -545,6 +554,8 @@ export function apply(ctx: HostContext): void {
       // 这份 last-good 结果，而不是每次事件点都重读一遍坏文件。
       state.versions = { user: versionOf(userRead), project: versionOf(projectRead) }
       state.hasHooks = hasHooks
+      // 记下"这份生效配置是 last-good 兜底"，供数据面如实告诉页面（AGENTS §3.9）。
+      state.stale = stale
       return { groups, projectPath, userPath }
     })().catch((error: unknown) => {
       warn(`dsh-hooks: 加载 ${projectRoot} 的 hook 配置失败：${messageOf(error)}`)
@@ -553,6 +564,8 @@ export function apply(ctx: HostContext): void {
       // 整体失败时不去猜版本：两个都记 undefined，让"两个文件都不存在"这一种情况仍能复用。
       state.versions = { user: undefined, project: undefined }
       state.hasHooks = false
+      // 整体失败时 groups 是空的，谈不上"沿用上一份"。
+      state.stale = false
       return { groups: {}, projectPath, userPath }
     })
 
@@ -643,6 +656,9 @@ export function apply(ctx: HostContext): void {
     for (const group of groups) {
       if (!matchesMatcher(group.matcher, matchQuery)) continue
       for (const hook of group.hooks) {
+        // `disabled: true` 在这里**被真正跳过** —— 这是 AGENTS §2.5 的诚实性要求：
+        // 开关落在文件里，而本插件的执行路径必须认它，否则"UI 显示已停用、实际照跑"。
+        if (hook.disabled === true) continue
         const started = Date.now()
         const timeoutMs = hook.timeoutSec !== undefined ? hook.timeoutSec * 1000 : DEFAULT_TIMEOUT_MS
         let output: HookOutput
@@ -739,6 +755,100 @@ export function apply(ctx: HostContext): void {
       agent_type: SUBAGENT_TYPE,
       ...(event === 'SubagentStop' ? { stop_hook_active: false } : {}),
     }
+  }
+
+  //#endregion
+
+  //#region 数据面（设置页的只读快照）
+
+  /** cwd 的来源，如实报告、绝不编造（AGENTS §2.8）。**同步**函数：只查内存里的 agent 表。 */
+  function cwdFor(sessionId: string | undefined): { cwd: string | null; source: 'session' | 'initiator' | 'none' } {
+    const agents = ctx.get('agents')
+    if (sessionId !== undefined && agents !== undefined && typeof agents.get === 'function') {
+      try {
+        const cwd = agents.get(sessionId)?.session?.header?.cwd
+        if (typeof cwd === 'string' && cwd.length > 0) return { cwd, source: 'session' }
+      } catch {
+        /* 拿不到就往下试 */
+      }
+    }
+    if (agents !== undefined && typeof agents.currentInitiator === 'function') {
+      try {
+        const cwd = agents.currentInitiator()?.session?.header?.cwd
+        if (typeof cwd === 'string' && cwd.length > 0) return { cwd, source: 'initiator' }
+      } catch {
+        /* 没有就是没有 */
+      }
+    }
+    return { cwd: null, source: 'none' }
+  }
+
+  /** 把一次读取折成页面要的来源视图（用**同一个** `parseHookConfig` —— AGENTS §2.6）。 */
+  function sourceViewOf(kind: 'project' | 'user', read: ReadState, vars: { projectDir?: string }): SourceInspection {
+    const parsed = parseHookConfig(read.state === 'ok' ? read.raw : undefined, vars)
+    return {
+      kind,
+      path: read.path,
+      state: read.state,
+      // 技术原文只在 error 时给出，且只放"详情"位（AGENTS §3.9：不作为页面主文案）。
+      message: read.state === 'error' ? read.message : null,
+      version: read.version === undefined || read.version === null ? null : read.version,
+      groups: parsed.groups,
+      skipped: parsed.skipped,
+      matcherErrors: parsed.errors,
+    }
+  }
+
+  /**
+   * 数据面：检视"当前项目 + 用户级"两个来源。
+   *
+   * 两个刻意的选择：
+   *   ① **生效配置取 `configFor()` 的缓存**，而不是这里重新解析一遍 —— AGENTS §2.6 要求
+   *      "页面显示的必须就是 hook 实际会跑的那一份"。重解析得到的是"磁盘刚刚的样子"，而
+   *      runner 可能正拿着 last-good 在跑；两者不一致时页面就在撒谎。
+   *   ② **每侧的 state/message 取一次新鲜读取** —— 页面需要知道磁盘此刻到底是什么状态，
+   *      才能把"文件坏了"和"生效配置是兜底"分开说清楚。
+   */
+  async function inspect(sessionId: string | undefined): Promise<HooksInspection> {
+    const { cwd, source } = cwdFor(sessionId)
+    const userPath = joinPath(dshHome(), HOOKS_FILE)
+    const userRead = await readJsonFile(userPath)
+    if (cwd === null) {
+      // 没有会话上下文：只列用户级，**不编造**一个项目路径（AGENTS §2.8）。
+      // 占位符也不替换（传空 vars），否则页面会看到被替换成 '' 的命令。
+      const userOnly = sourceViewOf('user', userRead, {})
+      return {
+        projectRoot: null,
+        cwd: null,
+        cwdSource: 'none',
+        sources: [userOnly],
+        effective: userOnly.groups,
+        staleInUse: false,
+      }
+    }
+    const projectRoot = await projectRootFor(cwd)
+    const projectRead = await readJsonFile(joinPath(projectRoot, PROJECT_DIR, HOOKS_FILE))
+    const vars = { projectDir: projectRoot }
+    const project = sourceViewOf('project', projectRead, vars)
+    const user = sourceViewOf('user', userRead, vars)
+    const config = await configFor(projectRoot)
+    return {
+      projectRoot,
+      cwd,
+      cwdSource: source,
+      // 展示顺序：项目级在前（它才是"这个项目"的配置）。合并顺序由 effective 决定，与这里无关。
+      sources: [project, user],
+      effective: config.groups,
+      staleInUse: projectCache.get(projectRoot)?.state.stale === true,
+    }
+  }
+
+  // 只有 Web 载体才提供 connection。没有它就不注册数据面 —— 设置页没了，但 hooks 照跑：
+  // 数据面是便利设施，不是硬依赖（也正因为如此，自检的假 ctx 不必实现它）。
+  if (ctx.connection !== undefined) {
+    registerHooksRoute(ctx.connection, inspect)
+  } else {
+    info('dsh-hooks: 当前载体没有 connection 服务，设置页数据面未注册（hooks 本身不受影响）')
   }
 
   //#endregion

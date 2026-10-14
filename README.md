@@ -405,6 +405,26 @@ node tools/verify.ts --config "D:\some\project\.dsh\hooks.json"
 会列出：识别到哪些事件、每个 group 的 matcher 与 timeout、被跳过的非 command handler、
 以及 matcher 诊断。**写配置之后先跑这个**，比等重启看日志快得多。
 
+## 设置页数据面（`/api/hooks`，P4a 已就位）
+
+给设置页「Hooks」用的**只读**数据面，由宿主半边用 `ctx.connection.fetch.register()` 注册：
+
+- **为什么是这条通道**（7 条候选逐条否决：Remote / `$events` / client-store / 构建期快照 …）：
+  [docs/design-notes.md](docs/design-notes.md) §1。
+- `GET /api/hooks[?sessionId=…]` → `{ok:true, data:HooksSnapshot}`；失败 → `{ok:false, error, detail?}`，
+  **没有 `data`**（页面必须先补空形状再解引用）。
+- 快照的硬不变式：**7 个事件永远全列**（含 0 条）、**两个来源永远都列**、`disabled` 单独计数
+  （生效条数不含它）、`staleInUse` 如实反映"文件坏了但运行中的还是上一份可用配置"。
+- `capabilities.writable` 现在是 **`false`** —— 页面据此显示只读横幅，而不是让用户点了没反应；
+  写入（P4b / P6）落地后翻成 `true`。
+- **没有会话上下文**时 `cwd` / `projectRoot` 一律是 `null` 并标注来源（`cwdSource`），
+  **不拿 `process.cwd()` 顶上**。
+- 当前载体没有 `connection` 服务（如 shell 载体）时不注册数据面，但 **hooks 照常工作**。
+- 离线自检覆盖：注册契约（路径 / 方法 / `requestBody`）+ handler 行为（直接用
+  `new Request('http://127.0.0.1/api/hooks')` 调 handler），见 `tools/verify.ts` 的 `P` 区。
+
+界面本身在 P5 落地；那一步需要**重启一次 DSH**（客户端半边首次发布才需要）。
+
 ## 故障排查
 
 | 现象 | 检查 |
