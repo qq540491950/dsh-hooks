@@ -481,13 +481,27 @@ function writeButtons(nodes) {
   return nodes.filter((node) => typeof node.className === 'string' && node.className.includes('dsh-hooks__btn'))
 }
 
+/**
+ * 按**标签**取按钮（`title` 就是动作名）。
+ *
+ * 比按下标稳：这几轮每加一个按钮（0→2→3→4），按下标的旧断言就会**换一个目标**去点，
+ * 而报错却是"功能坏了"——把测试的脆弱伪装成产品的回归。按标签选才表达真实意图。
+ */
+function buttonByLabel(nodes, label) {
+  const found = nodes.find(
+    (node) => typeof node.className === 'string' && node.className.includes('dsh-hooks__btn') && node.title === label,
+  )
+  assert.ok(found !== undefined, `应当有一个标签为「${label}」的按钮`)
+  assert.equal(typeof found.onClick, 'function', `「${label}」按钮必须真的带 onClick`)
+  return found
+}
+
 await test('D：点"停用"发的是定点写请求（file + 原始下标 + 目标值）', async () => {
   const harness = createFakeReact()
   const component = componentFromArtifact(harness.React)
   const nodes = await renderSection(component, harness, { ok: true, data: minimalSnapshot() })
   const buttons = writeButtons(nodes)
-  assert.equal(buttons.length, 3, '可写时一行三个按钮：编辑、停用、删除（这里只有一条 hook）')
-  assert.equal(typeof buttons[1].onClick, 'function', '按钮必须真的带 onClick')
+  assert.equal(buttons.length, 4, '可写时一行四个按钮：试运行、编辑、停用、删除（这里只有一条 hook）')
 
   const calls = []
   globalThis.fetch = async (_url: string, options: { method?: string; body?: string } = {}) => {
@@ -500,7 +514,7 @@ await test('D：点"停用"发的是定点写请求（file + 原始下标 + 目�
           : { ok: true, data: minimalSnapshot() },
     }
   }
-  buttons[1].onClick()
+  buttonByLabel(nodes, '停用').onClick()
   await new Promise((resolve) => setTimeout(resolve, 0))
   await new Promise((resolve) => setTimeout(resolve, 0))
 
@@ -517,7 +531,7 @@ await test('D：写失败按错误码分别说清，且只渲染在页面级通�
   const component = componentFromArtifact(harness.React)
   const nodes = await renderSection(component, harness, { ok: true, data: minimalSnapshot() })
   // 索引 1 是"停用"（索引 0 是"编辑"）—— 这里要触发的是写请求。
-  const button = writeButtons(nodes)[1]
+  const button = buttonByLabel(nodes, '停用')
 
   globalThis.fetch = async () => ({
     json: async () => ({ ok: false, error: 'stale', detail: 'FS_STALE_VERSION: 期望 v1' }),
@@ -547,8 +561,8 @@ await test('D：行内编辑命令 —— 文本框里是当前命令，保存�
 
   // 没在编辑时：一行两个按钮（编辑、停用）
   const idle = writeButtons(first)
-  assert.equal(idle.length, 3, '一行应当有"编辑"、"停用"、"删除"三个按钮')
-  idle[0].onClick()
+  assert.equal(idle.length, 4, '一行应当有"试运行"、"编辑"、"停用"、"删除"四个按钮')
+  buttonByLabel(first, '编辑').onClick()
 
   // 点"编辑"后重新渲染（§4.5：事件闭包是当次渲染的）
   harness.begin()
@@ -575,7 +589,7 @@ await test('D：行内编辑命令 —— 文本框里是当前命令，保存�
     calls.push({ method, body: typeof options.body === 'string' ? JSON.parse(options.body) : null })
     return { json: async () => ({ ok: true, data: { file: 'project', version: 'v2' } }) }
   }
-  writeButtons(typed)[0].onClick()
+  buttonByLabel(typed, '保存').onClick()
   await new Promise((resolve) => setTimeout(resolve, 0))
   await new Promise((resolve) => setTimeout(resolve, 0))
 
@@ -607,7 +621,7 @@ await test('D：删除是两步 —— 第一步只改状态不发请求，第�
   }
 
   // 第一步：点"删除"（索引 2）。**绝不能发请求**。
-  writeButtons(first)[2].onClick()
+  buttonByLabel(first, '删除').onClick()
   await new Promise((resolve) => setTimeout(resolve, 0))
   assert.equal(calls.length, 0, '第一步绝不能发请求 —— 删除是唯一丢数据的操作，点错了没有 undo')
 
@@ -623,7 +637,7 @@ await test('D：删除是两步 —— 第一步只改状态不发请求，第�
   assert.ok(joined.includes('确认删除'), '第二个按钮必须是明确的"确认删除"，不是含混的"确定"')
 
   // 第二步：点"确认删除" → 这时才发请求。
-  confirmButtons[0].onClick()
+  buttonByLabel(confirming, '确认删除').onClick()
   await new Promise((resolve) => setTimeout(resolve, 0))
   assert.equal(calls.length, 1, '两步之后恰好一次写请求')
   assert.equal(calls[0].method, 'POST')
@@ -632,6 +646,62 @@ await test('D：删除是两步 —— 第一步只改状态不发请求，第�
     { file: 'project', op: 'removeHook', event: 'PreToolUse', groupIndex: 0, hookIndex: 0 },
     '删除也是定点操作：宿主拿这两个**文件下标**定位要删的那一条',
   )
+})
+
+await test('D：点"试运行"发 dryRun 请求，结果贴在这一行，且那一行仍然是灰的', async () => {
+  const harness = createFakeReact()
+  const component = componentFromArtifact(harness.React)
+  const first = await renderSection(component, harness, { ok: true, data: minimalSnapshot() })
+
+  const calls = []
+  globalThis.fetch = async (_url: string, options: { method?: string; body?: string } = {}) => {
+    const method = options.method ?? 'GET'
+    calls.push({ method, body: typeof options.body === 'string' ? JSON.parse(options.body) : null })
+    return {
+      json: async () => ({
+        ok: true,
+        data: {
+          run: { command: 'echo a', exitCode: 2, decision: 'block', durationMs: 7, stdout: '', stderr: 'dry ok' },
+        },
+      }),
+    }
+  }
+  buttonByLabel(first, '试运行').onClick()
+  await new Promise((resolve) => setTimeout(resolve, 0))
+  await new Promise((resolve) => setTimeout(resolve, 0))
+
+  assert.equal(calls.length, 1, '试运行只发一次请求')
+  assert.deepEqual(
+    calls[0].body,
+    { op: 'dryRun', file: 'project', event: 'PreToolUse', groupIndex: 0, hookIndex: 0 },
+    '试运行也是定点寻址（文件 + 事件 + 两个文件下标）',
+  )
+
+  harness.begin()
+  const after = harness.flatten(component())
+  const joined = after
+    .filter((node) => node.text !== undefined)
+    .map((node) => node.text)
+    .join('')
+  assert.ok(joined.includes('已阻断'), 'deny/block 要**单独点名**，不能只说"失败了事"')
+  assert.ok(joined.includes('dry ok'), 'stderr 要带给用户看（原因通常写在这里）')
+  assert.ok(joined.includes('7ms'), '耗时也要显示（用户判断"这条 hook 慢不慢"就靠它）')
+  const dot = after.find((node) => typeof node.className === 'string' && node.className.includes('dsh-hooks__dot'))
+  assert.ok(dot.title.includes('未运行'), '试运行**不进台账**：那一行仍然是灰的"未运行" —— 预演不该给状态上色（§3.8）')
+
+  // 失败走**页面级**通道（§3.7），与其它行内操作一致。
+  globalThis.fetch = async () => ({ json: async () => ({ ok: false, error: 'invalid-json', detail: '坏文件' }) })
+  harness.begin()
+  buttonByLabel(harness.flatten(component()), '试运行').onClick()
+  await new Promise((resolve) => setTimeout(resolve, 0))
+  await new Promise((resolve) => setTimeout(resolve, 0))
+  harness.begin()
+  const failedText = harness
+    .flatten(component())
+    .filter((node) => node.text !== undefined)
+    .map((node) => node.text)
+    .join('')
+  assert.ok(failedText.includes('没有写入'), '试运行失败也要按错误码说清（这条是"文件读不出来，所以没写"）')
 })
 
 //#endregion

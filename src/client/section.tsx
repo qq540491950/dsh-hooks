@@ -22,7 +22,7 @@ import { Fragment, h, useEffect, useState } from './react.ts'
 import type { Jsx } from './react.ts'
 import { HOOKS_ROUTE } from '../shared/constants.ts'
 import { styles } from './styles.ts'
-import { requestWrite, writeErrorSentence, type WriteIntent } from './write.ts'
+import { requestDryRun, requestWrite, writeErrorSentence, type DryRunView, type WriteIntent } from './write.ts'
 import type { FileEventView, FileView, GroupView, HooksResponse, HooksSnapshot, HookView } from './wire.ts'
 
 /**
@@ -78,6 +78,25 @@ function statusOf(hook: HookView): { className: string; label: string } {
   return { className: 'dsh-hooks__dot dsh-hooks__dot--warn', label: `失败 · ${where}` }
 }
 
+/**
+ * 试运行结果 → 一行字。
+ *
+ * **不猜**（§3.8）：`exitCode === null`（子进程没起来）与"非零退出"是两件事，各自说清；
+ * `deny`/`block` 单独点名。输出优先显示 stderr（钩子通常把原因写在 stderr）。
+ */
+function formatDryRun(run: DryRunView): string {
+  const outcome =
+    run.exitCode === null
+      ? '启动失败（子进程没起来）'
+      : run.decision === 'deny' || run.decision === 'block'
+        ? `已阻断（exit ${String(run.exitCode)}）`
+        : run.exitCode === 0
+          ? '通过（exit 0）'
+          : `失败（exit ${String(run.exitCode)}）`
+  const text = run.stderr.trim() === '' ? run.stdout.trim() : run.stderr.trim()
+  return `试运行：${outcome} · ${String(run.durationMs)}ms${text === '' ? '' : ` · ${text}`}`
+}
+
 /** 行内操作的回调：行组件自己不知道怎么写，由最外层统一发请求并处理错误。 */
 type Toggle = (file: FileView, event: string, groupRawIndex: number, hook: HookView) => void
 
@@ -100,6 +119,10 @@ type Editor = {
   askRemove: (key: string) => void
   cancelRemove: () => void
   remove: (file: FileView, event: string, groupRawIndex: number, hook: HookView) => void
+  /** 刚试运行完的那一行（空串 = 没有）+ 它的结果文案。**不写台账**，只是给人看一眼（§3.8）。 */
+  dryKey: string
+  dryText: string
+  run: (file: FileView, event: string, groupRawIndex: number, hook: HookView) => void
 }
 
 /** 一条 hook。 */
@@ -117,6 +140,7 @@ function HookRow(props: {
   const key = rowKey(file, event, groupRawIndex, hook.rawIndex)
   const editing = editor.key === key
   const confirming = editor.confirmKey === key
+  const dryText = editor.dryKey === key ? editor.dryText : ''
   const status = statusOf(hook)
   const run = hook.lastRun
   const title = run === null ? status.label : `${status.label}\n${run.stderr || run.stdout || '(无输出)'}`
@@ -148,6 +172,7 @@ function HookRow(props: {
           <button
             type="button"
             className="dsh-hooks__btn"
+            title="保存"
             disabled={busy}
             onClick={() => {
               editor.save(file, event, groupRawIndex, hook)
@@ -172,6 +197,18 @@ function HookRow(props: {
           <button
             type="button"
             className="dsh-hooks__btn"
+            title="试运行"
+            disabled={busy}
+            onClick={() => {
+              editor.run(file, event, groupRawIndex, hook)
+            }}
+          >
+            试运行
+          </button>
+          <button
+            type="button"
+            className="dsh-hooks__btn"
+            title="编辑"
             disabled={busy}
             onClick={() => {
               editor.start(key, hook.command)
@@ -182,6 +219,7 @@ function HookRow(props: {
           <button
             type="button"
             className="dsh-hooks__btn"
+            title={hook.disabled ? '启用' : '停用'}
             disabled={busy}
             onClick={() => {
               onToggle(file, event, groupRawIndex, hook)
@@ -192,6 +230,7 @@ function HookRow(props: {
           <button
             type="button"
             className="dsh-hooks__btn"
+            title="删除"
             disabled={busy}
             onClick={() => {
               // **第一步只改状态、不发请求** —— 删除是唯一丢数据的操作。
@@ -208,6 +247,7 @@ function HookRow(props: {
           <button
             type="button"
             className="dsh-hooks__btn"
+            title="确认删除"
             disabled={busy}
             onClick={() => {
               editor.remove(file, event, groupRawIndex, hook)
@@ -227,6 +267,8 @@ function HookRow(props: {
           </button>
         </span>
       ) : null}
+      {/* 试运行的结果**贴着这一行**显示：它是这一行的动作结果，不是页面级错误（§3.7）。 */}
+      {dryText === '' ? null : <span className="dsh-hooks__dry">{dryText}</span>}
     </div>
   )
 }
@@ -361,6 +403,9 @@ export function HooksSection(): Jsx {
   const [draft, setDraft] = useState('')
   /** 正在等"确认删除"的那一行（空串 = 没有）。 */
   const [confirmKey, setConfirmKey] = useState('')
+  /** 刚试运行完的那一行 + 结果文案（**不进台账**，只给人看一眼）。 */
+  const [dryKey, setDryKey] = useState('')
+  const [dryText, setDryText] = useState('')
 
   useEffect(() => {
     const controller = new AbortController()
@@ -474,6 +519,30 @@ export function HooksSection(): Jsx {
         groupIndex: groupRawIndex,
         hookIndex: hook.rawIndex,
       })
+    },
+    dryKey,
+    dryText,
+    run: (file, event, groupRawIndex, hook) => {
+      if (busy) return
+      setBusy(true)
+      setBanner(null)
+      void (async () => {
+        // 试运行**不是写操作**：不碰文件、也不进台账（§3.8），所以走独立的结果形状。
+        const outcome = await requestDryRun({
+          file: file.kind,
+          event,
+          groupIndex: groupRawIndex,
+          hookIndex: hook.rawIndex,
+        })
+        if (outcome.ok && outcome.run !== undefined) {
+          setDryKey(rowKey(file, event, groupRawIndex, hook.rawIndex))
+          setDryText(formatDryRun(outcome.run))
+        } else {
+          // 失败走**页面级**通道，与其它行内操作一致（§3.7：一条错误一个渲染点）。
+          setBanner({ code: outcome.error ?? 'internal', detail: outcome.detail ?? '' })
+        }
+        setBusy(false)
+      })()
     },
   }
 

@@ -96,3 +96,62 @@ export async function requestWrite(intent: WriteIntent, signal?: AbortSignal): P
     return { ok: false, error: 'network', detail: error instanceof Error ? error.message : String(error) }
   }
 }
+
+/** 试运行要改哪一条（**文件 + 事件 + 两个文件下标**，与写操作同一套寻址）。 */
+export interface DryRunIntent {
+  file: 'project' | 'user'
+  event: string
+  groupIndex: number
+  hookIndex: number
+}
+
+/** 试运行的结果（宿主 `DryRunOutcome.run`）。 */
+export interface DryRunView {
+  command: string
+  /** `null` = 子进程没起来（与台账里的语义一致，页面据此说"启动失败"而不是绿）。 */
+  exitCode: number | null
+  decision: string
+  durationMs: number
+  stdout: string
+  stderr: string
+}
+
+/** 一次试运行的结果。同样**永不抛**。 */
+export interface DryRunResult {
+  ok: boolean
+  error?: string
+  detail?: string
+  run?: DryRunView
+}
+
+/**
+ * 试运行一条 hook。
+ *
+ * **不是写操作**：它不碰文件，也**不进执行台账**（§3.8 —— 一次预演不该把那一行画绿），
+ * 所以它走独立的响应形状，不套用 `WriteOutcome`。
+ */
+export async function requestDryRun(intent: DryRunIntent, signal?: AbortSignal): Promise<DryRunResult> {
+  try {
+    const response = await fetch(HOOKS_ROUTE, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      credentials: 'same-origin',
+      body: JSON.stringify({ op: 'dryRun', ...intent }),
+      ...(signal === undefined ? {} : { signal }),
+    })
+    const body = (await response.json()) as {
+      ok: boolean
+      data?: { run?: DryRunView }
+      error?: string
+      detail?: string
+    }
+    if (body.ok) {
+      const run = body.data === undefined ? undefined : body.data.run
+      return run === undefined ? { ok: false, error: 'internal' } : { ok: true, run }
+    }
+    const outcome: DryRunResult = { ok: false, error: typeof body.error === 'string' ? body.error : 'internal' }
+    return typeof body.detail === 'string' ? { ...outcome, detail: body.detail } : outcome
+  } catch (error) {
+    return { ok: false, error: 'network', detail: error instanceof Error ? error.message : String(error) }
+  }
+}
