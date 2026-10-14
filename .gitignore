@@ -8,6 +8,9 @@ build/
 out/
 *.tsbuildinfo
 .cache/
+# esbuild 打包客户端时的中间产物；正常会被构建脚本删掉，崩了才会留下
+lib/.client.cjs
+lib/.client.cjs.map
 
 # 测试与覆盖率
 coverage/

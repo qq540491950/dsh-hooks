@@ -1,0 +1,184 @@
+# AGENTS.md —— 本仓库的 agent 工作约束
+
+> 分级：**[硬]**（破坏数据/环境）＞**[边界]**（抄近路引入已知 bug）＞**[风格]**；同级冲突以**机检**为准（`tsconfig.*` / `eslint.config.js` / `tools/verify.*` / `package.json`）。
+> 每条规则都对应**已经发生过的**事实，括号里是现象或证据，不是理论风险。
+> 只写"做什么、怎么自查、代价"；取证、事故复盘、断言台账在 `docs/agent-rules-notes.md`，设计与实测记录在 [README.md](README.md)，迁移与 UI 的阶段计划在 `docs/plan-hooks-ui-and-ts.md`。
+
+## 0. 30 秒定位
+
+**这是什么**：DSH Host 插件，让每个项目带自己的 hooks 配置。配置只有两处，都是**插件自己拥有的 JSON 文件**（与 `dsh-mcp-manager` 管的 cordis Loader 条目**完全无关**）：
+
+| 级别 | 路径 |
+|---|---|
+| 项目级 | `<projectRoot>/.dsh/hooks.json`（`projectRoot` = 最近含 `.git` 的祖先，没有就用会话 cwd） |
+| 用户级 | `$DSH_HOME/hooks.json`（本机 `C:\Users\admin\.dsh\hooks.json`） |
+
+合并语义：**用户级在前、项目级在后**，同事件数组拼接；**顺序即执行顺序**。支持 7 个事件（`SessionStart / UserPromptSubmit / PreToolUse / PostToolUse / Stop / SubagentStart / SubagentStop`），**只跑 `type: "command"`**。
+
+**源码与产物（判据）**：
+
+- `src/` 存在 → **源码在 `src/**`（TS），`lib/**` 是构建产物，不要直接编辑**。
+- `src/` 不存在 → 迁移尚未落地，`lib/index.js` 就是源码，本文件对它同样生效（尤其 §2.1 零 import）。
+
+| 半边 | 源码 | 产物 | 职责 |
+|---|---|---|---|
+| 宿主 | `src/host/**` | `lib/index.js` | **零 import**；读两个 hooks.json + `ctx.fs.watch` 热重载 + 跑 hook 子进程；并将开 `/api/hooks` 给设置页用 |
+| 客户端 | `src/client/**` | `lib/client.js` | 设置页「Hooks」（`settings.section`，list 座位，`order: 920`） |
+
+**唯一必跑**：`node tools/verify.ts`（迁移前为 `node tools/verify.mjs`），期望 `PASS n/n`。**别把条数抄死**——条数看输出，台账是 `//#region` + 实际输出。
+
+**座位台账（活台账，`cordis_inspect_query` client `Slots.listSubTree` root=`settings.section`）**：
+`account/-10`、`general/0`、`models/10`、`plugins/15`、`agent-presets/20`、`mcp/900`（本地 `dsh-mcp-manager`）、`skills/910`（本地 `dsh-skill-manager`）、**`hooks/920`（本插件）**。
+
+## 1. 硬性纪律
+
+**1.1 [硬] 不用 PowerShell 读写 UTF-8 源文件。** 本机 `pwsh` 是 **Windows PowerShell 5.1**（ANSI 码页 936）：`Get-Content -Raw` / `Set-Content` 会让中文变乱码、吃掉换行、坏字节变 `?`，**不可逆**（本轮实测：`Get-Content .gitignore` 直接输出乱码，而文件本身没坏）。读用 `read` 工具或 `node -e "fs.readFileSync(p,'utf8')"`；写用 `write` / `edit`（自带版本护栏）。一次性实验脚本写成 `.mjs`/`.ts` 文件，**不要塞进 `node -e` 字符串**（反引号会被吞掉）。
+
+**1.2 [硬] 宿主半边不热重载，客户端半边热重载。** 实测：`insert` 行加进 profile 后**立刻**出现在 Loader 树里（`include:dsh-hooks`, `enabled:true`），但**运行中的进程不会激活它**；连 `plugin_manager set_plugin`（禁用→启用）也只是对**同一个模块实例**再 `apply()` 一次，不会从磁盘重新 import。所以改 `lib/index.js` / `src/host/**` 要**重启 DSH**；改 `lib/client.js` / `src/client/**` 构建后由客户端 HMR 替换（且只有在 `pnpm run dev:web` 也在跑时才免刷新）。唯一热的是 `hooks.json` 本身（watch 命中 < 1s，最坏 `POSITIVE_TTL_MS` 4s）。
+
+**1.3 [硬] 不要重启 DSH。** 当前会话就跑在它里面。需要宿主侧生效时**告知用户**，由用户决定。
+
+**1.4 [硬] 不擅自改 `~/.dsh/profiles/**`。** 本插件的接线是 `desktop/cordis.patch.yml` 末尾的 `- insert: - id: dsh-hooks / name: 'file:///D:/project/dsh-plugins/dsh-hooks/lib/index.js'`（"路径行"装载）。该文件是**活配置**，应用会并发写入。确需改动：① 备份到带时间戳 `.bak`；② 只用 `edit` 做**最小行级**改动；③ 用真实 YAML 解析器验证；④ 告知备份路径与回滚方式。**profile 原文（含明文凭据 / 真实网关地址）不得粘进仓库文件**（本 profile 里就有明文 token 与内网地址）。
+
+**1.5 [硬] 并发编辑按护栏重做。** `edit` 报 `file changed since it was read`、或写入报 `FS_STALE_VERSION` → **重新读取、基于新内容重做**；不要用整文件写入绕过护栏。
+
+**1.6 [硬] hook 子进程的权限来自调用会话，不许提权。** 每次 hook 都必须 `ctx.get('sandboxPolicy').resolve({session})` 并把结果透传进 `shell.resolve({..., sandboxPolicy})`（与 `dsh-tool-pwsh` 同构）。**只有这个返回值可以透传**；服务缺失 / 抛错就**省略该字段**回退部署策略（并打一条降级 warn）。代价：`read-only` 会话下 hook 照样写不了——这是对的，不是 bug。反面教材：v0.1.0 不透传，hook 按**部署**档跑（`workspaceRoot` = 宿主启动目录），所有落盘类 hook（格式化 / 自动修复 / 写日志）**静默**失效。
+
+**1.7 [硬] 只在 `.tmp/**` 下做一次性实验。** `.tmp/` 与 `*.log` 已 gitignore。实验产物、从 `app.asar` 解出来的第三方包、注入脚本一律不进版本库，**也绝不进 `lib/`**。
+
+**1.8 [硬] 不许把"读不到配置"当成"没有配置"。** 见 §2.9：这是本插件最危险的失效路径（写坏一个字符 → 全部 hook 含 deny 守卫静默消失）。C1 已修（三态 + last-good），**但改动这条语义必须同时有断言**——它是"安全默认值"级别的东西，不是普通行为。
+
+## 2. 代码与数据边界
+
+**2.1 [边界] 宿主半边零 import。** 判据是**裸模块说明符**（`@deepseek-ai/*` 都在 `app.asar` 里，从磁盘路径解析不到）；相对 import 由打包器内联、`import type` 被擦除，两者允许。→ eslint `HOST_BARE_IMPORT` + 产物断言（`lib/index.js` 里 `import` 与 `require` 计数都为 0）。宿主侧只用注入的 Service 与全局对象（`URL` / `Response` / `AbortController` / `crypto` / `process`）。
+
+**2.2 [边界] 客户端产物协议。** classic script（非 ESM），只向 `window.__ModuleLoader__.load` 注册 factory（**恰好一次**）；`id` == `package.json.name`（构建注入）；`require` 只取种子模块（`react`，经 `src/client/react.ts` 单点中转，产物里应当只有**一处** `require`）；`package.json` 必须有 `exports["./client"]`（指向真实文件）与 `dsh.client.platform === "web"`。**源码里不许手写 `window.__ModuleLoader__`**（wrapper 由 `tools/build.ts` 注入；eslint 禁）。
+
+**2.3 [边界] hooks.json 是我们自己的文件：写入只走 `ctx.fs.writeText()`，不用 `configEditor`。**
+- 绝不 `ctx.loader.create()/remove()`，也绝不碰 `ctx.configEditor`——那是 cordis 配置面，改了会压平用户手写的 `insert:` 分节（`dsh-mcp-manager` 的教训），而 hooks.json 根本不在那里。
+- `expected` **必须给**：存在用 `{kind:'replaceIfVersion', version}`，不存在用 `{kind:'createIfAbsent'}`。`writeText` 本身就是**原子替换**（临时文件 + rename），不需要另外找原子写库。
+- **未知键必须原样保留。** 现在 `.dsh/hooks.json` 第一行就是 `_comment`（活文档）；任何"解析→重建→写回"都必须证明除目标字段外**逐字段深比较相等**，否则**拒写并报错**（这是 `dsh-mcp-manager` 写盘前 `composeEntries` 断言的同构物）。
+- 缩进、行尾、结尾换行按**原文件探测**后保持；不带 BOM；不要因为一次编辑把整个文件重排（用户会看到整文件 diff）。
+- **客户端不许回传整份文件**：只发 `{file, op, event, groupIndex, hookIndex, patch}` 这样的定点操作，宿主读→改→写。回传整份 = 静默丢字段的老事故。
+
+**2.4 [边界] 源文保留优先于"重新序列化"。** 能用 `fs.editText(target, {oldString, newString, replaceAll:false}, {version})` 精确定位的那几个操作（改 `command` / `timeout` / `disabled`）就用它——它**只动那一段字节**。只有结构性操作（新增 / 删除 / 移动整条）才重建文档，且重建必须走 §2.3 的深比较断言。
+
+**2.5 [边界] 启停必须落在文件里，不许只存内存或私有状态文件。** 用 hook 对象上的 `disabled: true`（与 DSH loader 行的字段名一致）。只存 sidecar 状态会导致"UI 显示已停用、别的消费者照跑"。⚠️ **改这条之前先核对** `@deepseek-ai/dsh-hook-protocol` 是否拒绝未知字段；若拒绝，就把开关放到 group 层并同步 README。
+
+**2.6 [边界] 解析规则只有一份。** UI 展示的"生效配置"必须就是 hook 实际会跑的那一份：同一个 `parseHookConfig`、同一个 projectRoot 解析、同一个 `matcherDiagnostic`、同一份用户级+项目级合并。**禁止为页面另写一套解析器**（两套必然漂移，页面会"看起来配好了"而运行时不认）。
+
+**2.7 [边界] matcher 非法只跳过该 group，不整份拒绝；非 command handler 跳过并记入 `skipped`。** 这是刻意的取舍（一个笔误不该让全部 hook 失效），官方桥是整份拒绝。UI 校验必须调用同一个 `matcherDiagnostic`。
+
+**2.8 [边界] cwd 只能来自 session，拿不到就如实说。** 宿主侧**没有**"当前工作区"概念。事件时用 `agent.session.header.cwd`（`exec.agent` 缺失时退化到 `ctx.agents.currentInitiator()`，再没有才 `process.cwd()`）；UI 侧用 `sessionQuery.observeSession(sessionId)` 的 `header.cwd`（租约**读完即放**）。没有 sessionId 时 cwd 就是 `undefined`，**不要编造**成某个 workspace 路径。
+
+**2.9 [边界][硬] 「读不到」≠「没有」——三态语义，已修一半。**
+读取配置有三态：`absent`（ENOENT，合法的空配置）/ `ok`（解析成功 + 刷新 last-good）/ `error`（读到了但 JSON 非法、顶层不是对象、或 IO 失败）。
+- **C1 已实现（v0.2.1）**：`error` 时**继续沿用最近一次成功解析的配置**；同一条错误只 warn 一次（成功读取后计数重置）；每次沿用打一条限流 info。对应断言在 `tools/verify.mjs` 的 `fail-open` 区（4 条），并做过反向验证（把 `stale` 打回 `false` → 3 条精确报错）。**删除文件仍然是合法的清空**，不许 fail-safe 回旧配置。
+- 修之前的形态是危险的 fail-open：`error` 被折叠成"没有配置"，写坏一个字符就让**全部** hook（含 deny 守卫）静默消失，而且一直消失。历史取证见 `.tmp/hotreload-fix-plan.md`。
+- **C2 未实现**：用 `ctx.fs.stat()` 的 `version`（`dev:ino:size:mtimeNs:ctimeNs`）做**状态核对**，作为失效主通道（watcher 降为加速器、TTL 只做兜底）。注意 verify 的假 `ctx.fs.stat` 目前**不返回 `version`**（真实 `ctx.fs` 返回 `FsInfo.version`）——实现 C2 时要同时给假 fs 补 `version`，并覆盖"没有 version 的 provider 退化成 TTL"这一支。
+- **C3 未实现**：可观测性（payload 里加 `dsh_hooks: {config_path, config_version, loaded_at, reload_reason, last_error}`；可选旁路 journal）。宿主 logger 没有可发现的落盘位置（§6），所以这条对排查很重要。
+- **任何写入路径落地之前必须先有 C1**（已满足）**且 C2 落地**（UI 会让人更频繁地改这个文件）。
+
+**2.10 [边界] 试运行与真实运行共用同一条执行路径。** 只有 `signal` / timeout / 沙箱档位允许不同；payload 必须由**同一个** builder 产出。禁止另写"演示用"执行器——那必然出现"试运行通过、真实失败"。试运行也必须带上 §1.6 的会话沙箱策略。
+
+**2.11 [边界] 执行台账有界。** "最近执行"只存**固定容量环形缓冲**（每 session ~200 / 全局 ~500），`ctx.effect` 里清理；stdout/stderr 截断（字节上限）后再进快照。**不许**无界增长，也不许把 hook 的完整输出塞进 HTTP 响应。
+
+## 3. UI 纪律
+
+**3.1 [边界] 绝不硬编码颜色。** 深色主题下 `--dsw-alias-brand-primary` **近白色**，写 `#fff` 就是白底白字。十六进制只允许作 `var()` 的 fallback。状态色用 `--dsw-alias-state-*-primary`。
+
+**3.2 [边界] 视觉与尺寸进注入的样式表，绝不写 inline。** inline `background` 压过 `:hover`（按钮永远没有悬停反馈），inline `height` 压过样式表。唯一例外：圆点颜色（走 token）。注入必须**幂等且能刷新**：`<style id=...>` 已存在时**比较 textContent 并原地更新**（客户端半边会热替换，"存在就 return"会让新加的 CSS 永远不出现）。
+
+**3.3 [边界] 座位注册字段白名单里没有 `icon`。** 本轮核对 `dsh-client-ui-slots/lib/index.js` 的 `register()`：`entry.options` 逐字段展开，只有 `key/id/order/label/priority/select/inject/children/store/locale/registrant` 会被拷贝，**`icon` 被静默丢弃**；导航图标由官方 `navIcon(id)` 硬编码查表、未知 id 兜底成齿轮。**不要学 `dsh-mcp-manager` 的「打 data 属性 + CSS 覆盖」**——那依赖官方 DOM 结构，一改就静默失效（`dsh-skill-manager` 已明确否决）。本插件第一版就用兜底齿轮。
+**注意区分两个「icon」**：这里说的是**座位注册参数**；`package.json` 里的 **manifest 级 `icon`** 是另一套机制且**官方支持**（Plugin Manager 卡片 / bundle 详情 / 设置里的插件清单会读它，不需要激活插件）——见 §7。
+
+**3.4 [边界] 必须走 `slots.inject("settings.section", …)`，不能直接 `register`。** 该座位由官方 `settings-general` 声明；未声明的座位直接 register 会抛 `slot "..." is not declared`。
+
+**3.5 [边界] `order: 920`，唯一性约束在 `(id, priority)`。** 同一 list 座位里同 `(id, priority)` 重复注册会抛错（`list slot "..." already has an entry with id "..."`）。`order` 只保证排在 `mcp/900`、`skills/910` 之后，不保证"永远最后一个"。
+
+**3.6 [边界] 7 个事件分组永远全部渲染，含 0 条。** 「空」和「不存在」必须长得不一样，否则用户只能得出"这功能没做"——**他的判断没错，是界面在撒谎**。分组标签带条数；默认选中第一个非空分组。两个来源（项目级 / 用户级）同样永远都列，带条数。
+
+**3.7 [边界] 一条错误只允许一个渲染点。** 错误跟着来源走：表单内的错误由提交失败写入、渲染在表单内部；页面级错误由行内操作（启停 / 删除 / 试运行）失败写入、渲染在页面级。写入辅助函数的第三个参数就是"写进哪条通道"，**必须只写一条**。
+
+**3.8 [边界] 状态色必须有正面证据。** 每行的颜色只能来自**执行台账**（真实 `exitCode` / `decision` / `spawn-failed` / 超时）与 `disabled` 字段：无记录 = 灰「未运行」，**不许**因为"没报错"就报绿。这与 `dsh-mcp-manager` 的 3.10 是同一条纪律（那边被 `failOnStartupError:false` 骗过绿）。
+
+**3.9 [边界] 只读渲染不许"猜"。** 文件不存在 / JSON 非法 / 写入被沙箱拒绝 / matcher 非法，四种都要能**分别**说清，并且**不许把内部错误原文**（`FsError: cannot list …`）直接当文案。
+
+**3.10 [风格] mono 与 multiline 正交。** `mono` 只换等宽字体，`multiline` 换真 `<textarea>`；`command` 是两个都要（等宽多行），`timeout` 只要 mono。混用会把单行字段渲染成 56px 大框。
+
+**3.11 [风格] 表单面板靠底色分层，不加描边。** 卡：`.5px solid var(--dsw-alias-settings-card-stroke)` + `var(--dsw-alias-settings-card-fill)`；面板：无描边 + `var(--dsw-alias-bg-module-platform)`。加 `border` 会叠成"卡片套卡片"。
+
+**3.12 [风格] 自适应与外壳留白。** 每个可收缩的 flex 子项显式 `min-width:0`；长文本 `text-overflow:ellipsis`（长路径 `overflow-wrap:anywhere`）；操作区 `flex:none` 且不换行。外壳内容区**已经**有 `padding: 0 24px 24px`（`dsh-client-ui-settings-general` 的 `options` 类），**不要再垫一层**。
+
+## 4. 改代码与交付流程
+
+**4.1 先跑自检。** `node tools/verify.ts`：改动前 PASS、改动后 FAIL，才能证明是你的改动引起的。
+
+**4.2 每修一个 bug 同时加断言。** 台账只有一处：`tools/verify.ts` 的 `//#region` + 自检输出——**本文件不维护断言 ID，也不抄条数**（历史台账已经漂移过）。建议分区：`A` 包清单/座位/主题与 inline 纪律/零 import/产物协议；`B` 宿主行为（真子进程 + 真文件系统 + 假 ctx）；`C` 客户端协议（假 `window.__ModuleLoader__` 真跑 factory）；`D`/`D2` 真实渲染与挂载行为；`E` 共享常量 ↔ 出厂产物（含构建指纹）；`F` 纯函数直接单测；`P` 数据面（读 / 定点写 / 版本锁 / 深比较保留未知键 / 沙箱拒绝）。
+
+**4.3 新断言必须反向验证。** 注入违规 → 确认能**精确**报错 → 还原（用 `edit`，别用 PowerShell）。五个自欺陷阱：① 注入点让进程崩掉（看起来像"没报错"）→ 用 `if (false) …` 之类不执行的注入；② 注入锚点不唯一（先断锚点恰好命中 1 次，否则判该用例无效）；③ 断言里带恒真的「或」；④ 注入打错半边；⑤ **平凡通过的断言**（永不失败的断言比没有更糟）。
+
+**4.4 处理失败响应时先补空形状。** 路由失败返回 `{ok:false,error}`，**没有 `data`**；断言里直接解引用会在第一处崩掉，后面的断言全部来不及跑。取响应统一走一个 `getJson()`，`data` 缺失时补成文档里的空形状，让失败报成"实际 0 条"这类干净结果。
+
+**4.5 测交互时事件闭包是当次渲染的。** `onClick`/`onChange` 捕获的是那一次渲染的状态：状态变更后**必须重新 mount、重新查 DOM**，别拿旧节点去点。
+
+**4.6 改了 JSX 就延长渲染测试。** 假 React 的 `useState` 是**按 hook 顺序**位置发值的：`scene(...)` 的参数顺序就是组件的状态顺序，**新增一个状态必须同步补一位**（这是本仓库 `D`/`D2` 最大的维护陷阱）。
+
+**4.7 不要为了让断言通过而放宽断言。** 先判断是断言过严还是改动错了；改断言要说明理由并保留原有防护意图。**改断言之后要重新做反向验证**——锚点会随重构过期。
+
+**4.8 [硬] 迁移期纪律（`src/**` 与 `lib/**` 并存时）。**
+- 同一次提交里**不同时**手改 `lib/**` 和 `src/**`：`lib/**` 只能由 `pnpm build` 产出。
+- 每个阶段结束必须：`node tools/verify.ts` PASS（条数**不减少**）+ 无 BOM / 无 `U+FFFD` / LF。
+- **任何中间态都必须能被现有 profile 行加载**：`lib/index.js` 必须始终是可用的产物（先建 `src/host/index.ts` 并让构建输出与手写版行为一致，再删手写逻辑）。
+- 产物提交进版本库（`lib/**` 在 `.gitignore` 之外），并用两把锁守住：`lib/.build-manifest.json` 指纹 + `git diff --exit-code lib/`。
+
+## 5. 常用命令
+
+- **自检**：`node tools/verify.ts`（唯一必跑）。
+- **体检一份真实配置**（不跑测试）：`node tools/verify.ts --config "<path>/.dsh/hooks.json"`（迁移前 `verify.mjs`）—— 列出识别到的事件、每个 group 的 matcher/timeout、被跳过的非 command handler、matcher 诊断。**写完配置先跑这个**，比等重启看日志快。
+- **座位台账**：`cordis_inspect_query`（platform: client, provider: Slots, method: listSubTree, input `{"root":"settings.section"}`）。
+- **本插件 Loader 条目 / Service 契约**：`cordis_inspect_query`（host, provider: Service, method: listService，`input {"service":"fs"}` 这样只取一个服务的精确契约）比读源码快；条目 id 是 `include:dsh-hooks`。
+- **官方源码 / CSS / 契约**：源码在 `<安装目录>\resources\app.asar`（**是文件不是目录**）。`read` / glob / shell / `node` 都穿不过 asar 虚拟路径，要用**只读探针**（`.tmp/asar.mjs`：解析 asar 头按 offset 取文件；`list <regex>` / `cat <path>` / `top`）。**判据权威顺序**：本机安装的 DSH 源码 ＞ asar 内官方 README/practices ＞ 同目录成熟兄弟插件 ＞ 二手资料。
+  已核实的官方参考入口（都在 asar 里）：`@deepseek-ai/dsh-client-ui-primitives`、`@deepseek-ai/dsh-client-ui-slots`（座位白名单与注册语义）、`@deepseek-ai/dsh-client-ui-settings-general`（设置外壳 DOM/CSS 与 `settings.section` 渲染）、`@deepseek-ai/dsh-client-modules`（`dsh.client` 运行时校验器、`exports["./client"]` 解析）、以及插件开发参考 `cordis-plugin-development/references/{host-plugin,ui-plugin,practices}.md` 与 `templates/{mcp,decoration}/`。**读之前先 `list` 确认路径存在**——版本会变。
+- **看真实运行痕迹**：宿主 logger **没有**可发现的落盘位置；`lib/index.js` 的日志看不到。可用的观测面只有三处：① hook 自己的 stdout / deny reason（**首选**，跨平台、免疫沙箱）；② 会话日志 `session.v4.jsonl.zstd`（多帧 zstd，按 `28 b5 2f fd` 切帧，参考 `.tmp/zlog.mjs`）；③ `.debug` 模式的旁路 journal（见 `hotreload-fix-plan.md` C3，**未实现**）。
+- **权限**：官方明确 `plugin_manager` 每个 action（含 `list_plugins`）**需要审批**，`cordis_inspect_query` **不需要**——查证优先后者。
+
+## 6. 已知边界（不要试图"修好"）
+
+| 边界 | 说明 |
+|---|---|
+| 宿主半边不热重载 | §1.2：重启，或告知用户；`plugin_manager` 禁用→启用也**不重新 import 模块** |
+| **设置导航那一格**的图标不可由插件提供 | §3.3。上游支持 `icon` 注册参数后立刻改用它。别和 **manifest 级 `icon`** 混淆——那个是插件卡片图标，官方支持（§7） |
+| `order` 不保证"永远最后" | 920 只是大于 mcp/900、skills/910 |
+| **`readJson` fail-open** | §2.9。**C1 已修**（三态 + last-good + 错误去重告警，有断言与反向验证）；**C2 版本核对 / C3 可观测性仍未实现** |
+| 项目级 = 最近 `.git` 祖先 | 上游约束（与 `dsh-skill-filesystem` 同一约定），不支持 monorepo 子项目选择 |
+| 官方兼容桥是**进程级单配置** | `dsh-hooks-claude-code` / `dsh-hooks-codex` 的 `configPath` 启动只读一次，无法表达项目级；同时命中同一事件 = 同一个 hook 跑两遍 |
+| `args` 不被协议支持 | DSH 的 hook 协议只认 `command` 字符串 → 参数拼进 `command` |
+| Windows 上 `exit 2` 不可靠 | 本机 `ctx.shell` 是 **PowerShell 5.1**，`exit 2` 被折叠成 1 → 改用 `exit 0` + `{"hookSpecificOutput":{"permissionDecision":"deny",…}}` |
+| 只有 `command` handler | `http`/`mcp_tool`/`prompt`/`agent` 一律跳过并 warn |
+| `updatedInput` 只解析不生效 | 协议字段收下但 warn，不要对外承诺"能改写工具入参" |
+| `transcript_path` 恒为空串 | DSH 会话日志是 zstd 压缩的，shell 脚本读不了（与官方桥一致） |
+| 宿主日志基本不可看 | §5：靠自检 + 渲染测试兜住，不能靠"跑起来看看" |
+| TTL 是**兜底**不是时效保证 | `POSITIVE_TTL_MS` 4s / `NEGATIVE_TTL_MS` 2s 只是"允许重读"；单次事件点只解析一次 |
+| Stop 有 3 次上限 | 比官方桥多一道防线（官方无上限，会无限续跑），这是**有意**的偏离 |
+| `listTokens` 不是全表 | 只列需要 light/dark 双份覆写的 alias 子集；判断 token 是否存在以官方 CSS 用法为准 |
+| 客户端半边首次出现需要重启 | `@deepseek-ai/dsh-client-modules` 在启动时扫描 `exports["./client"]`；给已在运行的插件**新增**客户端半边，通常要重启一次 DSH 才发布 bundle |
+
+## 7. Git 与发布
+
+- 分支 `main`；远端 `origin` → `https://github.com/qq540491950/dsh-hooks.git`。
+- 提交信息中文：`feat|fix|docs: 一句话` + 空行 + 分节说明（接入点 / 数据面 / UI / 自检）；**写进 UTF-8 文件用 `git commit -F`**（不要 `-m` 直传中文，见 §1.1）。
+- **推送前扫密钥**：不得含真实 token / API key / 内网地址；`hooks.json` 示例里不写机器绝对路径（现在 `_comment` 与命令里就有 `D:\...`，示例要标注为"本机 demo"）。profile 原文一律不粘进仓库。
+- `.gitattributes` 强制 LF；不要引入 CRLF，也不要依赖 `core.autocrlf`（本机为 `true`，方向相反）。
+- `git push` 的 stderr 进度会被 PowerShell 记成错误并给出 `[exit code: 1]`——**假警报**，以 `git ls-remote origin refs/heads/main` 与 `git status -sb` 为准。
+- **装载路线二选一（必须在 README 里写明本包用哪条）**：
+  - **路线 1「路径行」（当前）**：profile 的 `- insert:` 直接指向 `lib/index.js` 的 `file://` 绝对路径；不需要 `dsh.bundle.patch`、不需要 pnpm / node_modules。客户端 bundle 仍由 `dsh-client-modules` 从本包 `package.json` 的 `exports["./client"]` 定位，由 Host 在 `/plugins` 下发布。
+  - **路线 2「bundle」**：`package.json` 声明 `dsh.bundle.patch: './cordis.patch.yml'`，由该 YAML 的 `- insert:` 行声明插件条目，走 `plugin_manager install_bundle`（官方要求：**不要**用 shell 命令复刻安装流程）。**两条路线是替代关系，不是互补字段**。走这条路要额外提交补丁文件与 `lib/**`（git 路线要求），且**替换已安装的包必须重启**才加载新的 JS 模块代。
+- **`dsh.client` 的确切 schema（官方运行时校验器为准）**：`{platform, inject?, external?, immediately?}`。
+  - `platform` **必填且必须是字符串**；只有 `platform === "web"` 才会发布客户端半边（其他值等同"没有客户端半边"）。
+  - `inject: string[]` 只用于**排序激活**（不是模块依赖）；`external: string[]` 声明**非基线**运行时 import（答案来自动态包行或静态表，且某一行不得声明自己的包）；`immediately: boolean`。
+  - **声明了 `dsh.client` 却没有 `exports["./client"]` 会直接抛错**；`exports["./client"]` 只接受字符串，或带字符串 `default` 的对象。bundle 文件按 `join(dirname(package.json), 相对路径)` 解析。
+  - 运行时 `require('@deepseek-ai/dsh-client-ui-*')` 等 Harness Client 包**被官方 practices 禁止**（这正是 eslint 要禁客户端运行时 import 的原因）。
+- **发布（尚未开始）**：`package.json` 现在是 `private: true` 且**没有** `scripts` / `license` / `files` / `engines` / `types` / `dsh` 字段。要发 npm 需要：包名（裸名 `dsh-hooks` 是否被占**未核实**）、`files` 白名单**不含** `src/`、`tools/`、`docs/`、`AGENTS.md`、`.tmp/`、`*.log`、`.dsh/`、`LICENSE` 与 `README.md` 必含、`exports["./package.json"]`、**恰好一个 peer**（`@deepseek-ai/cordis`，绝不 pin `@deepseek-ai/dsh-*`，否则 app-boot 会整包跳过）；若走路线 2 再加 `dsh.bundle.patch` 与 `exports["./cordis.patch.yml"]`。升级后宿主半边仍需重启。
+- **manifest 级展示元数据（可选但推荐）**：`icon` 是**相对 manifest 目录**的路径（SVG/PNG/JPEG/WebP，≤ 256 KiB；绝对路径、URL、越界符号链接被拒），与 `locale/en.json` + `locale/zh.json`（内容形如 `{"meta":{"title":…,"description":…}}`）一起被 Plugin Manager 卡片 / bundle 详情 / 设置里的插件清单读取，**不需要激活插件**。配套要加 `exports["./locale/*.json"]` 与 `files` 里的 `locale/*.json`、图标文件。缺失时回退到 `name`/`description` 与默认图。**这是"插件卡片图标"，与设置导航那一格的图标（§3.3，slot 注册给不了）是两回事。**
+- **安装契约双向核对**：`install_bundle` 也认绝对路径 / git / tarball；git 路线要求补丁文件与 `lib/**` **已提交**，且 bundle 判定发生在抓取之后（失败会回滚 profile）。
