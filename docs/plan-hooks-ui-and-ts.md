@@ -528,3 +528,13 @@ window.__ModuleLoader__.load({
 - 反向验证 3 个注入全部精确命中并还原：乐观锁传假版本、读不懂也照写、`capabilities.writable` 写死 false。
 - **自检又抓到一个"假件比真的弱"的问题**：`createFile` 在自检里 500，因为假 fs 不建父目录；而真实 provider 的 `writeFileAtomic` 里有 `mkdir(dirname, {recursive:true})`（已读 asar 源码核实）。修法是让假 fs 与真实同能力 —— 否则会出现"自检里假失败、真机没事"，反过来也可能掩盖真问题。
 - **未做（留给 P4d）**：有界执行台账（状态色的唯一证据来源）与试运行（复用 `runPoint`）。
+
+### P4d —— 完成（本次提交）：有界执行台账 + 可寻址视图
+
+- 产出：`src/host/ledger.ts`（`ExecutionLedger` 有界缓冲 + `latestRunFor` 匹配 + `truncateText`）；`runPoint` 每次执行记一条台账；快照新增**行级证据**与**可寻址信息**。
+- **可寻址（这是 P5/P6 的前置条件）**：`GroupView.file`/`rawIndex`、`HookView.rawIndex`；每个 `files[]` 各自带 7 个事件视图（`FileEventView`）—— 页面拿 `file + group.rawIndex + hook.rawIndex` 就能直接发定点写，不必从合并视图反推。合并视图（顶层 `events`）的 `file` 按合并顺序（用户级条数切一刀）标出来源；`staleInUse` 时给 `null`（来源无法确定）→ 页面据此**禁用编辑**，而不是猜一个文件写进去。
+- **台账（§2.11 + §3.8）**：全局 500 / 单会话 200（两个上限各自生效）、输出进台账前截断、fiber 释放时清空。快照里每条 hook 带 `lastRun`（真实的 `exitCode`/`decision`/耗时/输出），匹配条件是 **`event + command` 两者都要** —— 命令改过之后旧记录不再匹配，行退回"未运行"的灰色，**绝不会拿旧命令的结果给新命令画绿**；另给 `EventView.runCount` 用来解释"为什么这行是灰的"。
+- 断言：新增 `L` 区 1 条 + `P4` 区 2 条，107 → 110，全绿。其中最有价值的一条是**端到端寻址**：配置里第一个 group 的 matcher 非法（会被解析跳过），于是"保留下来的那个"在文件里是第 1 个 —— 断言 `rawIndex === 1`，然后**拿快照里的下标直接发 POST**，验证改到的是文件里第 1 个 group 且第 0 个一个字节没动。
+- 反向验证 3 个注入全部精确命中并还原：台账匹配忽略 command、台账不再封顶、**`rawIndex` 改用解析后的下标**（写操作会改错 hook —— 这条同时打红了两条断言）。
+- **过程中自检又抓到我自己的测试错误**：把"全局上限"和"单会话上限"混在同一次灌入里，于是先触到单会话上限（200 ≠ 500）。产品行为是对的，改的是测试。
+- **未做（留给 P4e / P6）**：试运行（复用 `runPoint`，不另写演示执行器）。

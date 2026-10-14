@@ -43,6 +43,8 @@ import {
 import { DEFAULT_TIMEOUT_MS, HOOK_EVENTS, NEGATIVE_TTL_MS, POSITIVE_TTL_MS } from '../src/shared/constants.ts'
 // 数据面：路由注册与**纯函数**快照构造都直接 import 源码，不需要挂载插件就能测。
 import { HOOKS_ROUTE, buildSnapshot, registerHooksRoute } from '../src/host/data-plane.ts'
+// 执行台账：有界缓冲与"最近一次真实执行"的匹配逻辑，纯逻辑直接单测。
+import { ExecutionLedger, MAX_GLOBAL, MAX_PER_SESSION, MAX_TEXT_CHARS, latestRunFor } from '../src/host/ledger.ts'
 // 写路径：定点操作、风格探测、保留性证明 —— 全是纯函数，直接单测。
 import {
   applyOp,
@@ -159,6 +161,7 @@ test('E：功能标记必须真的出现在产物里（源码存在 ≠ 已交�
   const markers = [
     '/api/hooks', // data-plane.ts：设置页路由
     '改写会动到目标之外的字段', // write.ts：写路径（接线之前它整块被 esbuild 丢掉了）
+    '已截断', // ledger.ts：执行台账（状态色的唯一证据来源）
   ]
   for (const marker of markers) {
     assert.ok(source.includes(marker), `产物里应当出现 ${marker} —— 检查它所在的模块是不是没被 import 进去`)
@@ -1726,6 +1729,7 @@ function emptyInspection(overrides = {}) {
     effective: {},
     staleInUse: false,
     writable: false,
+    ledger: [],
     ...overrides,
   }
 }
@@ -1998,6 +2002,153 @@ await test('P：handler 抛错 → 500 信封，且**没有 data**（错误契�
   assert.equal(body.detail, 'boom', '技术原文放 detail，页面主文案自己措辞')
   assert.equal(body.data, undefined, '失败响应不该有 data')
   assert.deepEqual(data.events, [], '补空形状之后仍然可断言，而不是崩在第一处解引用')
+})
+
+//#endregion
+
+//#region P4. 执行台账（状态色的唯一证据来源）+ 可寻址视图
+
+/** 造一条台账记录。 */
+function ledgerEntry(overrides = {}) {
+  return {
+    at: 1,
+    sessionId: 's1',
+    event: 'PreToolUse',
+    command: 'c',
+    exitCode: 0,
+    decision: 'pass',
+    durationMs: 1,
+    stdout: '',
+    stderr: '',
+    ...overrides,
+  }
+}
+
+test('L：台账有界（全局 500 / 单会话 200）、输出截断、匹配按 event+command', () => {
+  const global = new ExecutionLedger()
+  // 每条一个独立会话，避免单会话上限先起作用（两个上限是**各自**生效的，要分开验）。
+  for (let i = 0; i < MAX_GLOBAL + 200; i++) {
+    global.push(ledgerEntry({ at: i, sessionId: `s${i}`, command: `c${i}` }))
+  }
+  assert.equal(global.size, MAX_GLOBAL, '全局必须封顶')
+
+  const perSession = new ExecutionLedger()
+  for (let i = 0; i < MAX_PER_SESSION + 100; i++) perSession.push(ledgerEntry({ at: i, sessionId: 'only' }))
+  assert.equal(perSession.size, MAX_PER_SESSION, '单会话必须封顶')
+  assert.equal(
+    latestRunFor(perSession.entries(), 'PreToolUse', 'c').at,
+    MAX_PER_SESSION + 99,
+    '丢的是最旧的，留的是最新的',
+  )
+
+  const long = new ExecutionLedger()
+  long.push(ledgerEntry({ stdout: 'x'.repeat(MAX_TEXT_CHARS + 50) }))
+  const kept = long.entries()[0]
+  assert.ok(kept.stdout.length <= MAX_TEXT_CHARS + 40, '超长输出必须截断后才进快照（§2.11）')
+  assert.ok(kept.stdout.includes('已截断'), '截断要有明确标记，不是静默切掉')
+
+  const fresh = new ExecutionLedger()
+  fresh.push(ledgerEntry({ event: 'PreToolUse', command: 'old' }))
+  assert.equal(latestRunFor(fresh.entries(), 'PreToolUse', 'old').command, 'old')
+  assert.equal(latestRunFor(fresh.entries(), 'PreToolUse', 'new'), undefined, '命令改过 → 旧记录不匹配')
+  assert.equal(latestRunFor(fresh.entries(), 'Stop', 'old'), undefined, '事件不同也不匹配')
+})
+
+await test('P：行级状态来自真实执行；命令一改就回落到"未运行"（不许画旧状态）', async () => {
+  await withIsolatedHome(async () => {
+    const dir = await makeProject()
+    const s = await script(dir, 'run.cjs', 'process.exit(0)')
+    await writeHooks(dir, { hooks: { PreToolUse: [{ matcher: 'pwsh', hooks: [{ command: cmd(s) }] }] } })
+    const conn = makeConnection()
+    const { agent } = fakeAgent(dir)
+    const h = await mount({ connection: conn.connection, fs: makeFs({ version: true }), initiator: agent })
+
+    // 先跑一次真实子进程 → 台账里应当有正面证据
+    await h.listeners.get('tools/pre-execute')[0]({ name: 'pwsh', arguments: {}, callId: 'c', agent }, nextAllow)
+    const after = await callRoute(conn.routes[0])
+    const pre = after.data.events.find((event) => event.event === 'PreToolUse')
+    const row = pre.groups[0].hooks[0]
+    assert.equal(row.command, cmd(s))
+    assert.ok(row.lastRun !== null, '跑过一次就必须有记录 —— 状态色只能来自这里')
+    assert.equal(row.lastRun.exitCode, 0)
+    assert.equal(row.lastRun.decision, 'pass')
+    assert.equal(pre.runCount, 1)
+
+    // 改掉命令：旧记录不再匹配 → 行回落"未运行"
+    const changed = await postRoute(conn.routes[0], {
+      op: 'setHookCommand',
+      file: 'project',
+      event: 'PreToolUse',
+      groupIndex: 0,
+      hookIndex: 0,
+      command: 'echo other',
+    })
+    assert.equal(changed.status, 200)
+    const next = await callRoute(conn.routes[0])
+    const nextPre = next.data.events.find((event) => event.event === 'PreToolUse')
+    assert.equal(nextPre.groups[0].hooks[0].command, 'echo other')
+    assert.equal(
+      nextPre.groups[0].hooks[0].lastRun,
+      null,
+      '命令改过 → 退回灰色：拿旧命令的结果给新命令上色就是"界面在撒谎"',
+    )
+    assert.equal(nextPre.runCount, 1, '该事件跑过几次仍如实报告（解释"为什么这行是灰的"）')
+  })
+})
+
+await test('P：files[].events 是可寻址视图（file + rawIndex），下标直接能用来发写操作', async () => {
+  await withIsolatedHome(async () => {
+    const dir = await makeProject()
+    const projectFile = path.join(dir, '.dsh', 'hooks.json')
+    await writeHooks(dir, {
+      hooks: {
+        PreToolUse: [
+          // 这个 group 的 matcher 非法 → 解析会跳过它，所以"保留下来的那个"在文件里是第 1 个。
+          { matcher: '[bad', hooks: [{ command: 'skipped' }] },
+          { matcher: 'pwsh', hooks: [{ command: 'ok' }] },
+        ],
+      },
+    })
+    await fsp.writeFile(
+      path.join(process.env.DSH_HOME, 'hooks.json'),
+      JSON.stringify({ hooks: { PreToolUse: [{ hooks: [{ command: 'from-user' }] }] } }),
+      'utf8',
+    )
+    const conn = makeConnection()
+    const { agent } = fakeAgent(dir)
+    await mount({ connection: conn.connection, fs: makeFs({ version: true }), initiator: agent })
+
+    const { data } = await callRoute(conn.routes[0])
+    const project = data.files.find((file) => file.kind === 'project')
+    assert.equal(project.events.length, 7, '每个文件也各有 7 个事件视图（含 0 条）')
+    const pre = project.events.find((event) => event.event === 'PreToolUse')
+    assert.equal(pre.groups.length, 1, '非法 matcher 的 group 不在可寻址列表里（它不会跑）')
+    assert.equal(pre.groups[0].file, 'project')
+    assert.equal(pre.groups[0].rawIndex, 1, 'rawIndex 必须是**文件里的**下标，不是解析后的下标')
+    assert.equal(pre.groups[0].hooks[0].rawIndex, 0)
+
+    // 合并视图要能标出来源：用户级在前、项目级在后
+    const merged = data.events.find((event) => event.event === 'PreToolUse')
+    assert.deepEqual(
+      merged.groups.map((group) => group.file),
+      ['user', 'project'],
+      '生效视图必须标出每个 group 来自哪个文件（页面才知道该改哪一份）',
+    )
+
+    // 拿可寻址视图里的下标直接发写操作 → 必须落到文件里正确的那个 group
+    const response = await postRoute(conn.routes[0], {
+      op: 'setHookCommand',
+      file: 'project',
+      event: 'PreToolUse',
+      groupIndex: pre.groups[0].rawIndex,
+      hookIndex: pre.groups[0].hooks[0].rawIndex,
+      command: 'changed',
+    })
+    assert.equal(response.status, 200)
+    const onDisk = JSON.parse(fs.readFileSync(projectFile, 'utf8'))
+    assert.equal(onDisk.hooks.PreToolUse[1].hooks[0].command, 'changed', '必须落到文件里的第 1 个 group')
+    assert.equal(onDisk.hooks.PreToolUse[0].hooks[0].command, 'skipped', '被跳过的那个 group 一个字都不许改')
+  })
 })
 
 //#endregion

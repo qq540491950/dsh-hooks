@@ -15,8 +15,9 @@
 import { HOOK_EVENTS, DEFAULT_TIMEOUT_MS, type HookEvent } from '../shared/constants.ts'
 import { messageOf } from '../shared/guards.ts'
 import { matcherDiagnostic } from '../shared/protocol.ts'
-import type { ParsedGroups, SkippedHandler } from '../shared/types.ts'
-import { parseHooksRequest, type HooksRequest } from './write.ts'
+import type { ParsedGroup, ParsedGroups, SkippedHandler } from '../shared/types.ts'
+import { latestRunFor, type LedgerEntry } from './ledger.ts'
+import { parseHooksRequest, type FileKind, type HooksRequest } from './write.ts'
 
 /**
  * 本插件注册的浏览器路由。
@@ -69,6 +70,19 @@ export interface HooksInspection {
    * 而不是让用户点了没反应。
    */
   writable: boolean
+  /** 有界执行台账（§2.11）。**状态色的唯一证据来源**（§3.8）。 */
+  ledger: LedgerEntry[]
+}
+
+/** 最近一次**真实**执行的证据（每条都来自台账，绝不是"没报错"推出来的）。 */
+export interface RunView {
+  at: number
+  /** `null` = 子进程没起来（infra 失败），这本身也是正面证据。 */
+  exitCode: number | null
+  decision: string
+  durationMs: number
+  stdout: string
+  stderr: string
 }
 
 /** 单条 hook 的呈现。 */
@@ -80,10 +94,26 @@ export interface HookView {
   defaultTimeoutSec: number
   /** 文件里是否写了 `disabled: true`（停用）。runner 会跳过它。 */
   disabled: boolean
+  /** **文件里的真实下标** —— 页面发写操作时要原样回传（AGENTS §2.3）。 */
+  rawIndex: number
+  /**
+   * 最近一次真实执行；`null` = **没有记录**（页面显示灰"未运行"，**不许**报绿）。
+   *
+   * 注意：命令改过之后这里会变回 `null`（匹配条件是 event + command），
+   * 所以"旧记录"绝不会给新命令上色。
+   */
+  lastRun: RunView | null
 }
 
 /** 一个 group 的呈现。matcher 属于 group，command/timeout 属于 hook。 */
 export interface GroupView {
+  /**
+   * 这个 group 来自哪个文件。合并视图（顶层 `events`）里，`staleInUse` 时为 `null`
+   * （来源无法确定）→ 页面据此**禁用编辑**，而不是猜一个文件写进去。
+   */
+  file: FileKind | null
+  /** **文件里的真实下标**（该文件该事件数组中的位置）。 */
+  rawIndex: number
   matcher: string | null
   /** `matcher` 非法时该 group 不会运行 —— 页面必须能分别说清（AGENTS §3.9）。 */
   matcherOk: boolean
@@ -103,6 +133,17 @@ export interface EventView {
   /** 生效条数来自哪个来源（诊断"我改的用户级为什么不生效"）。 */
   fromProject: number
   fromUser: number
+  /** 台账里这个事件被真实执行过几次（解释"为什么每一行都是灰的"）。 */
+  runCount: number
+}
+
+/** 一个文件**自己**的事件视图：这是**可寻址**的那一份（页面拿 `file + rawIndex` 发写操作）。 */
+export interface FileEventView {
+  event: HookEvent
+  groups: GroupView[]
+  hookCount: number
+  disabledCount: number
+  runCount: number
 }
 
 /** 一个文件在 `/api/hooks` 响应里的呈现。 */
@@ -116,6 +157,13 @@ export interface FileView {
   hookCount: number
   skipped: SkippedHandler[]
   matcherErrors: string[]
+  /**
+   * 这个文件自己的 7 个事件视图（含 0 条）。
+   *
+   * 顶层 `events` 是**生效视图**（合并后、可能来自 last-good），而这里是**可寻址视图**：
+   * 页面要编辑哪一行，就用这里的 `file + group.rawIndex + hook.rawIndex` 去发定点操作。
+   */
+  events: FileEventView[]
 }
 
 /** `GET /api/hooks` 的 `data` 形状。 */
@@ -144,23 +192,42 @@ export interface HooksErrorBody {
   detail?: string
 }
 
-/** 把解析结果里的一个 group 折成可渲染形状。 */
-function groupViewOf(group: {
-  matcher?: string
-  hooks: Array<{ command: string; timeoutSec?: number; disabled?: boolean }>
-}): GroupView {
+/** 把解析结果里的一个 group 折成可渲染形状（含**文件下标**与最近执行证据）。 */
+function groupViewOf(
+  group: ParsedGroup,
+  options: { file: FileKind | null; event: HookEvent; ledger: LedgerEntry[] },
+): GroupView {
   const matcher = group.matcher ?? null
   const problem = matcherDiagnostic(matcher ?? undefined)
   return {
+    file: options.file,
+    rawIndex: group.rawIndex,
     matcher,
     matcherOk: problem === undefined,
     matcherProblem: problem ?? null,
-    hooks: group.hooks.map((hook) => ({
-      command: hook.command,
-      timeoutSec: hook.timeoutSec ?? null,
-      defaultTimeoutSec: DEFAULT_TIMEOUT_MS / 1000,
-      disabled: hook.disabled === true,
-    })),
+    hooks: group.hooks.map((hook) => {
+      // 匹配条件是 `event + command` **两者都要**：命令改过之后旧记录不再匹配 → 行退回"未运行"
+      // 的灰色，而不是拿**旧命令**的结果给新命令画绿（AGENTS §3.8）。
+      const record = latestRunFor(options.ledger, options.event, hook.command)
+      return {
+        rawIndex: hook.rawIndex,
+        command: hook.command,
+        timeoutSec: hook.timeoutSec ?? null,
+        defaultTimeoutSec: DEFAULT_TIMEOUT_MS / 1000,
+        disabled: hook.disabled === true,
+        lastRun:
+          record === undefined
+            ? null
+            : {
+                at: record.at,
+                exitCode: record.exitCode ?? null,
+                decision: record.decision,
+                durationMs: record.durationMs,
+                stdout: record.stdout,
+                stderr: record.stderr,
+              },
+      }
+    }),
   }
 }
 
@@ -177,21 +244,41 @@ function countsFor(groups: ParsedGroups, event: HookEvent): { hookCount: number;
   return { hookCount, disabledCount }
 }
 
+/** 台账里某个事件被真实执行过几次（用来解释"为什么每一行都是灰的"）。 */
+function runCountFor(ledger: LedgerEntry[], event: HookEvent): number {
+  let count = 0
+  for (const entry of ledger) if (entry.event === event) count++
+  return count
+}
+
 /**
  * 构造只读快照。**纯函数** —— 输入是宿主检视出来的事实，输出是页面的渲染模型。
  *
  * 不变式（都有断言）：
- *   - `events` **恒为 7 项**（含 0 条），顺序 = `HOOK_EVENTS`；
- *   - `files` **恒为 2 项**（项目级、用户级），含 `absent`；
- *   - `hookCount` 不含 `disabled`，停用单独计数（否则页面会把"已停用"显示成"在跑"）；
- *   - 绝不因为某个来源是 `error` 就把它的分组 **并进** 生效配置 —— 生效配置由宿主给
+ *   - 顶层 `events` **恒为 7 项**（含 0 条），顺序 = `HOOK_EVENTS`；它是**生效视图**（合并后）。
+ *   - 每个 `files[]` 也各带 7 个事件视图，那是**可寻址视图**：页面拿 `file + rawIndex` 去发写操作。
+ *   - `hookCount` 不含 `disabled`，停用单独计数（否则页面会把"已停用"显示成"在跑"）。
+ *   - 绝不因为某个来源是 `error` 就把它的分组**并进**生效配置 —— 生效配置由宿主给
  *     （可能是 last-good），页面只负责显示并标注 `staleInUse`。
  */
 export function buildSnapshot(inspection: HooksInspection): HooksSnapshot {
+  const ledger = inspection.ledger
+  const userSource = inspection.sources.find((source) => source.kind === 'user')
+
   const files: FileView[] = inspection.sources.map((source) => {
     let hookCount = 0
-    for (const event of HOOK_EVENTS)
-      hookCount += countsFor(source.groups, event).hookCount + countsFor(source.groups, event).disabledCount
+    const events: FileEventView[] = HOOK_EVENTS.map((event) => {
+      const parsed = source.groups[event] ?? []
+      const count = countsFor(source.groups, event)
+      hookCount += count.hookCount + count.disabledCount
+      return {
+        event,
+        groups: parsed.map((group) => groupViewOf(group, { file: source.kind, event, ledger })),
+        hookCount: count.hookCount,
+        disabledCount: count.disabledCount,
+        runCount: runCountFor(ledger, event),
+      }
+    })
     return {
       kind: source.kind,
       path: source.path,
@@ -201,6 +288,7 @@ export function buildSnapshot(inspection: HooksInspection): HooksSnapshot {
       hookCount,
       skipped: source.skipped,
       matcherErrors: source.matcherErrors,
+      events,
     }
   })
 
@@ -216,7 +304,17 @@ export function buildSnapshot(inspection: HooksInspection): HooksSnapshot {
       if (source.kind === 'user') fromUser += hits
       else fromProject += hits
     }
-    const groups = (inspection.effective[event] ?? []).map(groupViewOf)
+    // 生效视图的来源（合并顺序 = 用户级在前 + 项目级在后，所以按用户级条数切一刀就能定来源）。
+    // `staleInUse` 时生效配置来自 last-good，与磁盘上的来源对不上 → 给 `null`，
+    // 页面据此**禁用编辑**（它本来就是读不懂的状态），而不是猜一个文件出来。
+    const userCount = (userSource?.groups[event] ?? []).length
+    const groups = (inspection.effective[event] ?? []).map((group, index) =>
+      groupViewOf(group, {
+        file: inspection.staleInUse ? null : index < userCount ? 'user' : 'project',
+        event,
+        ledger,
+      }),
+    )
     totalHooks += count.hookCount
     totalDisabled += count.disabledCount
     totalGroups += groups.length
@@ -227,6 +325,7 @@ export function buildSnapshot(inspection: HooksInspection): HooksSnapshot {
       disabledCount: count.disabledCount,
       fromProject,
       fromUser,
+      runCount: runCountFor(ledger, event),
     }
   })
 

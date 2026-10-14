@@ -8,10 +8,11 @@
   "targets": [
     {
       "output": "lib/index.js",
-      "outputSha256": "e3c39387b6a161ccbb9524a9aabf14fb0bddaedd4ed748c547194f4492f83537",
+      "outputSha256": "ecd9be0f523f096b04fb394136fe6f19b337c516c855bd0fc25d88aad4529329",
       "inputs": {
-        "src/host/data-plane.ts": "796c881cc88b14182925a06f95ee8e41658d5a221296c6ca276212f1fb59be4b",
-        "src/host/index.ts": "019c964ef2dd4eed7609ec4ee09abbabf3468f8234779949cd662455274ce586",
+        "src/host/data-plane.ts": "cff3ab72435f103578bef4f8bd307278e64d15ef7d27f0763f4624ef40a2ea52",
+        "src/host/index.ts": "310bb5cba9aab048e9f24ef278423d0fd2de4ade86e70487870070aa82d123f9",
+        "src/host/ledger.ts": "55f55f2ead0abf01c52c03aff7d7b521119f47a0e99ab1edb3bfdf507de977d9",
         "src/host/service-types.ts": "cdd0a46d390347420a6f58355aa781c98ea387ab80590e4b3ccbda666a711eb7",
         "src/host/write.ts": "a49feab7d3c2d10ebdb547c58fca80ec2e7a606d278902400db376a3874683dd",
         "src/shared/constants.ts": "f1d90f50b407ff234cd1c790964bdee627837cacaf7adc72cc651078fe9c5840",

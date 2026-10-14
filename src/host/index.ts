@@ -89,6 +89,7 @@ import {
   starterText,
   type HooksRequest,
 } from './write.ts'
+import { ExecutionLedger } from './ledger.ts'
 
 /** 插件名。 */
 export const name = 'dsh-hooks'
@@ -225,6 +226,11 @@ export function apply(ctx: HostContext): void {
   const stopForced = new Map<string, number>()
   /** runId -> 子 agent */
   const subagentChildren = new Map<string, AgentLike>()
+  /**
+   * 有界执行台账（§2.11）：**状态色的唯一证据来源**（§3.8）。
+   * 全局 500 条 / 单会话 200 条；stdout/stderr 在进台账之前就截断。
+   */
+  const ledger = new ExecutionLedger()
 
   const watcherAbort = new AbortController()
   let disposed = false
@@ -232,6 +238,7 @@ export function apply(ctx: HostContext): void {
   ctx.effect(
     () => () => {
       disposed = true
+      ledger.clear()
       watcherAbort.abort(new Error('dsh-hooks disposed'))
       for (const close of watchers) {
         try {
@@ -708,6 +715,18 @@ export function apply(ctx: HostContext): void {
           output = parseHookOutput(undefined, '', messageOf(error), point)
         }
         const durationMs = Date.now() - started
+        // 记台账：这是"这一行现在是什么颜色"的**唯一**依据（§3.8）。记的是实际发生的事实。
+        ledger.push({
+          at: started,
+          sessionId: typeof payload.session_id === 'string' ? payload.session_id : '',
+          event: point,
+          command: hook.command,
+          exitCode: output.exitCode,
+          decision: output.decision ?? 'pass',
+          durationMs,
+          stdout: output.stdout,
+          stderr: output.stderr,
+        })
         info(
           `dsh-hooks: [${point}] ${JSON.stringify(hook.command)} exit=${
             output.exitCode === undefined ? 'spawn-failed' : output.exitCode
@@ -862,6 +881,7 @@ export function apply(ctx: HostContext): void {
         staleInUse: false,
         // 数据面本身就是"能写"的入口：路由注册了 POST，页面据此显示可编辑。
         writable: true,
+        ledger: ledger.entries(),
       }
     }
     const projectRoot = await projectRootFor(cwd)
@@ -879,6 +899,7 @@ export function apply(ctx: HostContext): void {
       effective: config.groups,
       staleInUse: projectCache.get(projectRoot)?.state.stale === true,
       writable: true,
+      ledger: ledger.entries(),
     }
   }
 

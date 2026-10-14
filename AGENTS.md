@@ -94,7 +94,9 @@
 
 **2.10 [边界] 试运行与真实运行共用同一条执行路径。** 只有 `signal` / timeout / 沙箱档位允许不同；payload 必须由**同一个** builder 产出。禁止另写"演示用"执行器——那必然出现"试运行通过、真实失败"。试运行也必须带上 §1.6 的会话沙箱策略。
 
-**2.11 [边界] 执行台账有界。** "最近执行"只存**固定容量环形缓冲**（每 session ~200 / 全局 ~500），`ctx.effect` 里清理；stdout/stderr 截断（字节上限）后再进快照。**不许**无界增长，也不许把 hook 的完整输出塞进 HTTP 响应。
+**2.11 [边界] 执行台账有界，且是状态色的唯一证据。** 见 `src/host/ledger.ts`（**已实现**）：全局 `MAX_GLOBAL` 500 条、单会话 `MAX_PER_SESSION` 200 条（两个上限**各自**生效：灌同一个会话时先触到单会话上限）；stdout/stderr 进台账前按 `MAX_TEXT_CHARS` 截断并留 `…（已截断 N 字符）` 标记。`ctx.effect` 清理时 `clear()`。
+**匹配规则是 `event + command` 两者都要**：命令改过之后旧记录不再匹配 → 行退回"未运行"的灰色。这就是 §3.8"缓存记录不能给不同 command 上色"的落地方式。
+寻址上还有一条：`GroupView.file` / `rawIndex` 与 `HookView.rawIndex` 是**文件里的真实下标**，页面必须原样回传；合并视图（顶层 `events`）在 `staleInUse` 时 `file` 为 `null`（来源无法确定）→ 页面据此**禁用编辑**，而不是猜一个文件写进去。
 
 **2.12 [边界] 设置页数据面只走 `ctx.connection.fetch.register()` 的精确路由。**
 选型论证在 [docs/design-notes.md](docs/design-notes.md) §1（含 7 条候选的否决理由）。落地纪律：
