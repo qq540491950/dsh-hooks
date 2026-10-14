@@ -22,7 +22,23 @@ import os from 'node:os'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 
-import { apply, inject, internals, name } from '../lib/index.js'
+// 宿主产物：跑真实的 lib/index.js（事件接线 + 配置读取 + 子进程执行）。
+import { apply, inject, name } from '../lib/index.js'
+// 纯协议层：**直接 import TS 源码**（Node ≥22.18 会剥类型），而不是经 lib/index.js 的
+// `internals` 转出来 —— 这样同一批断言直接压在迁移后的实现上，改错了立刻红。
+import {
+  blocksToText,
+  contextMessage,
+  matcherDiagnostic,
+  matchesMatcher,
+  mergeHookGroups,
+  mergeHookOutputs,
+  parentOf,
+  parseHookConfig,
+  parseHookOutput,
+  joinPath,
+} from '../src/shared/protocol.ts'
+import { DEFAULT_TIMEOUT_MS, NEGATIVE_TTL_MS, POSITIVE_TTL_MS } from '../src/shared/constants.ts'
 
 const HERE = path.dirname(fileURLToPath(import.meta.url))
 const LIB = path.join(HERE, '..', 'lib', 'index.js')
@@ -52,22 +68,6 @@ function test(title, fn) {
   return undefined
 }
 
-const {
-  parseHookConfig,
-  mergeHookGroups,
-  matchesMatcher,
-  matcherDiagnostic,
-  parseHookOutput,
-  mergeHookOutputs,
-  parentOf,
-  joinPath,
-  blocksToText,
-  contextMessage,
-  NEGATIVE_TTL_MS,
-  POSITIVE_TTL_MS,
-  DEFAULT_TIMEOUT_MS,
-} = internals
-
 const tmpRoots = []
 
 //#region 1. 静态检查
@@ -84,6 +84,21 @@ test('插件导出面正确', () => {
   assert.equal(name, 'dsh-hooks')
   assert.deepEqual(inject, ['shell', 'fs'])
   assert.equal(typeof apply, 'function')
+})
+
+test('A：format/format:check 的 glob 指向真实存在的目录（空 glob 不再静默）', () => {
+  // P2 记账：当时 src/ 还不存在，prettier 对空 glob 直接退出码 2，于是给两个脚本加了
+  // --no-error-on-unmatched-pattern —— 代价是"glob 写错"不再报错。这条断言把那份保护补回来。
+  const pkg = JSON.parse(fs.readFileSync(path.join(HERE, '..', 'package.json'), 'utf8'))
+  const root = path.join(HERE, '..')
+  for (const name of ['format', 'format:check']) {
+    const script = pkg.scripts[name]
+    assert.ok(typeof script === 'string' && script.startsWith('prettier'), `${name} 应当是 prettier 脚本`)
+    for (const dir of ['src', 'tools']) {
+      assert.ok(script.includes(`${dir}/**`), `${name} 应当覆盖 ${dir}/**（当前：${script}）`)
+      assert.ok(fs.existsSync(path.join(root, dir)), `${name} 覆盖的目录 ${dir}/ 必须真实存在`)
+    }
+  }
 })
 
 //#endregion
@@ -355,6 +370,163 @@ test('helper：contextMessage 形状对齐 createUserMessage', () => {
     { type: 'text', text: 'y' },
   ])
   assert.ok(message.source && typeof message.source.kind === 'string')
+})
+
+//#endregion
+
+//#region 2b. 差分对拍：TS 协议层 ↔ lib/index.js 的 internals（**迁移期专用**）
+//
+// 为什么需要它：2 区的单测只覆盖"想到的那些例子"。迁移期间两份实现同时存在，
+// 用一批更宽的输入对拍，任何一边漂移都会立刻红。
+// **P3b 之后（lib/index.js 变成构建产物、internals 被删除）本区应当整体删除。**
+const { internals } = await import('../lib/index.js')
+
+/** 递归按键排序，使比较只看语义、不看键的书写顺序。 */
+function canon(value) {
+  if (Array.isArray(value)) return value.map(canon)
+  if (value !== null && typeof value === 'object') {
+    const out = {}
+    for (const key of Object.keys(value).sort()) out[key] = canon(value[key])
+    return out
+  }
+  return value
+}
+
+const sameAsLegacy = (label, produce, legacyProduce) => {
+  const next = JSON.stringify(canon(produce()))
+  const legacy = JSON.stringify(canon(legacyProduce()))
+  assert.equal(next, legacy, `${label}：TS 实现与旧实现结果不一致`)
+}
+
+const DIFF_CONFIGS = [
+  { hooks: { PreToolUse: [{ matcher: 'pwsh', hooks: [{ command: 'a' }] }] } },
+  { PreToolUse: [{ hooks: [{ command: 'b', timeout: 30 }] }] },
+  { hooks: { PreToolUse: [{ hooks: [{ type: 'http', command: 'x' }, { command: 'c' }] }] } },
+  { hooks: { PreToolUse: [{ matcher: '(', hooks: [{ command: 'd' }] }] } },
+  { hooks: { Stop: [{ matcher: 'pwsh', hooks: [{ command: 'e' }] }] } },
+  { hooks: { UserPromptSubmit: [{ matcher: 'pwsh', hooks: [{ command: 'f' }] }] } },
+  { hooks: { PreToolUse: [{ hooks: [{ command: '${DSH_PROJECT_DIR}/x' }] }] } },
+  { hooks: { PostToolUse: [{ hooks: [{ command: 'g', timeout: 0 }] }] } },
+  { hooks: null },
+  null,
+  42,
+  [],
+  'text',
+  { hooks: { Notification: [{ hooks: [{ command: 'h' }] }] } },
+]
+
+const DIFF_MATCHERS = [undefined, '', '*', 'pwsh|bash', '^mcp__.*', '(', 'Edit']
+const DIFF_QUERIES = ['pwsh', 'Bash', 'mcp__github__x', 'EditText', '']
+const DIFF_OUTPUTS = [
+  { exitCode: 0, stdout: '{"continue":false,"stopReason":"r"}', stderr: '' },
+  { exitCode: 2, stdout: '', stderr: 'boom' },
+  { exitCode: 2, stdout: '', stderr: '   ' },
+  { exitCode: 0, stdout: 'not json', stderr: '' },
+  { exitCode: 0, stdout: '{"decision":"deny","reason":"only approve|block"}', stderr: '' },
+  {
+    exitCode: 0,
+    stdout: '{"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"ask","permissionDecisionReason":"sure?"}}',
+    stderr: '',
+  },
+  { exitCode: 0, stdout: '{"hookSpecificOutput":{"hookEventName":"PostToolUse","permissionDecision":"deny"}}', stderr: '' },
+  { exitCode: undefined, stdout: undefined, stderr: undefined },
+  { exitCode: 0, stdout: '{"systemMessage":"sys","additionalContext":"ctx"}', stderr: '' },
+]
+
+await test('差分：parseHookConfig 与旧实现逐例一致', () => {
+  for (const raw of DIFF_CONFIGS) {
+    sameAsLegacy(
+      `parseHookConfig(${JSON.stringify(raw)})`,
+      () => parseHookConfig(raw, { projectDir: 'D:/p' }),
+      () => internals.parseHookConfig(raw, { projectDir: 'D:/p' }),
+    )
+  }
+})
+
+await test('差分：matcher 判定与诊断逐例一致', () => {
+  for (const matcher of DIFF_MATCHERS) {
+    sameAsLegacy(
+      `matcherDiagnostic(${JSON.stringify(matcher)})`,
+      () => matcherDiagnostic(matcher),
+      () => internals.matcherDiagnostic(matcher),
+    )
+    for (const query of DIFF_QUERIES) {
+      sameAsLegacy(
+        `matchesMatcher(${JSON.stringify(matcher)}, ${JSON.stringify(query)})`,
+        () => matchesMatcher(matcher, query),
+        () => internals.matchesMatcher(matcher, query),
+      )
+    }
+  }
+})
+
+await test('差分：mergeHookGroups 逐例一致', () => {
+  const user = parseHookConfig({ hooks: { PreToolUse: [{ hooks: [{ command: 'u' }] }] } })
+  const project = parseHookConfig({ hooks: { PreToolUse: [{ hooks: [{ command: 'p' }] }], Stop: [] } })
+  sameAsLegacy(
+    'mergeHookGroups',
+    () => mergeHookGroups(user.groups, project.groups),
+    () => internals.mergeHookGroups(user.groups, project.groups),
+  )
+})
+
+await test('差分：输出解码与合并逐例一致', () => {
+  for (const item of DIFF_OUTPUTS) {
+    for (const expectedEventName of [undefined, 'PreToolUse']) {
+      sameAsLegacy(
+        `parseHookOutput(${String(item.exitCode)}, …, ${String(expectedEventName)})`,
+        () => parseHookOutput(item.exitCode, item.stdout, item.stderr, expectedEventName),
+        () => internals.parseHookOutput(item.exitCode, item.stdout, item.stderr, expectedEventName),
+      )
+    }
+  }
+  const decoded = DIFF_OUTPUTS.map((item) => parseHookOutput(item.exitCode, item.stdout, item.stderr, 'PreToolUse'))
+  // ⚠️ 逐条单元素对拍是**必须的**：如果只对拍整个数组，rank 最高的那一项会掩盖其它分支
+  // （第一版就是这么写的 —— deny 项让 rank=2 的 ask 分支永远走不到，注入漂移都抓不住）。
+  for (let index = 0; index < decoded.length; index++) {
+    const single = decoded[index]
+    sameAsLegacy(
+      `mergeHookOutputs([${String(index)}])`,
+      () => mergeHookOutputs([single]),
+      () => internals.mergeHookOutputs([single]),
+    )
+  }
+  sameAsLegacy(
+    'mergeHookOutputs(all)',
+    () => mergeHookOutputs(decoded),
+    () => internals.mergeHookOutputs(decoded),
+  )
+})
+
+await test('差分：路径与文本 helper 逐例一致', () => {
+  const paths = ['/a/b/c', 'C:\\x\\y\\z', 'C:\\', '/', '/a.txt', 'relative', 'C:\\x\\y\\']
+  for (const p of paths) {
+    sameAsLegacy(`parentOf(${p})`, () => parentOf(p), () => internals.parentOf(p))
+    sameAsLegacy(
+      `joinPath(${p})`,
+      () => joinPath(p, '.dsh', 'hooks.json'),
+      () => internals.joinPath(p, '.dsh', 'hooks.json'),
+    )
+  }
+  for (const content of [undefined, null, 'text', [], [{ type: 'text', text: 'a' }, { type: 'image' }], [{}]]) {
+    sameAsLegacy(
+      `blocksToText(${JSON.stringify(content)})`,
+      () => blocksToText(content),
+      () => internals.blocksToText(content),
+    )
+  }
+  const merged = { decision: 'deny', reason: 'r', stop: false, additionalContext: ['x', 'y'], systemMessages: [] }
+  sameAsLegacy(
+    'contextMessage',
+    () => {
+      const message = contextMessage(merged)
+      return message === undefined ? undefined : { ...message, id: '(id)' }
+    },
+    () => {
+      const message = internals.contextMessage(merged)
+      return message === undefined ? undefined : { ...message, id: '(id)' }
+    },
+  )
 })
 
 //#endregion

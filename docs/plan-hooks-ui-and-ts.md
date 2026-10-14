@@ -474,6 +474,18 @@ window.__ModuleLoader__.load({
   2. `pnpm check` 目前**不含 typecheck**（此时没有任何 `src/`，`tsc -b` 必然 TS18003）。**P3 落地后立刻把 `pnpm typecheck && pnpm typecheck:tools` 加回 `check`**。
 - **未实测**：typecheck 门本身（无输入）；eslint 的类型感知规则（无 `src/` 文件，`pnpm lint` 现在是"全部被 ignore → 0 文件"的通过）。
 
+### P3a —— 完成（本次提交）：纯协议层 TS 化 + 等价性证明
+
+- 产出：`src/shared/constants.ts`、`src/shared/types.ts`、`src/shared/guards.ts`、`src/shared/protocol.ts`（严格类型；`tsc -p tsconfig.host.json` 与 `tsc -p tsconfig.client.json` **两个视角都干净** —— 这一点同时验证了"shared 不许碰 DOM / 不许碰 process"）。
+- **等价性证明（这是本阶段的核心）**：`tools/verify.mjs` 的纯函数测试与新增的 `2b 差分对拍` 区**直接 `import` TS 源码**（Node ≥22.18 剥类型），并在迁移期与 `lib/index.js` 的 `internals` **逐例对拍**（递归按键排序后比较，只看语义不看键序）。自检 68 → **74 条**，全绿。
+- 反向验证（两个真实语义漂移）：
+  1. `decisionForRank(2)` 从 `ask` 改成 `allow` → 期望被差分抓到；
+  2. `matchesMatcher` 的字面量多选退化成全匹配 → 期望被差分抓到。
+  **两个方向都抓到了。** 但第一轮暴露了差分 harness 自身的一个缺陷：合并用例只对拍**整个数组**时，rank 最高的 `deny` 项把 `ask` 分支彻底掩盖 → 改注入也抓不住（正是 AGENTS 4.3 的第五个陷阱"平凡通过的断言"）。修成"**逐条单元素 + 整数组**"两轮对拍后两个注入都被抓住，注释里记了这个坑。
+- 判据调整：AGENTS §0 的"源码/产物"判据从"`src/` 是否存在"改成"**`lib/.build-manifest.json` 是否存在**"。理由：P3a 之后 `src/` 已存在但宿主体还在 `lib/index.js` 里，只看目录会误判成"lib 是产物"。
+- 关闭 P2 债务：新增断言"A：format/format:check 的 glob 指向真实存在的目录"。
+- **本阶段未做（留给 P3b）**：宿主体仍手写在 `lib/index.js`；`internals` 这个只为自检存在的导出还不能删（差分对拍要靠它）；`tools/build.ts` 未落地；自检仍是 `tools/verify.mjs`。
+
 ### 下一步
 
-P2（TS 工具链配置 + `pnpm install`）→ P3（协议层搬 TS + `tools/build.ts` + verify 迁移）。**P5 才需要第一次重启**（客户端半边首次发布），宿主侧的在线验收可以在那时合并做一次。
+**P3b**：把宿主体搬进 `src/host/**` + 落地 `tools/build.ts`，让 `lib/index.js` 变成产物（届时删掉 `internals` 与 `2b 差分对拍` 区、`verify.mjs` → `verify.ts`）。**P5 才需要第一次重启**（客户端半边首次发布），宿主侧的在线验收可以在那时合并做一次。

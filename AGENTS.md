@@ -15,10 +15,13 @@
 
 合并语义：**用户级在前、项目级在后**，同事件数组拼接；**顺序即执行顺序**。支持 7 个事件（`SessionStart / UserPromptSubmit / PreToolUse / PostToolUse / Stop / SubagentStart / SubagentStop`），**只跑 `type: "command"`**。
 
-**源码与产物（判据）**：
+**源码与产物（判据：看 `lib/.build-manifest.json`）**：
 
-- `src/` 存在 → **源码在 `src/**`（TS），`lib/**` 是构建产物，不要直接编辑**。
-- `src/` 不存在 → 迁移尚未落地，`lib/index.js` 就是源码，本文件对它同样生效（尤其 §2.1 零 import）。
+- **有** `lib/.build-manifest.json` → **源码在 `src/**`（TS），`lib/**` 是构建产物，不要直接编辑**。
+- **没有**该文件 → 迁移尚未落地，`lib/index.js` 就是手写源码，本文件对它同样生效（尤其 §2.1 零 import）。
+
+> 用"构建指纹存在"而不是"`src/` 目录存在"作判据：迁移期间 `src/shared/**` 会先落地而宿主体还在
+> `lib/index.js` 里，只看目录会误判成"lib 是产物"。指纹由 `tools/build.ts` 产出，语义唯一。
 
 | 半边 | 源码 | 产物 | 职责 |
 |---|---|---|---|
