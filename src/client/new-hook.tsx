@@ -112,16 +112,18 @@ export function NewHookForm(props: {
         </div>
       )}
       <div className="dsh-hooks__newfield">
+        {/* 提交是**填充**按钮（这一屏唯一的主动作）；取消是 ghost —— 内容区不许出现描边按钮
+            （描边只允许在工具条，见 styles.ts 的纪律注释与 D 区的计数断言）。 */}
         <button
           type="button"
-          className="dsh-hooks__btn"
+          className="dsh-hooks__btn dsh-hooks__btn--primary"
           title="创建"
           disabled={busy || !writable || draft.command.trim() === ''}
           onClick={props.onSubmit}
         >
           创建
         </button>
-        <button type="button" className="dsh-hooks__btn" disabled={busy} onClick={props.onCancel}>
+        <button type="button" className="dsh-hooks__btn dsh-hooks__btn--ghost" disabled={busy} onClick={props.onCancel}>
           取消
         </button>
       </div>

@@ -42,6 +42,24 @@ export function scopeQuery(scope: ScopeValue): string {
   return `?scope=workspace&workspaceId=${encodeURIComponent(scope)}`
 }
 
+/**
+ * `sessionId` 的 query 片段（空串 = 不带）。
+ *
+ * 为什么必须带：**设置页拿不到"当前会话"**，宿主侧只能退回 `currentInitiator()` —— 而设置页里
+ * 它取不到，于是整页"当前会话未知"：项目根解析不出来、`scope=current` 不可用、
+ * 「当前会话生效 N 条」也没意义。会话 id 由 root kit 的 `useSessions` 交给页面（见 `section.tsx`）。
+ */
+export function sessionQuery(sessionId: string | undefined): string {
+  return sessionId === undefined || sessionId === '' ? '' : `?sessionId=${encodeURIComponent(sessionId)}`
+}
+
+/** `GET /api/hooks` 的完整相对路径：**作用域 + 会话**两件事都要定点（缺一个页面就在撒谎）。 */
+export function snapshotPath(scope: ScopeValue, sessionId: string | undefined): string {
+  const scopePart = scopeQuery(scope).slice(1)
+  const sessionPart = sessionQuery(sessionId).slice(1)
+  return `${HOOKS_ROUTE}?${[scopePart, sessionPart].filter((part) => part !== '').join('&')}`
+}
+
 /** 一次写操作的**意图**（不含 `file`：那一项由作用域决定，见 `intentFor`）。 */
 export type WriteOp =
   | { op: 'createFile' }
@@ -88,7 +106,9 @@ export function writeErrorSentence(error: string): string {
     case 'stale':
       return '这个文件刚被别处改过了，页面上的内容已经不是最新的。请刷新后再改。'
     case 'invalid-json':
-      return '文件现在读不出来（内容不是合法 JSON）。为避免覆盖你的内容，这次**没有写入**，请先手工修好文件。'
+      // ⚠️ 文案里**不许**出现 markdown 语法（真机截图上 `**…**` 被原样渲染出来了）——
+      // 自检的渲染护栏会把任何文本节点里的星号对/反引号/井号判红。
+      return '文件现在读不出来（内容不是合法 JSON）。为避免覆盖你的内容，这次没有写入，请先手工修好文件。'
     case 'not-preservable':
       return '这次改动会动到目标以外的字段。为避免破坏文件，已拒绝写入。'
     case 'sandbox':
@@ -117,10 +137,20 @@ export function writeErrorSentence(error: string): string {
   }
 }
 
-/** 发一次写请求。`signal` 用于组件卸载/超时中断。 */
-export async function requestWrite(intent: WriteIntent, signal?: AbortSignal): Promise<WriteOutcome> {
+/**
+ * 发一次写请求。
+ *
+ * `sessionId` 也走 **query**（宿主从 URL 取它，见 `data-plane.ts` 的 `sessionIdOf`）——
+ * 宿主据此解析调用会话的 cwd 与沙箱策略；不带时它会退回"当前发起者"，设置页里常常取不到。
+ * `signal` 用于组件卸载/超时中断。
+ */
+export async function requestWrite(
+  intent: WriteIntent,
+  sessionId: string | undefined,
+  signal?: AbortSignal,
+): Promise<WriteOutcome> {
   try {
-    const response = await fetch(HOOKS_ROUTE, {
+    const response = await fetch(`${HOOKS_ROUTE}${sessionQuery(sessionId)}`, {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
       // 鉴权是 host-only 的同源 cookie（官方 connection 层管），带上同源凭据即可。
@@ -179,9 +209,13 @@ export interface DryRunResult {
  * **不是写操作**：它不碰文件，也**不进执行台账**（§3.8 —— 一次预演不该把那一行画绿），
  * 所以它走独立的响应形状，不套用 `WriteOutcome`。
  */
-export async function requestDryRun(intent: DryRunIntent, signal?: AbortSignal): Promise<DryRunResult> {
+export async function requestDryRun(
+  intent: DryRunIntent,
+  sessionId: string | undefined,
+  signal?: AbortSignal,
+): Promise<DryRunResult> {
   try {
-    const response = await fetch(HOOKS_ROUTE, {
+    const response = await fetch(`${HOOKS_ROUTE}${sessionQuery(sessionId)}`, {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
       credentials: 'same-origin',
