@@ -11,26 +11,62 @@
 import { HOOKS_ROUTE } from '../shared/constants.ts'
 import type { HooksWriteResponse } from './wire.ts'
 
-/** 一次写操作的意图（字段与宿主 `write.ts` 的 `HooksRequest` 一一对应）。 */
-export interface WriteIntent {
-  file: 'project' | 'user'
-  op:
-    | 'setHookCommand'
-    | 'setHookTimeout'
-    | 'setHookDisabled'
-    | 'setGroupMatcher'
-    | 'addHook'
-    | 'removeHook'
-    | 'moveHook'
-    | 'removeGroup'
-    | 'createFile'
-  event?: string
-  groupIndex?: number
-  hookIndex?: number
-  command?: string
-  timeoutSec?: number | null
-  disabled?: boolean
-  matcher?: string
+/**
+ * 作用域的取值：`'user'`、`'current'`（**当前会话的项目**）或**工作区 id**。
+ *
+ * `'current'` 是刻意保留的第三种值：会话所在的项目**不一定**在 `workspaceRegistry` 清单里
+ * （本机正在开发的插件项目就是这样）。它由宿主按"会话 cwd → 最近 `.git` 祖先"解析 —— 与旧页面
+ * 的语义完全一致，而且**不能**伪装成一个工作区 id（伪装了宿主只会回 404）。
+ */
+export type ScopeValue = string
+
+/** 作用域取值：当前会话的项目（宿主按会话 cwd 解析，不涉及工作区清单）。 */
+export const CURRENT_SCOPE = 'current'
+
+/** 作用域 → 请求体的定位字段。**这是唯一的构造点**（§2.2：禁止各调用点自己拼）。 */
+export function scopeTargetOf(scope: ScopeValue): { file: 'project' | 'user'; workspaceId?: string } {
+  if (scope === 'user') return { file: 'user' }
+  // `'current'` **必须不带** `workspaceId`：带上就等于谎称"它是某个工作区"，宿主会照白名单去查
+  // → `unknown-workspace`（404）。不带时宿主按会话 cwd 解析（就是旧页面的语义）。
+  if (scope === CURRENT_SCOPE) return { file: 'project' }
+  return { file: 'project', workspaceId: scope }
+}
+
+/**
+ * `GET /api/hooks` 的 query（读也必须定点到作用域，否则页面看的是"当前会话的项目"，
+ * 而写的是选中的那个工作区 —— 那就是另一条"看着 A 改到 B"的路）。
+ */
+export function scopeQuery(scope: ScopeValue): string {
+  if (scope === 'user') return '?scope=user'
+  if (scope === CURRENT_SCOPE) return '?scope=current'
+  return `?scope=workspace&workspaceId=${encodeURIComponent(scope)}`
+}
+
+/** 一次写操作的**意图**（不含 `file`：那一项由作用域决定，见 `intentFor`）。 */
+export type WriteOp =
+  | { op: 'createFile' }
+  | { op: 'setHookDisabled'; event: string; groupIndex: number; hookIndex: number; disabled: boolean }
+  | { op: 'setHookCommand'; event: string; groupIndex: number; hookIndex: number; command: string }
+  | { op: 'setHookTimeout'; event: string; groupIndex: number; hookIndex: number; timeoutSec: number | null }
+  | { op: 'setGroupMatcher'; event: string; groupIndex: number; matcher: string | null }
+  | { op: 'addHook'; event: string; groupIndex: number; command: string; timeoutSec: number | null }
+  | { op: 'addGroup'; event: string; matcher: string | null; command: string; timeoutSec: number | null }
+  | { op: 'removeHook'; event: string; groupIndex: number; hookIndex: number }
+  | { op: 'moveHook'; event: string; groupIndex: number; hookIndex: number; direction: -1 | 1 }
+  | { op: 'removeGroup'; event: string; groupIndex: number }
+
+/** 真正发出去的请求体（字段与宿主 `write.ts` 的 `HooksRequest` 一一对应）。 */
+export type WriteIntent = WriteOp & { file: 'project' | 'user'; workspaceId?: string }
+
+/**
+ * **唯一**的请求体构造函数：`(作用域, 操作) → WriteIntent`。
+ *
+ * 为什么必须是函数而不是"各调用点自己写 file/workspaceId"：只要有一个调用点忘了带
+ * `workspaceId`，宿主就会按**会话 cwd** 落笔 —— 页面看着 A 项目、改到 B 项目，而且是静默的
+ * （§2.2 里最重的一条）。收成一个构造点之后，"选中工作区却没带 id"在结构上不可能发生。
+ */
+export function intentFor(scope: ScopeValue, op: WriteOp): WriteIntent {
+  return { ...scopeTargetOf(scope), ...op }
 }
 
 /** 写请求的结果（永不抛，所以调用方只需判 `ok`）。 */
@@ -65,8 +101,15 @@ export function writeErrorSentence(error: string): string {
       return '要改的那一条已经不在了（文件可能刚被改过），请刷新。'
     case 'bad-op':
       return '这次请求不合法（界面与宿主的版本可能不一致）。'
+    case 'bad-timeout':
+      // 纯前端校验：还没发请求就被拦下了（表单内错误通道，§3.7）。
+      return '超时必须是正数秒；留空就用默认 600s。'
     case 'no-project':
       return '无法确定当前项目，所以不能写项目级配置。'
+    case 'unknown-workspace':
+      return '这个工作区已经不在宿主的清单里了（可能被删过），请刷新页面后重试。'
+    case 'no-workspace-registry':
+      return '宿主没有提供工作区清单，只能改当前项目和用户级配置。'
     case 'network':
       return '连不上宿主，写入没有发生。'
     default:
@@ -98,11 +141,17 @@ export async function requestWrite(intent: WriteIntent, signal?: AbortSignal): P
 }
 
 /** 试运行要改哪一条（**文件 + 事件 + 两个文件下标**，与写操作同一套寻址）。 */
-export interface DryRunIntent {
+export type DryRunIntent = { event: string; groupIndex: number; hookIndex: number } & {
   file: 'project' | 'user'
-  event: string
-  groupIndex: number
-  hookIndex: number
+  workspaceId?: string
+}
+
+/** 试运行的寻址（同样经**唯一**构造点：作用域 → file + workspaceId）。 */
+export function dryRunFor(
+  scope: ScopeValue,
+  address: { event: string; groupIndex: number; hookIndex: number },
+): DryRunIntent {
+  return { ...scopeTargetOf(scope), ...address }
 }
 
 /** 试运行的结果（宿主 `DryRunOutcome.run`）。 */

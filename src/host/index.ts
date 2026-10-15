@@ -84,13 +84,20 @@ import type {
   ShellRunRequest,
   SubagentInfo,
   ToolExecution,
+  WorkspaceRecord,
+  WorkspaceService,
 } from './service-types.ts'
 import {
+  ScopeError,
   registerHooksRoute,
   type DryRunOutcome,
   type DryRunRequest,
   type HooksInspection,
+  type ScopeTarget,
+  type SessionEffectView,
   type SourceInspection,
+  type ScopeView,
+  type WorkspaceItemView,
 } from './data-plane.ts'
 // 写路径的纯函数区：定点操作、风格、保留性证明、请求体校验（业务语义只有这一份）。
 import {
@@ -114,7 +121,18 @@ export const inject = ['shell', 'fs']
 
 /** 一个 projectRoot 的合并配置。 */
 interface ResolvedConfig {
+  /** 合并后的生效配置（用户级在前、项目级在后）。 */
   groups: ParsedGroups
+  /**
+   * **参与合并**的用户级 / 项目级两份。
+   *
+   * 为什么要留：`groups` 是合并结果，而页面还要回答"用户级贡献几条、项目级贡献几条"。
+   * 那两个数字**必须**取自这里，不能另外新鲜读一遍 —— stale（沿用上一份可用配置）时新鲜读
+   * 解析出的是空 groups，于是"生效 5 条（用户级 0 + 项目级 0）"会与 stale 横幅自相矛盾。
+   * 留在这里也顺带消掉了重复解析。
+   */
+  userGroups: ParsedGroups
+  projectGroups: ParsedGroups
   projectPath: string
   userPath: string
 }
@@ -596,7 +614,7 @@ export function apply(ctx: HostContext): void {
       state.hasHooks = hasHooks
       // 记下"这份生效配置是 last-good 兜底"，供数据面如实告诉页面（AGENTS §3.9）。
       state.stale = stale
-      return { groups, projectPath, userPath }
+      return { groups, userGroups: user.groups, projectGroups: project.groups, projectPath, userPath }
     })().catch((error: unknown) => {
       warn(`dsh-hooks: 加载 ${projectRoot} 的 hook 配置失败：${messageOf(error)}`)
       state.settled = true
@@ -606,7 +624,7 @@ export function apply(ctx: HostContext): void {
       state.hasHooks = false
       // 整体失败时 groups 是空的，谈不上"沿用上一份"。
       state.stale = false
-      return { groups: {}, projectPath, userPath }
+      return { groups: {}, userGroups: {}, projectGroups: {}, projectPath, userPath }
     })
 
     projectCache.set(projectRoot, { state, promise })
@@ -761,6 +779,9 @@ export function apply(ctx: HostContext): void {
           sessionId: typeof payload.session_id === 'string' ? payload.session_id : '',
           event: point,
           command: hook.command,
+          // 记下这次执行发生在哪个项目根下 —— 状态色的匹配条件是 event + command + projectRoot
+          // 三者（§2.3）：少了它，同命令在别的项目跑过就会给这一行上色。
+          projectRoot: context.projectRoot,
           exitCode: output.exitCode,
           decision: output.decision ?? 'pass',
           durationMs,
@@ -871,11 +892,206 @@ export function apply(ctx: HostContext): void {
     return { agent: undefined, source: 'none' }
   }
 
-  /** cwd 的来源，如实报告、绝不编造（AGENTS §2.8）。 */
-  function cwdFor(sessionId: string | undefined): { cwd: string | null; source: 'session' | 'initiator' | 'none' } {
+  /**
+   * 一次会话上下文的解析结果。
+   *
+   * `projectRoot` 是**从会话 cwd 解析出来的**项目根 —— 它是"当前会话在哪里"的唯一来源，
+   * 绝不拿工作区清单里的某一条来代称（AGENTS §2.8）。
+   */
+  interface SessionContext {
+    cwd: string | null
+    cwdSource: 'session' | 'initiator' | 'none'
+    projectRoot: string | null
+  }
+
+  /** 解析一次会话上下文（拿不到 cwd 就是 null，不编造）。 */
+  async function sessionContextFor(sessionId: string | undefined): Promise<SessionContext> {
     const found = agentForSession(sessionId)
     const cwd = found.agent?.session?.header?.cwd
-    return typeof cwd === 'string' && cwd.length > 0 ? { cwd, source: found.source } : { cwd: null, source: 'none' }
+    if (typeof cwd !== 'string' || cwd.length === 0) return { cwd: null, cwdSource: 'none', projectRoot: null }
+    return { cwd, cwdSource: found.source, projectRoot: await projectRootFor(cwd) }
+  }
+
+  /**
+   * 解析后的作用域：`current` 归一成 `user` 或 `workspace` 之一。
+   *
+   * ⚠️ 这是**编辑**作用域，不是运行时开关：hook 仍然按触发事件的会话 cwd 解析（AGENTS §2.6）。
+   */
+  interface ResolvedScope {
+    kind: 'user' | 'workspace'
+    /** 这份 project 文件的项目根；`kind === 'user'` 时是 null（不确定就不编造）。 */
+    projectRoot: string | null
+    workspace: { id: string; title: string; path: string } | null
+    /** 与当前会话的项目根比对的结果；`null` = 当前会话未知。 */
+    isCurrentSession: boolean | null
+  }
+
+  /** 收窄一条工作区记录（**唯一**一份实现；`service-types.ts` 只声明类型）。 */
+  function workspaceRecordOf(value: unknown): WorkspaceRecord | undefined {
+    if (!isObject(value)) return undefined
+    const { id, path, title } = value
+    if (typeof id !== 'string' || id.length === 0) return undefined
+    if (typeof path !== 'string' || path.length === 0) return undefined
+    return { id, path, ...(typeof title === 'string' && title.length > 0 ? { title } : {}) }
+  }
+
+  /**
+   * 取工作区服务。**每次请求现取** —— Cordis 的服务是渐进可用的，`apply()` 时刻读属性很可能
+   * 拿到 `undefined`（AGENTS §2.12 记的线上事故就是这个形状），于是"没有清单"会变成常态假象。
+   */
+  function workspaceService(): WorkspaceService | undefined {
+    const registry = ctx.get('workspaceRegistry')
+    if (registry === undefined) return undefined
+    // 两个成员都没有 = 它给不了我们任何东西：按"没有清单"处理，不装作可用。
+    if (typeof registry.list !== 'function' && typeof registry.get !== 'function') return undefined
+    return registry
+  }
+
+  /** 工作区清单（`available: false` = **宿主没有清单**，≠ 没有工作区；页面必须分别说清）。 */
+  async function workspaceList(): Promise<{ available: boolean; records: WorkspaceRecord[] }> {
+    const registry = workspaceService()
+    if (registry === undefined || typeof registry.list !== 'function') return { available: false, records: [] }
+    let raw: unknown
+    try {
+      raw = await registry.list()
+    } catch (error) {
+      warn(`dsh-hooks: 读取工作区清单失败：${messageOf(error)}`)
+      return { available: false, records: [] }
+    }
+    if (!isUnknownArray(raw)) return { available: false, records: [] }
+    const records: WorkspaceRecord[] = []
+    for (const item of raw) {
+      const record = workspaceRecordOf(item)
+      if (record !== undefined) records.push(record)
+    }
+    return { available: true, records }
+  }
+
+  /**
+   * 按 id 找工作区。
+   *
+   * `available: false`（宿主没有清单）与 `record: undefined`（清单里没有这个 id，可能被删过）
+   * **必须分开**：前者 409 `no-workspace-registry`、后者 404 `unknown-workspace` —— 页面文案不同。
+   */
+  async function lookupWorkspace(id: string): Promise<{ available: boolean; record: WorkspaceRecord | undefined }> {
+    const registry = workspaceService()
+    if (registry === undefined) return { available: false, record: undefined }
+    if (typeof registry.get === 'function') {
+      try {
+        const record = workspaceRecordOf(registry.get(id))
+        if (record !== undefined) return { available: true, record }
+      } catch (error) {
+        warn(`dsh-hooks: 查询工作区 ${id} 失败：${messageOf(error)}`)
+      }
+    }
+    if (typeof registry.list === 'function') {
+      const listed = await workspaceList()
+      if (!listed.available) return { available: false, record: undefined }
+      return { available: true, record: listed.records.find((record) => record.id === id) }
+    }
+    return { available: true, record: undefined }
+  }
+
+  /**
+   * 解析一次作用域。
+   *
+   * - `user` → 用户级文件（与项目无关）；
+   * - `current` → 会话 cwd 解析出的项目根；**没有会话上下文时归一到 `user`**（与旧行为逐字一致：
+   *   只列用户级，绝不编造一个项目路径，AGENTS §2.8）；
+   * - `workspace` → 必须能在清单里查到，否则抛 {@link ScopeError}。**绝不回落会话项目**（§2.2）。
+   */
+  async function resolveScope(session: SessionContext, target: ScopeTarget): Promise<ResolvedScope> {
+    if (target.kind === 'user') return { kind: 'user', projectRoot: null, workspace: null, isCurrentSession: null }
+    if (target.kind === 'current') {
+      if (session.projectRoot === null) {
+        return { kind: 'user', projectRoot: null, workspace: null, isCurrentSession: null }
+      }
+      return { kind: 'workspace', projectRoot: session.projectRoot, workspace: null, isCurrentSession: true }
+    }
+    const lookup = await lookupWorkspace(target.workspaceId)
+    if (!lookup.available) {
+      throw new ScopeError(
+        'no-workspace-registry',
+        '宿主没有提供工作区清单（workspaceRegistry），只能改当前项目和用户级配置',
+      )
+    }
+    if (lookup.record === undefined) {
+      throw new ScopeError('unknown-workspace', `工作区 ${target.workspaceId} 不在宿主的清单里（可能被删过）`)
+    }
+    const path = lookup.record.path
+    const projectRoot = await projectRootFor(path)
+    return {
+      kind: 'workspace',
+      projectRoot,
+      workspace: { id: lookup.record.id, title: lookup.record.title ?? lookup.record.id, path },
+      // 比较的是**项目根**而不是工作区路径：工作区是仓库子目录时也能判对。
+      isCurrentSession: session.projectRoot === null ? null : session.projectRoot === projectRoot,
+    }
+  }
+
+  /** 工作区清单视图（下拉框用）。服务缺失 ⇒ `available: false`（**明说**，不是空下拉）。 */
+  async function workspacesFor(session: SessionContext): Promise<{ items: WorkspaceItemView[]; available: boolean }> {
+    const listed = await workspaceList()
+    if (!listed.available) return { items: [], available: false }
+    // 每条都要探测 `.git`（走 projectRootFor 的缓存），所以并行而不是串行。
+    const items = await Promise.all(
+      listed.records.map(async (record) => {
+        const projectRoot = await projectRootFor(record.path)
+        return {
+          id: record.id,
+          title: record.title ?? record.id,
+          path: record.path,
+          projectRoot,
+          isCurrent: session.projectRoot !== null && session.projectRoot === projectRoot,
+        }
+      }),
+    )
+    return { items, available: true }
+  }
+
+  /** 一份配置的条数口径：启用中 / 已停用 / 分组数（`hookCount` **不含** disabled）。 */
+  function countsOf(groups: ParsedGroups): { hookCount: number; disabledCount: number; groupCount: number } {
+    let hookCount = 0
+    let disabled = 0
+    let groupCount = 0
+    for (const event of HOOK_EVENTS) {
+      for (const group of groups[event] ?? []) {
+        groupCount++
+        for (const hook of group.hooks) {
+          if (hook.disabled === true) disabled++
+          else hookCount++
+        }
+      }
+    }
+    return { hookCount, disabledCount: disabled, groupCount }
+  }
+
+  /**
+   * 「当前会话实际会跑的是什么」—— **与所选作用域无关**的那一份（AGENTS §2.6）。
+   *
+   * 作用域回答的是"我在看/改哪一份文件"，而运行时回答的是"用户级 + 会话自己项目级的合并"。
+   * 两个问题不是同一个，所以答案也不能复用：页面必须能**同时**说清这两件事。
+   *
+   * **三态**（AGENTS §2.8/§2.9）：当前会话的项目根拿不到就返回 `null` —— 一个数字都不编，
+   * 页面要说"当前会话未知，无法判断实际会跑什么"，而不是"当前会话生效 0 条"
+   * （用户级的条数确实是已知的，但"会话生效"是用户级 **+** 项目级的合并，缺了一半就不能报总数）。
+   */
+  async function sessionEffectOf(session: SessionContext): Promise<SessionEffectView | null> {
+    if (session.projectRoot === null) return null
+    const projectRoot = session.projectRoot
+    const config = await configFor(projectRoot)
+    const counts = countsOf(config.groups)
+    // 来源条数取自**参与合并的那两份**（与 `hookCount` 同源）⇒ `fromUser + fromProject === hookCount`
+    // 是结构性的，不需要"对账"；stale 时也不会出现 0 + 0 对不上总数。
+    return {
+      projectRoot,
+      hookCount: counts.hookCount,
+      disabledCount: counts.disabledCount,
+      groupCount: counts.groupCount,
+      fromUser: countsOf(config.userGroups).hookCount,
+      fromProject: countsOf(config.projectGroups).hookCount,
+      staleInUse: projectCache.get(projectRoot)?.state.stale === true,
+    }
   }
 
   /** 把一次读取折成页面要的来源视图（用**同一个** `parseHookConfig` —— AGENTS §2.6）。 */
@@ -895,51 +1111,81 @@ export function apply(ctx: HostContext): void {
   }
 
   /**
-   * 数据面：检视"当前项目 + 用户级"两个来源。
+   * 数据面：检视**被选中的作用域**那一份文件。
    *
-   * 两个刻意的选择：
-   *   ① **生效配置取 `configFor()` 的缓存**，而不是这里重新解析一遍 —— AGENTS §2.6 要求
+   * 三个刻意的选择：
+   *   ① **作用域决定读哪一份 project 文件**（`scope=user` 时只有用户级；`workspace` 时读
+   *      `root(X)/.dsh/hooks.json`）；
+   *   ② **生效配置取 `configFor()` 的缓存**，而不是这里重新解析一遍 —— AGENTS §2.6 要求
    *      "页面显示的必须就是 hook 实际会跑的那一份"。重解析得到的是"磁盘刚刚的样子"，而
-   *      runner 可能正拿着 last-good 在跑；两者不一致时页面就在撒谎。
-   *   ② **每侧的 state/message 取一次新鲜读取** —— 页面需要知道磁盘此刻到底是什么状态，
+   *      runner 可能正拿着 last-good 在跑；两者不一致时页面就在撒谎；
+   *   ③ **每侧的 state/message 取一次新鲜读取** —— 页面需要知道磁盘此刻到底是什么状态，
    *      才能把"文件坏了"和"生效配置是兜底"分开说清楚。
+   *
+   * 顶层 `projectRoot` / `cwd` 永远是"**当前会话**在哪里"（与所选作用域无关）：页面据此比较
+   * "我是不是在看当前会话的项目"，绝不拿工作区清单里的某一条来代称（AGENTS §2.8）。
    */
-  async function inspect(sessionId: string | undefined): Promise<HooksInspection> {
-    const { cwd, source } = cwdFor(sessionId)
+  async function inspect(sessionId: string | undefined, target: ScopeTarget): Promise<HooksInspection> {
+    const session = await sessionContextFor(sessionId)
     const userPath = joinPath(dshHome(), HOOKS_FILE)
     const userRead = await readJsonFile(userPath)
-    if (cwd === null) {
-      // 没有会话上下文：只列用户级，**不编造**一个项目路径（AGENTS §2.8）。
+    const resolved = await resolveScope(session, target)
+    const listed = await workspacesFor(session)
+    const scope: ScopeView = {
+      kind: resolved.kind,
+      requested: target.kind,
+      workspaceId: resolved.workspace?.id ?? null,
+      workspaceTitle: resolved.workspace?.title ?? null,
+      workspacePath: resolved.workspace?.path ?? null,
+      projectRoot: resolved.projectRoot,
+      isCurrentSession: resolved.isCurrentSession,
+    }
+    const base = {
+      projectRoot: session.projectRoot,
+      cwd: session.cwd,
+      cwdSource: session.cwdSource,
+      scope,
+      workspaces: listed.items,
+      workspacesAvailable: listed.available,
+      // 数据面本身就是"能写"的入口：路由注册了 POST，页面据此显示可编辑。
+      writable: true,
+      ledger: ledger.entries(),
+    }
+    if (resolved.kind === 'user') {
+      // 用户级作用域：只列用户级；生效配置就是用户级自己的 groups。
       // 占位符也不替换（传空 vars），否则页面会看到被替换成 '' 的命令。
       const userOnly = sourceViewOf('user', userRead, {})
       return {
-        projectRoot: null,
-        cwd: null,
-        cwdSource: 'none',
+        ...base,
+        session: await sessionEffectOf(session),
         sources: [userOnly],
         effective: userOnly.groups,
+        // 这个作用域里没有项目级贡献：合并输入就是用户级自己（`fromProject` 因此恒为 0）。
+        effectiveUserGroups: userOnly.groups,
+        effectiveProjectGroups: {},
         staleInUse: false,
-        // 数据面本身就是"能写"的入口：路由注册了 POST，页面据此显示可编辑。
-        writable: true,
-        ledger: ledger.entries(),
       }
     }
-    const projectRoot = await projectRootFor(cwd)
-    const projectRead = await readJsonFile(joinPath(projectRoot, PROJECT_DIR, HOOKS_FILE))
+    const projectRoot = resolved.projectRoot ?? ''
     const vars = { projectDir: projectRoot }
+    const projectRead = await readJsonFile(joinPath(projectRoot, PROJECT_DIR, HOOKS_FILE))
     const project = sourceViewOf('project', projectRead, vars)
     const user = sourceViewOf('user', userRead, vars)
     const config = await configFor(projectRoot)
+    const stale = projectCache.get(projectRoot)?.state.stale === true
     return {
-      projectRoot,
-      cwd,
-      cwdSource: source,
+      ...base,
+      // 会话生效视图**只有一处实现**（`sessionEffectOf`）：目标就是当前会话的项目时它照样成立
+      // （`configFor(projectRoot)` 命中同一份缓存，不多读一次文件）。刻意**不**在这里再抄一份
+      // 计数逻辑 —— 两处必然漂移，而漂移的就是"实际会跑几条"这个数字。
+      session: await sessionEffectOf(session),
       // 展示顺序：项目级在前（它才是"这个项目"的配置）。合并顺序由 effective 决定，与这里无关。
       sources: [project, user],
       effective: config.groups,
-      staleInUse: projectCache.get(projectRoot)?.state.stale === true,
-      writable: true,
-      ledger: ledger.entries(),
+      // 合并输入（**与 effective 同源**：磁盘或 last-good 由同一条路径决定）——页面据此标来源。
+      effectiveUserGroups: config.userGroups,
+      effectiveProjectGroups: config.projectGroups,
+      staleInUse: stale,
     }
   }
 
@@ -987,6 +1233,9 @@ export function apply(ctx: HostContext): void {
     const message = messageOf(error)
     // `FS_STALE_VERSION` 是官方契约里版本冲突的精确错误码（已用 cordis_inspect_query 核实）。
     if (message.includes('FS_STALE_VERSION')) return 'stale'
+    // `createIfAbsent` 撞上"别人刚建了它"：如实报 `exists`（页面提示刷新），绝不静默覆盖。
+    // 契约没给这个精确错误码（与沙箱那条一样是 best-effort），所以两种常见写法都认。
+    if (/FS_EXISTS|FS_ALREADY_EXISTS|already exists|EEXIST/i.test(message)) return 'exists'
     // 沙箱拒绝只能按消息 best-effort 归类 —— 契约没给精确错误码，这条要在线上复核。
     if (/FS_(DENIED|SANDBOX|READ_ONLY)|read-only|permission denied|EPERM|EACCES/i.test(message)) return 'sandbox'
     return 'write-failed'
@@ -1041,7 +1290,24 @@ export function apply(ctx: HostContext): void {
         return { ok: true, version: created.version }
       }
 
-      if (prep.state === 'absent') return { ok: false, error: 'absent' }
+      if (prep.state === 'absent') {
+        // 「＋新建」要能**一次建出文件**（D2）：只有新增类 op 才放开自动建文件 ——
+        // "改一条不存在的命令"仍然 absent 拒写（否则会顺手建出一份空配置，用户看到的是
+        // "我明明是去改的，怎么多了个文件"）。骨架就是 `{hooks:{…一条}}`（我们自己的不动点风格）。
+        if (request.op !== 'addGroup' && request.op !== 'addHook') return { ok: false, error: 'absent' }
+        const skeleton: Record<string, unknown> = { hooks: {} }
+        // `addHook` 在**空文件**里没有组可加 → 等价于"新开一组"（语义上就是新建按钮的意图）。
+        const seeding = request.op === 'addHook' ? { ...request, op: 'addGroup' as const, matcher: null } : request
+        const applied = applyOp(skeleton, seeding)
+        if (!applied.ok) return { ok: false, error: applied.reason }
+        const problem = preservationProblem(skeleton, applied.applied.doc, applied.applied.changes)
+        if (problem !== undefined) return { ok: false, error: 'not-preservable', detail: problem }
+        const text = serialize(applied.applied.doc, DEFAULT_STYLE)
+        // 竞态（别人同时建了它）：provider 报 `exists`，这里如实透传并提示刷新（D2）。
+        const created = await fsSvc.writeText(prep.target, text, { kind: 'createIfAbsent' }, signal, sandboxPolicy)
+        return { ok: true, version: created.version }
+      }
+
       const applied = applyOp(prep.doc, request)
       if (!applied.ok) return { ok: false, error: applied.reason }
       const problem = preservationProblem(prep.doc, applied.applied.doc, applied.applied.changes)
@@ -1060,16 +1326,43 @@ export function apply(ctx: HostContext): void {
     }
   }
 
-  /** 路由的写入口：把 `sessionId` 解析成 projectRoot + 该会话的沙箱策略。 */
+  /**
+   * 把**请求体里的作用域参数**解析成目标 projectRoot。
+   *
+   * 这是 §2.2 的核心：`file:'project'` + `workspaceId` 时**只**按白名单解析那个工作区 ——
+   * 解析不到就返回错误，**绝不允许**"拿不到就退回会话项目"（那会静默改错文件）。
+   * 沙箱策略仍取调用会话（拿不到工作区时也不提权）。
+   */
+  async function writeRootFor(
+    target: ScopeTarget,
+    sessionId: string | undefined,
+  ): Promise<{ ok: true; projectRoot: string | null } | { ok: false; error: string }> {
+    if (target.kind === 'user') return { ok: true, projectRoot: null }
+    if (target.kind === 'current') {
+      const found = agentForSession(sessionId)
+      const cwd = found.agent?.session?.header?.cwd
+      return {
+        ok: true,
+        projectRoot: typeof cwd === 'string' && cwd.length > 0 ? await projectRootFor(cwd) : null,
+      }
+    }
+    const lookup = await lookupWorkspace(target.workspaceId)
+    if (!lookup.available) return { ok: false, error: 'no-workspace-registry' }
+    if (lookup.record === undefined) return { ok: false, error: 'unknown-workspace' }
+    return { ok: true, projectRoot: await projectRootFor(lookup.record.path) }
+  }
+
+  /** 路由的写入口：作用域 → projectRoot + 该会话的沙箱策略。 */
   async function handleWrite(
     request: HooksRequest,
+    target: ScopeTarget,
     sessionId: string | undefined,
     signal: AbortSignal,
   ): Promise<WriteResult> {
     const found = agentForSession(sessionId)
-    const cwd = found.agent?.session?.header?.cwd
-    const projectRoot = typeof cwd === 'string' && cwd.length > 0 ? await projectRootFor(cwd) : null
-    return writeHookFile(request, projectRoot, signal, sandboxPolicyFor(found.agent))
+    const root = await writeRootFor(target, sessionId)
+    if (!root.ok) return { ok: false, error: root.error }
+    return writeHookFile(request, root.projectRoot, signal, sandboxPolicyFor(found.agent))
   }
 
   //#endregion
@@ -1087,12 +1380,15 @@ export function apply(ctx: HostContext): void {
    */
   async function dryRunHook(
     request: DryRunRequest,
+    target: ScopeTarget,
     sessionId: string | undefined,
     signal: AbortSignal,
   ): Promise<DryRunOutcome> {
     const found = agentForSession(sessionId)
-    const cwd = found.agent?.session?.header?.cwd
-    const projectRoot = typeof cwd === 'string' && cwd.length > 0 ? await projectRootFor(cwd) : null
+    const session = await sessionContextFor(sessionId)
+    const root = await writeRootFor(target, sessionId)
+    if (!root.ok) return { ok: false, error: root.error }
+    const projectRoot = root.projectRoot
     const path =
       request.file === 'user'
         ? joinPath(dshHome(), HOOKS_FILE)
@@ -1113,8 +1409,14 @@ export function apply(ctx: HostContext): void {
     const hook = group.hooks.find((candidate) => candidate.rawIndex === request.hookIndex)
     if (hook === undefined) return { ok: false, error: 'not-found', detail: '这一条不在文件里（可能刚被改过）' }
 
+    // 工作目录：只有"目标就是当前会话的项目"才用会话 cwd；否则用目标项目根 ——
+    // 拿当前会话的 cwd 去跑别的工作区的 hook，结果会**看起来像**那条 hook 会在这里跑。
+    const cwd =
+      projectRoot !== null && session.projectRoot === projectRoot && session.cwd !== null
+        ? session.cwd
+        : (projectRoot ?? session.cwd ?? '')
     const context: ExecutionContext = {
-      cwd: cwd ?? '',
+      cwd,
       projectRoot: projectRoot ?? '',
       sandboxPolicy: sandboxPolicyFor(found.agent),
     }

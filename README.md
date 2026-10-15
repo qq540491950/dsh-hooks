@@ -415,26 +415,42 @@ node tools/verify.ts --config "D:\some\project\.dsh\hooks.json"
 
 - **为什么是这条通道**（7 条候选逐条否决：Remote / `$events` / client-store / 构建期快照 …）：
   [docs/design-notes.md](docs/design-notes.md) §1。
-- `GET /api/hooks[?sessionId=…]` → `{ok:true, data:HooksSnapshot}`；失败 → `{ok:false, error, detail?}`，
-  **没有 `data`**（页面必须先补空形状再解引用）。
-- `POST /api/hooks` 三种意图，**全部是定点操作**（客户端**绝不回传整份文件**，那会静默丢字段）：
-  - **定点写**：`{op:'setHookCommand'|'setHookTimeout'|'setHookDisabled'|'setGroupMatcher'|'addHook'|'removeHook'|'moveHook'|'removeGroup'|'createFile', file, event, groupIndex, hookIndex, …}`。
+- `GET /api/hooks[?sessionId=…][&scope=current|user|workspace][&workspaceId=…]` → `{ok:true, data:HooksSnapshot}`；
+  失败 → `{ok:false, error, detail?}`，**没有 `data`**（页面必须先补空形状再解引用）。
+  `scope` **缺省仍是 `current`**（会话 cwd 的项目，向后兼容）；页面默认发 `scope=user`（见下一节）。
+  响应新增 `scope`（回显实际作用域）/ `workspaces` / `workspacesAvailable` / `session`（与作用域无关的
+  「当前会话实际会跑什么」条数口径；**三态**：`null` = 当前会话未知，页面必须说"无法判断"）。
+  `effectiveUserGroups` / `effectiveProjectGroups` 是 `EventView.fromUser` / `fromProject` 的**合并输入**
+  （取自 `configFor()` 参与合并的那两份，**不是"新鲜读"**）—— 客户端不消费它们，但离线断言与排查要看
+  "用户级贡献几条、项目级贡献几条"：`fromUser + fromProject === hookCount` 是必须成立的不变式
+  （stale 沿用 last-good 时同样成立），写在响应里比藏在内部变量里可核对。
+- `POST /api/hooks` 四种意图，**全部是定点操作**（客户端**绝不回传整份文件**，那会静默丢字段）：
+  - **定点写**：`{op:'setHookCommand'|'setHookTimeout'|'setHookDisabled'|'setGroupMatcher'|'addHook'|'addGroup'|'removeHook'|'moveHook'|'removeGroup'|'createFile', file, workspaceId?, event, groupIndex, hookIndex, …}`。
     机制是**克隆整份 JSON 树 + 只改目标节点 + 保留性证明**，未知键（例如第一行的 `_comment`）
     在结构上不可能丢；写盘带**版本锁**（存在用 `replaceIfVersion`、不存在用 `createIfAbsent`）。
-  - **试运行**：`{op:'dryRun', file, event, groupIndex, hookIndex}` —— 与真实运行**共用同一条执行
+    `addGroup` 是"＋新建"用的那个 op：事件数组不存在时**创建**它；文件不存在时用 `createIfAbsent`
+    写一份含该 hook 的骨架（竞态时 provider 报 `exists`，如实拒写并提示刷新）。
+  - **作用域**：`file:'project'` + `workspaceId` ⇒ 目标 = `root(workspaceId)/.dsh/hooks.json`；
+    它在宿主清单里查不到 ⇒ **拒写 `unknown-workspace`，绝不回落会话项目**（回落 = 静默改错文件）。
+    `file:'project'` 不带 `workspaceId` = 现状语义（会话 cwd 的项目）；`file:'user'` 带 `workspaceId` = 400。
+  - **试运行**：`{op:'dryRun', file, workspaceId?, event, groupIndex, hookIndex}` —— 与真实运行**共用同一条执行
     路径**（同一个 `runSingleHook`、同一个 payload builder），但**不写执行台账**（预演不该给状态上色）。
   - **错误码分得很细**，页面据此把失败**分别**说清（这是硬要求，不许糊成一句"保存失败"）：
-    `stale` / `exists` / `not-preservable` / `invalid-json` / `no-project` / `no-version` → 409；
-    `absent` / `not-found` → 404；`sandbox` → 403；`bad-op` / `bad-json` → 400。
+    `stale` / `exists` / `not-preservable` / `invalid-json` / `no-project` / `no-version` /
+    **`no-workspace-registry`** → 409；`absent` / `not-found` / **`unknown-workspace`** → 404；
+    `sandbox` → 403；`bad-op` / `bad-json` → 400。
 - 寻址一律用**文件下标**（`rawIndex`）：解析会跳过 matcher 非法的 group 与没有 command 的条目，
   拿"解析后的数组位置"去找 = 静默改错/跑错那一行。越界一律拒（`not-found`）。
-- 快照的硬不变式：**7 个事件永远全列**（含 0 条）、**两个来源永远都列**、`disabled` 单独计数
-  （生效条数不含它）、`staleInUse` 如实反映"文件坏了但运行中的还是上一份可用配置"。
+- 快照的硬不变式：**7 个事件永远全列**（含 0 条）、**两份文件永远都列**、`disabled` 单独计数
+  （生效条数不含它）、`staleInUse` 如实反映"文件坏了但运行中的还是上一份可用配置"、
+  `fromUser + fromProject === hookCount`（**stale 时也成立**：两个数字取自 `configFor()` 参与合并的
+  那两份，而不是"新鲜读"—— 否则页面会显示"生效 5 条（用户级 0 + 项目级 0）"）。
 - `capabilities.writable` 是 **`true`**（路由注册了 POST）；为 `false` 时页面显示只读横幅，
   而不是让用户点了没反应。
 - **每行还带执行证据**：`lastRun`（真实的 `exitCode` / `decision` / 耗时 / 输出）与 `runCount`。
-  匹配条件是 **`event + command` 两者都要** —— 命令改过之后旧记录不再匹配，行退回灰"未运行"，
-  **绝不会拿旧命令的结果给新命令画绿**。台账有界（全局 500 / 单会话 200），输出截断后才进快照。
+  匹配条件是 **`event + command + projectRoot` 三者都要** —— 命令改过之后旧记录不再匹配，行退回灰
+  "未运行"；**同一条命令在别的项目跑过也不会给这里的行上色**（否则切工作区就会看到别的项目的绿点）。
+  台账有界（全局 500 / 单会话 200），输出截断后才进快照。
 - **没有会话上下文**时 `cwd` / `projectRoot` 一律是 `null` 并标注来源（`cwdSource`），
   **不拿 `process.cwd()` 顶上**。
 - 当前载体没有 `connection` 服务（如 shell 载体）时不注册数据面，但 **hooks 照常工作**。
@@ -445,11 +461,13 @@ node tools/verify.ts --config "D:\some\project\.dsh\hooks.json"
 
 浏览器半边（`src/client/**` → `lib/client.js`）注册在设置导航里，排在 MCP（900）、Skills（910）之后：
 
-- **两个来源永远都列**（项目级 / 用户级），含"文件不存在"与"读不出来"——「空」和「不存在」必须长得
-  不一样，否则用户只能得出"这功能没做"，而**他的判断没错，是界面在撒谎**。
+- **两份文件都会列**：所选作用域那一份是主卡（可编辑），另一个来源（工作区作用域下的用户级）
+  作为只读卡片列出路径与状态，并说明"要编辑它请把作用域切过去"。含"文件不存在"与"读不出来"——
+  「空」和「不存在」必须长得不一样，否则用户只能得出"这功能没做"，而**他的判断没错，是界面在撒谎**。
 - **7 个事件分组永远全渲染**（含 0 条）。
-- 每行：状态点（**只**来自执行台账与 `disabled`）+ 命令（等宽）+ 超时 + 四个动作
-  **试运行 / 编辑 / 停用（启用）/ 删除**。
+- 每行（卡）：状态点（**只**来自执行台账与 `disabled`）+ 命令（等宽省略号）+ 超时 + 三个动作
+  **试运行 / 编辑 / 删除**，右侧是**启停开关**（`role="switch"`）。
+- **删除是两步**：点"删除"只变成"确认删除 / 取消"，**第一步不发请求**（它是唯一丢数据的操作）。
 - **删除是两步**：点"删除"只变成"确认删除 / 取消"，**第一步不发请求**（它是唯一丢数据的操作）。
 - 错误**只有一个渲染点**：行内操作（启停 / 编辑 / 删除 / 试运行）的失败写进**页面级**横幅，
   表单内的错误留在表单里。
@@ -461,6 +479,57 @@ node tools/verify.ts --config "D:\some\project\.dsh\hooks.json"
   那条路（依赖官方 DOM 结构，一改就静默失效）。
 - **首次出现需要重启一次 DSH**（`dsh-client-modules` 在启动时扫描 `exports["./client"]`）；
   之后改 UI 不需要重启（客户端半边构建后由客户端 HMR 替换）。
+
+## 设置页「Hooks」的作用域选择器（`用户` / 各工作区）
+
+页面顶部左起是**作用域下拉框**（原生 `<select>` + `<optgroup>`）、当前文件的条数、搜索框，
+右边是「↻ 刷新」「＋ 新建」；下面是工具条（`已安装 N · 已停用 M` + 文件路径）与**按事件分组的 hook 卡**。
+
+**作用域只决定"页面读哪份文件、写哪份文件"，它不改变运行时。** hook 仍然按**触发事件的会话**的
+cwd → 最近 `.git` 祖先解析，用户级永远参与合并（用户级在前、项目级在后，顺序即执行顺序）。
+页面在三个地方把这件事说清楚：
+
+| 选中的作用域 | 页面怎么说 |
+|---|---|
+| `用户（全局）`（**默认**） | 「用户级配置：对**所有**项目生效；每个项目还会叠加它自己的项目级配置」 |
+| 当前会话所在的工作区 | 「当前会话就在这个工作区（项目根 …），改动对之后的调用**立即**生效」 |
+| 别的工作区 | **黄底横幅**：「你正在看/改 **X**；当前会话的项目根是 Y。这次改动**不会**影响当前会话……当前会话的沙箱权限可能不允许写这个文件（那会报 sandbox）—— 那是预期行为，不是 bug」 |
+| 会话上下文拿不到 | 「当前会话未知，无法判断它是不是当前会话的项目」—— **不编造**一个"当前项目" |
+
+- **默认作用域 = 用户**；`GET /api/hooks` 的 `scope` 缺省仍是 `current`（老客户端不受影响）。
+- 下拉框 = 「用户（全局）」+（会话项目不在工作区清单里时）**「当前会话项目（<目录名>）」** + 工作区。
+  最后那个不是工作区，而是**按会话 cwd 解析**的项目（`scope=current`，请求里**不带** `workspaceId`）——
+  否则"正在开发的这个项目恰好不在 `workspaceRegistry` 里"时，用户在新页面上改不到它的
+  `.dsh/hooks.json`（旧页面本有这个能力，不能丢）。
+- 宿主没有提供工作区清单时**明说**「宿主没有提供工作区清单（只能改用户级配置）—— 这是"这个宿主给不了
+  这个能力"，不是"你没有工作区"」；清单为空则说「还没有工作区」。**空 ≠ 不存在**，两者文案不同。
+- **取数失败不是死胡同**：失败横幅下面有「↻ 重试」和「回到用户级配置」两个控件（后者在
+  `unknown-workspace` / `no-workspace-registry` 时突出显示）—— 选中的作用域被删掉时不必整页刷新。
+- **工作区路径 ≠ 项目根**：`projectRoot` 是最近含 `.git` 的祖先。两者不同（工作区是仓库子目录）时
+  横幅会把两行都写出来，否则用户会问"我改的是 A，为什么落到 B/.dsh/hooks.json"。
+- **每次写 / 试运行都带被选中的作用域**：请求体里的 `workspaceId` 由**唯一**构造函数
+  （`src/client/write.ts` 的 `intentFor` / `dryRunFor`）产出。宿主侧查不到那个工作区就**拒写**
+  `unknown-workspace`（404）并提示刷新，**绝不回落**到会话项目 —— 回落就是"看着 A 项目、改到 B 项目"，
+  而且是静默的。宿主没有清单则是 `no-workspace-registry`（409），文案不同。
+- **条数口径**（两个数字指不同的量，否则用户以为页面坏了）：下拉框右侧 **`钩子 N`** = 当前作用域
+  **文件里**的 hook 总条数（**含**已停用）；工具条 **`已安装 N`** = **启用中**的条数，另有停用时追加
+  `· 已停用 M`。
+- 折叠的只读一行回答「**当前会话实际会跑的是什么**」：`当前会话生效 N 条（用户级 a + 项目级 b）`
+  —— 它按的是运行时会话，与所选作用域无关；那一行与它下面的展开区是**两件事**（展开区是所选作用域的
+  生效视图），文案分别标注。会话上下文拿不到时写「当前会话未知，无法判断实际会跑什么」，
+  **绝不显示"生效 0 条"**（读不到 ≠ 没有）。
+- **搜索框是纯前端过滤**：只过滤渲染，发出去的仍是文件里的**真实下标**；无结果说"没有匹配的 hook"
+  （≠"没有配置"）。
+- **「＋新建」** = 一次 `addGroup` 定点操作（事件 / matcher / command / timeout），文件不存在时宿主
+  用 `createIfAbsent` 写一份含该 hook 的骨架；竞态（别人同时建了它）如实报 `exists` 并提示刷新。
+  `UserPromptSubmit` / `Stop` 没有 matcher —— 表单在选中这两个事件时**不渲染** matcher 输入框。
+- **开关**是 `<button role="switch" aria-checked>` + 样式表里的旋钮（不是原生 checkbox）：
+  停用落在文件里的 `disabled: true`，执行层**真的跳过**它。
+- **一条错误只允许一个渲染点**：行内操作（启停 / 编辑 / 删除 / 试运行）的失败进**页面级**横幅；
+  新建表单的失败只留在**表单内部**（表单里有独立的错误行）。两条通道不许互相写。
+- **改了工作区作用域后不重启也能生效的部分**：客户端半边（HMR）；**宿主半边要重启**
+  （新增的 `workspaceRegistry` 读取与 `addGroup` 都是宿主侧代码）。当前会话的沙箱权限可能不允许写
+  **别的工作区**的文件 —— 那会如实报 `sandbox`（403），不提权。
 
 ## 故障排查
 

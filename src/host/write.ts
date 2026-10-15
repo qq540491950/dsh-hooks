@@ -72,9 +72,39 @@ export type HooksOp =
       direction: -1 | 1
     }
   | { op: 'removeGroup'; file: FileKind; event: HookEvent; groupIndex: number }
+  | {
+      /**
+       * 新开一个 group（"＋新建"默认走它）。
+       *
+       * 与 `addHook` 的分工：`addHook` = 加到**已有**组；`addGroup` = 新开一组。
+       * 事件数组不存在时**创建**它（裸事件映射与 `{hooks:{…}}` 两种顶层形状都支持 ——
+       * 复用 `hooksMapOf()` 的判定，绝不另写一套），这也是自动建文件的落地路径（`absent` 时）。
+       */
+      op: 'addGroup'
+      file: FileKind
+      event: HookEvent
+      /** `null` / 空串 = 不写 `matcher` 键（全匹配），不是一个空字符串。 */
+      matcher: string | null
+      command: string
+      timeoutSec: number | null
+    }
+
+/**
+ * 作用域定位字段：请求体里可选的 `workspaceId`。
+ *
+ * 语义（写死在宿主侧，见 `handleWrite`）：
+ *   - `file:'project'` + 给了 `workspaceId` ⇒ 目标 = `root(workspaceId)/.dsh/hooks.json`；
+ *     若它**不在**宿主的工作区清单里 ⇒ **拒写** `unknown-workspace`，**绝不回落会话项目**
+ *     （回落 = "看着 A 项目、改到 B 项目"的静默改错文件）；
+ *   - `file:'project'` 不带 `workspaceId` ⇒ 现状语义（会话 cwd 的 projectRoot），向后兼容；
+ *   - `file:'user'` 带 `workspaceId` ⇒ 请求非法（用户级配置不属于任何工作区）。
+ */
+export interface WorkspaceField {
+  workspaceId?: string
+}
 
 /** 客户端能发的完整请求体。 */
-export type HooksRequest = HooksOp | { op: 'createFile'; file: FileKind }
+export type HooksRequest = (HooksOp | { op: 'createFile'; file: FileKind }) & WorkspaceField
 
 /** 拒写的机器可读原因（页面据此给出各自的文案，而不是一句"保存失败"）。 */
 export type OpFailure = 'bad-op' | 'not-found' | 'out-of-range' | 'not-preservable'
@@ -384,6 +414,36 @@ export function applyOp(doc: Record<string, unknown>, op: HooksOp): OpResult {
       }
     }
 
+    case 'addGroup': {
+      if (op.command.length === 0) return { ok: false, reason: 'bad-op' }
+      const map = hooksMapOf(next)
+      const existing = map[op.event]
+      // 事件数组不存在就**创建**它。顶层形状由 `hooksMapOf()` 判定：
+      // 裸事件映射时 map === doc（所以这里改的就是顶层），否则是 `doc.hooks`。
+      const created = !isUnknownArray(existing)
+      let list: unknown[]
+      if (created) {
+        list = []
+        map[op.event] = list
+      } else {
+        list = existing
+      }
+      const group: Record<string, unknown> = {}
+      // 只有真的给了非空 matcher 才写这个键（空串 = 全匹配，写进去是噪音）。
+      if (op.matcher !== null && op.matcher.length > 0) group.matcher = op.matcher
+      const hook: Record<string, unknown> = { type: 'command', command: op.command }
+      if (op.timeoutSec !== null && op.timeoutSec > 0) hook.timeout = op.timeoutSec
+      group.hooks = [hook]
+      list.push(group)
+      const index = list.length - 1
+      // 声明"我改了什么"：追加到已有数组是一处 `index`；**新创建**的事件数组则必须声明
+      // 整个键（否则新文档里多出来的那个空数组会被保留性证明判成"动了目标之外的字段"而拒写）。
+      const changes: Change[] = created
+        ? [{ path: [...mapPath(next), op.event], mode: 'key' }]
+        : [{ path: [...mapPath(next), op.event, index], mode: 'index' }]
+      return { ok: true, applied: { doc: next, changes } }
+    }
+
     case 'removeGroup': {
       const list = eventListOf(next, op.event)
       if (list === undefined || op.groupIndex < 0 || op.groupIndex >= list.length)
@@ -439,7 +499,33 @@ export function parseHooksRequest(body: unknown): RequestParse {
   if (typeof body.op !== 'string') return { ok: false, reason: 'op 必须是字符串' }
   const op = body.op
 
-  /** 校验 event + groupIndex（所有改写操作都要）。 */
+  // `workspaceId` 是**不可信输入**：非空字符串才收；`file:'user'` 时给了就是非法请求
+  // （用户级配置不属于任何工作区，带上它说明客户端状态与页面不一致）。
+  const rawWorkspaceId = body.workspaceId
+  if (rawWorkspaceId !== undefined) {
+    if (typeof rawWorkspaceId !== 'string' || rawWorkspaceId.length === 0) {
+      return { ok: false, reason: 'workspaceId 必须是非空字符串' }
+    }
+    if (file === 'user') {
+      return { ok: false, reason: 'file 为 user 时不许带 workspaceId（用户级配置不属于任何工作区）' }
+    }
+  }
+  /** 作用域字段（只在给定时出现 —— 不凭空补 `workspaceId: undefined` 这个键）。 */
+  const scope: WorkspaceField = rawWorkspaceId === undefined ? {} : { workspaceId: rawWorkspaceId }
+  /** 成功返回：把作用域字段**统一**挂到请求体上（调用点不许自己拼，§2.2）。 */
+  const ok = (request: HooksOp | { op: 'createFile'; file: FileKind }): RequestParse => ({
+    ok: true,
+    request: { ...request, ...scope },
+  })
+
+  /** 校验 event（`addGroup` 用：它没有 groupIndex —— 新开一组本来就没有"哪一组"）。 */
+  const eventOnly = (): { event: HookEvent } | string => {
+    if (!isHookEvent(body.event)) return 'event 不是受支持的事件'
+    // 成功也包一层对象：`HookEvent` 本身就是 string 联合，靠 `typeof x === 'string'` 判失败
+    // 会把**合法事件名**也判成错误（第一版就是这样，addGroup 一律 400）。
+    return { event: body.event }
+  }
+  /** 校验 event + groupIndex（其余改写操作都要）。 */
   const head = (): { event: HookEvent; groupIndex: number } | string => {
     if (!isHookEvent(body.event)) return 'event 不是受支持的事件'
     const groupIndex = indexOf(body.groupIndex)
@@ -457,7 +543,7 @@ export function parseHooksRequest(body: unknown): RequestParse {
 
   switch (op) {
     case 'createFile':
-      return { ok: true, request: { op: 'createFile', file } }
+      return ok({ op: 'createFile', file })
 
     case 'setHookCommand': {
       const where = withHook()
@@ -465,7 +551,7 @@ export function parseHooksRequest(body: unknown): RequestParse {
       if (typeof body.command !== 'string' || body.command.length === 0) {
         return { ok: false, reason: 'command 必须是非空字符串' }
       }
-      return { ok: true, request: { op, file, ...where, command: body.command } }
+      return ok({ op, file, ...where, command: body.command })
     }
 
     case 'setHookTimeout': {
@@ -474,24 +560,24 @@ export function parseHooksRequest(body: unknown): RequestParse {
       if (body.timeoutSec !== null) {
         const timeoutSec = positiveOf(body.timeoutSec)
         if (timeoutSec === undefined) return { ok: false, reason: 'timeoutSec 必须是 null 或正数' }
-        return { ok: true, request: { op, file, ...where, timeoutSec } }
+        return ok({ op, file, ...where, timeoutSec })
       }
-      return { ok: true, request: { op, file, ...where, timeoutSec: null } }
+      return ok({ op, file, ...where, timeoutSec: null })
     }
 
     case 'setHookDisabled': {
       const where = withHook()
       if (typeof where === 'string') return { ok: false, reason: where }
       if (typeof body.disabled !== 'boolean') return { ok: false, reason: 'disabled 必须是布尔值' }
-      return { ok: true, request: { op, file, ...where, disabled: body.disabled } }
+      return ok({ op, file, ...where, disabled: body.disabled })
     }
 
     case 'setGroupMatcher': {
       const base = head()
       if (typeof base === 'string') return { ok: false, reason: base }
-      if (body.matcher === null) return { ok: true, request: { op, file, ...base, matcher: null } }
+      if (body.matcher === null) return ok({ op, file, ...base, matcher: null })
       if (typeof body.matcher !== 'string') return { ok: false, reason: 'matcher 必须是字符串或 null' }
-      return { ok: true, request: { op, file, ...base, matcher: body.matcher } }
+      return ok({ op, file, ...base, matcher: body.matcher })
     }
 
     case 'addHook': {
@@ -501,17 +587,38 @@ export function parseHooksRequest(body: unknown): RequestParse {
         return { ok: false, reason: 'command 必须是非空字符串' }
       }
       if (body.timeoutSec === null || body.timeoutSec === undefined) {
-        return { ok: true, request: { op, file, ...base, command: body.command, timeoutSec: null } }
+        return ok({ op, file, ...base, command: body.command, timeoutSec: null })
       }
       const timeoutSec = positiveOf(body.timeoutSec)
       if (timeoutSec === undefined) return { ok: false, reason: 'timeoutSec 必须是 null 或正数' }
-      return { ok: true, request: { op, file, ...base, command: body.command, timeoutSec } }
+      return ok({ op, file, ...base, command: body.command, timeoutSec })
+    }
+
+    case 'addGroup': {
+      const where = eventOnly()
+      if (typeof where === 'string') return { ok: false, reason: where }
+      const event = where.event
+      if (typeof body.command !== 'string' || body.command.length === 0) {
+        return { ok: false, reason: 'command 必须是非空字符串' }
+      }
+      // matcher：`null` / 缺省 = 不写这个键；给了就必须是字符串（空串按"不写"处理）。
+      let matcher: string | null = null
+      if (body.matcher !== null && body.matcher !== undefined) {
+        if (typeof body.matcher !== 'string') return { ok: false, reason: 'matcher 必须是字符串或 null' }
+        matcher = body.matcher
+      }
+      if (body.timeoutSec === null || body.timeoutSec === undefined) {
+        return ok({ op, file, event, matcher, command: body.command, timeoutSec: null })
+      }
+      const timeoutSec = positiveOf(body.timeoutSec)
+      if (timeoutSec === undefined) return { ok: false, reason: 'timeoutSec 必须是 null 或正数' }
+      return ok({ op, file, event, matcher, command: body.command, timeoutSec })
     }
 
     case 'removeHook': {
       const where = withHook()
       if (typeof where === 'string') return { ok: false, reason: where }
-      return { ok: true, request: { op, file, ...where } }
+      return ok({ op, file, ...where })
     }
 
     case 'moveHook': {
@@ -519,13 +626,13 @@ export function parseHooksRequest(body: unknown): RequestParse {
       if (typeof where === 'string') return { ok: false, reason: where }
       const direction = body.direction === -1 ? -1 : body.direction === 1 ? 1 : undefined
       if (direction === undefined) return { ok: false, reason: 'direction 必须是 -1 或 1' }
-      return { ok: true, request: { op, file, ...where, direction } }
+      return ok({ op, file, ...where, direction })
     }
 
     case 'removeGroup': {
       const base = head()
       if (typeof base === 'string') return { ok: false, reason: base }
-      return { ok: true, request: { op, file, ...base } }
+      return ok({ op, file, ...base })
     }
 
     default:

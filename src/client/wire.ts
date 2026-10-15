@@ -75,12 +75,58 @@ export interface EventView {
   runCount: number
 }
 
+/** 实际生效的作用域（宿主回显）。页面所有写请求都必须按它构造（§2.2）。 */
+export interface ScopeView {
+  kind: 'user' | 'workspace'
+  requested: 'current' | 'user' | 'workspace'
+  workspaceId: string | null
+  workspaceTitle: string | null
+  /** 工作区路径。**它不等于项目根**（见下面 `projectRoot`）。 */
+  workspacePath: string | null
+  /** 这份 project 文件的**项目根**（最近含 `.git` 的祖先）；`kind === 'user'` 时为 null。 */
+  projectRoot: string | null
+  /** 选中的工作区是不是当前会话的项目根；`null` = **当前会话未知**（不编造）。 */
+  isCurrentSession: boolean | null
+}
+
+/** 工作区清单里的一项（下拉框用）。 */
+export interface WorkspaceItemView {
+  id: string
+  title: string
+  path: string
+  projectRoot: string
+  isCurrent: boolean
+}
+
+/**
+ * 「当前会话实际会跑什么」的条数口径（AGENTS §2.6）。
+ *
+ * ⚠️ **三态**：null = 当前会话未知（没有 sessionId / 它的项目根拿不到）——
+ * 页面必须说"当前会话未知，无法判断实际会跑什么"，**绝不许**显示"当前会话生效 0 条"。
+ */
+export interface SessionEffectView {
+  projectRoot: string
+  hookCount: number
+  disabledCount: number
+  groupCount: number
+  fromUser: number
+  fromProject: number
+  staleInUse: boolean
+}
+
 /** `GET /api/hooks` 的成功载荷。 */
 export interface HooksSnapshot {
   route: string
   projectRoot: string | null
   cwd: string | null
   cwdSource: 'session' | 'initiator' | 'none'
+  /** 宿主回显的作用域（页面用它做"我是不是在看当前会话的项目"的判断）。 */
+  scope: ScopeView
+  workspaces: WorkspaceItemView[]
+  /** `false` = 宿主没有工作区清单（≠ 没有工作区）—— 页面必须明说，不许渲染成空下拉。 */
+  workspacesAvailable: boolean
+  /** null = 当前会话未知（三态）。 */
+  session: SessionEffectView | null
   files: FileView[]
   events: EventView[]
   total: { hookCount: number; disabledCount: number; groupCount: number }

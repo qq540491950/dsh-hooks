@@ -168,6 +168,34 @@ export interface AgentsService {
   get?(id: string): AgentLike | undefined
 }
 
+/**
+ * 一条工作区记录（**最小形状**，只声明我们读的字段）。
+ *
+ * 官方 `dsh-workspace` 的记录还有 `createdAt` / `updatedAt` / `sessionIds`（已核实），
+ * 但本插件一个都不用 —— 只声明用得到的，版本升级时多出来的字段不该让插件编译不过。
+ * `path` 是 **realpath 规范化**过的绝对路径。
+ *
+ * ⚠️ 工作区路径 **≠** 项目根：`projectRoot` = 最近含 `.git` 的祖先（可能就在 `path` 上，
+ * 也可能是它的某个父目录）。所以两者必须分别给页面看，不能互相代替。
+ */
+export interface WorkspaceRecord {
+  id: string
+  path: string
+  title?: string
+}
+
+/**
+ * `ctx.get('workspaceRegistry')`（dsh-workspace 注册；desktop 载体上真实存在）。
+ *
+ * 返回类型刻意写成 `unknown`（与 `SandboxPolicyService` 同款防御性声明）：服务给回来的是
+ * **不可信运行时数据**，由宿主侧自己收窄成 {@link WorkspaceRecord}。
+ * 两个成员都可选：缺 `list` 时"扁平清单"这条能力不可用，缺 `get` 时退回 `list().find`。
+ */
+export interface WorkspaceService {
+  list?(): unknown
+  get?(id: string): unknown
+}
+
 /** 工具调用（`tools/pre-execute` 的 exec）。 */
 export interface ToolExecution {
   readonly name: string
@@ -248,6 +276,12 @@ export interface HostContext {
   inject(deps: readonly string[], callback: (scope: HostContext) => void): unknown
   get(name: 'sandboxPolicy'): SandboxPolicyService | undefined
   get(name: 'agents'): AgentsService | undefined
+  /**
+   * 工作区清单（`dsh-workspace`）。**每次请求时现取**，不要在 `apply()` 里读属性 ——
+   * 与 `connection` 同理：Cordis 的服务是渐进可用的，apply 时刻它可能还没加载
+   * （AGENTS §2.12 记的线上事故就是这个形状）。服务缺席 ⇒ 页面说"宿主没有提供工作区清单"。
+   */
+  get(name: 'workspaceRegistry'): WorkspaceService | undefined
   get(name: string): unknown
   on<E extends keyof HostEvents>(event: E, handler: HostEvents[E]): void
   /**

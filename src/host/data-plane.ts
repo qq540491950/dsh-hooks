@@ -46,18 +46,48 @@ export interface SourceInspection {
 /** 宿主提供的一次完整检视结果。 */
 export interface HooksInspection {
   /**
-   * 当前项目根。**`null` = 无法确定当前项目**（没有会话上下文）——
+   * 当前会话的项目根。**`null` = 无法确定当前项目**（没有会话上下文）——
    * 这时只列用户级配置，绝不编造一个 workspace 路径（AGENTS §2.8）。
+   *
+   * ⚠️ 它**永远是"当前会话在哪里"**，与所选作用域无关 —— 页面据此判断"我是不是在看
+   * 当前会话的项目"（见 {@link ScopeView.isCurrentSession}）。
    */
   projectRoot: string | null
   /** 会话 cwd；**拿不到就是 null，不编造**。 */
   cwd: string | null
   /** cwd 是从哪来的 —— 如实报告来源，页面才能说清"这个项目是怎么定的"。 */
   cwdSource: 'session' | 'initiator' | 'none'
-  /** 正常情况恒为 2 项（项目级、用户级）；项目无法确定时只有用户级 1 项。 */
+  /** 实际生效的作用域（回显）—— 页面所有写操作都必须按它构造请求体（§2.2）。 */
+  scope: ScopeView
+  /** 可选的工作区清单（下拉框用）。`workspacesAvailable === false` 时它恒为空数组。 */
+  workspaces: WorkspaceItemView[]
+  /** **`false` = 宿主没有 `workspaceRegistry`**（≠ 没有工作区）：页面必须明说，不许渲染空下拉。 */
+  workspacesAvailable: boolean
+  /**
+   * 「当前会话实际会跑的是什么」——**与所选作用域无关**（AGENTS §2.6）。
+   *
+   * ⚠️ **三态**（AGENTS §2.8/§2.9：「读不到」≠「没有」）：`null` = 当前会话的项目根拿不到
+   * （没有 sessionId / agent 查不到），此时**一个数字都不许编** —— 页面必须说"当前会话未知，
+   * 无法判断实际会跑什么"，而不是显示"当前会话生效 0 条"。
+   *
+   * 作用域是"看/改哪一份文件"，运行时是"用户级 + 会话自己项目级的合并"；两个问题不同源，
+   * 所以答案也必须分开给（`scope=user` 时生效视图只有用户级，光看它回答不了"实际会跑什么"）。
+   */
+  session: SessionEffectView | null
+  /** 正常情况恒为 2 项（项目级、用户级）；项目无法确定或 `scope=user` 时只有用户级 1 项。 */
   sources: SourceInspection[]
-  /** 生效配置（用户级在前 + 项目级在后，跨来源同事件拼接）。 */
+  /** 所选作用域的生效配置（用户级在前 + 项目级在后，跨来源同事件拼接）。 */
   effective: ParsedGroups
+  /**
+   * **参与合并**的两份（就是 `effective` 的来源，磁盘或 last-good 由同一条路径决定）。
+   *
+   * 页面要回答"每条生效 hook 来自哪个文件"、"用户级几条 / 项目级几条" —— 那两个数字必须取自
+   * 这里。用"新鲜读"会在 stale（沿用上一份可用配置）时得到 0 / 0，与 `effective` 的条数打架
+   * （`fromUser + fromProject === hookCount` 是必须成立的不变式）。
+   * `files[]` 的条数与 state 仍用**新鲜读** —— 那是"这份文件此刻长什么样"，本来就该新鲜。
+   */
+  effectiveUserGroups: ParsedGroups
+  effectiveProjectGroups: ParsedGroups
   /** 生效配置是否来自"沿用上一份可用配置"（磁盘当前读不出来）。 */
   staleInUse: boolean
   /**
@@ -69,6 +99,58 @@ export interface HooksInspection {
   writable: boolean
   /** 有界执行台账（§2.11）。**状态色的唯一证据来源**（§3.8）。 */
   ledger: LedgerEntry[]
+}
+
+/** 实际生效的作用域（回显给页面）。 */
+export interface ScopeView {
+  /** 解析后的种类：`current` 归一成这两者之一（没有会话上下文的 `current` 等于 `user`）。 */
+  kind: 'user' | 'workspace'
+  /** 客户端**请求**的作用域（原始值，便于页面说清"为什么落到这里"）。 */
+  requested: 'current' | 'user' | 'workspace'
+  /** `kind === 'workspace'` 时是工作区 id；工作区信息不可知（`current` 会话）时为 null。 */
+  workspaceId: string | null
+  workspaceTitle: string | null
+  /** 工作区路径。**它不等于项目根**（见 {@link ScopeView.projectRoot}）。 */
+  workspacePath: string | null
+  /**
+   * 这份 project 文件的**项目根**（最近含 `.git` 的祖先）；`kind === 'user'` 时为 null。
+   * 与 `workspacePath` 不同时页面必须**分别显示**（否则用户会问"我改的是 A，为什么落到 B"）。
+   */
+  projectRoot: string | null
+  /** 选中的工作区是不是当前会话的项目根；`null` = 当前会话未知（**不编造**，AGENTS §2.8）。 */
+  isCurrentSession: boolean | null
+}
+
+/** 工作区清单里的一项（下拉框用）。 */
+export interface WorkspaceItemView {
+  id: string
+  title: string
+  /** 工作区路径（realpath 规范化过的绝对路径）。 */
+  path: string
+  /** 该工作区解析出的项目根（最近含 `.git` 的祖先）。 */
+  projectRoot: string
+  /** 是不是当前会话的项目根。 */
+  isCurrent: boolean
+}
+
+/**
+ * 当前会话真正会跑的合并配置的**条数口径**（不重复给 groups：页面要的是那两个数字）。
+ *
+ * `hookCount` **不含** `disabled`（停用单独计数，否则页面会把"已停用"显示成"在跑"）。
+ * 整块为 `null` 表示"当前会话未知"（见 {@link HooksInspection.session}）—— 计数一律不编。
+ */
+export interface SessionEffectView {
+  /** 当前会话的项目根。**一定有值**：拿不到时整块为 `null`（三态，不填 `null` 假值）。 */
+  projectRoot: string
+  hookCount: number
+  disabledCount: number
+  groupCount: number
+  /** 用户级贡献的启用条数。 */
+  fromUser: number
+  /** 项目级贡献的启用条数。 */
+  fromProject: number
+  /** 这份合并配置是不是 last-good 兜底。 */
+  staleInUse: boolean
 }
 
 /** 最近一次**真实**执行的证据（每条都来自台账，绝不是"没报错"推出来的）。 */
@@ -170,6 +252,14 @@ export interface HooksSnapshot {
   projectRoot: string | null
   cwd: string | null
   cwdSource: 'session' | 'initiator' | 'none'
+  /** 实际生效的作用域（回显）。**页面每次写请求都必须按它带 `workspaceId`**（§2.2）。 */
+  scope: ScopeView
+  /** 可选的工作区清单。 */
+  workspaces: WorkspaceItemView[]
+  /** `false` = 宿主没有工作区清单（≠ 没有工作区）。 */
+  workspacesAvailable: boolean
+  /** 当前会话实际会跑的合并配置（与所选作用域无关，AGENTS §2.6）；`null` = 当前会话未知。 */
+  session: SessionEffectView | null
   files: FileView[]
   /** **固定 7 项**，顺序即事件表顺序，含 0 条的事件（AGENTS §3.6）。 */
   events: EventView[]
@@ -192,7 +282,7 @@ export interface HooksErrorBody {
 /** 把解析结果里的一个 group 折成可渲染形状（含**文件下标**与最近执行证据）。 */
 function groupViewOf(
   group: ParsedGroup,
-  options: { file: FileKind | null; event: HookEvent; ledger: LedgerEntry[] },
+  options: { file: FileKind | null; event: HookEvent; ledger: LedgerEntry[]; projectRoot: string },
 ): GroupView {
   const matcher = group.matcher ?? null
   const problem = matcherDiagnostic(matcher ?? undefined)
@@ -203,9 +293,13 @@ function groupViewOf(
     matcherOk: problem === undefined,
     matcherProblem: problem ?? null,
     hooks: group.hooks.map((hook) => {
-      // 匹配条件是 `event + command` **两者都要**：命令改过之后旧记录不再匹配 → 行退回"未运行"
-      // 的灰色，而不是拿**旧命令**的结果给新命令画绿（AGENTS §3.8）。
-      const record = latestRunFor(options.ledger, options.event, hook.command)
+      // 匹配条件是 `event + command + projectRoot` **三者都要**：命令改过之后旧记录不再匹配
+      // （行退回"未运行"的灰色），别的项目里跑过的同命令也不会给这一行上色（AGENTS §3.8 + §2.3）。
+      const record = latestRunFor(options.ledger, {
+        event: options.event,
+        command: hook.command,
+        projectRoot: options.projectRoot,
+      })
       return {
         rawIndex: hook.rawIndex,
         command: hook.command,
@@ -260,7 +354,9 @@ function runCountFor(ledger: LedgerEntry[], event: HookEvent): number {
  */
 export function buildSnapshot(inspection: HooksInspection): HooksSnapshot {
   const ledger = inspection.ledger
-  const userSource = inspection.sources.find((source) => source.kind === 'user')
+  // 台账匹配用的项目根：**所选作用域**的项目根（工作区作用域下就是那个工作区的根）。
+  // 这是"别的项目的绿点不许给这一行上色"的落地（§2.3）。
+  const projectRoot = inspection.scope.projectRoot ?? inspection.projectRoot ?? ''
 
   const files: FileView[] = inspection.sources.map((source) => {
     let hookCount = 0
@@ -270,7 +366,7 @@ export function buildSnapshot(inspection: HooksInspection): HooksSnapshot {
       hookCount += count.hookCount + count.disabledCount
       return {
         event,
-        groups: parsed.map((group) => groupViewOf(group, { file: source.kind, event, ledger })),
+        groups: parsed.map((group) => groupViewOf(group, { file: source.kind, event, ledger, projectRoot })),
         hookCount: count.hookCount,
         disabledCount: count.disabledCount,
         runCount: runCountFor(ledger, event),
@@ -294,22 +390,21 @@ export function buildSnapshot(inspection: HooksInspection): HooksSnapshot {
   let totalGroups = 0
   const events: EventView[] = HOOK_EVENTS.map((event) => {
     const count = countsFor(inspection.effective, event)
-    let fromUser = 0
-    let fromProject = 0
-    for (const source of inspection.sources) {
-      const hits = countsFor(source.groups, event).hookCount
-      if (source.kind === 'user') fromUser += hits
-      else fromProject += hits
-    }
-    // 生效视图的来源（合并顺序 = 用户级在前 + 项目级在后，所以按用户级条数切一刀就能定来源）。
+    // 来源条数取自**参与合并的两份**（与 `hookCount` 同源）：`fromUser + fromProject === hookCount`
+    // 是结构性的。旧的写法遍历 `sources`（**新鲜读**），stale 时会得到 0 / 0 而生效条数是 5
+    // —— 页面于是显示"生效 5 条（用户级 0 + 项目级 0）"，与 stale 横幅自相矛盾。
+    const fromUser = countsFor(inspection.effectiveUserGroups, event).hookCount
+    const fromProject = countsFor(inspection.effectiveProjectGroups, event).hookCount
+    // 生效视图的来源（合并顺序 = 用户级在前 + 项目级在后，所以按用户级组数切一刀就能定来源）。
     // `staleInUse` 时生效配置来自 last-good，与磁盘上的来源对不上 → 给 `null`，
     // 页面据此**禁用编辑**（它本来就是读不懂的状态），而不是猜一个文件出来。
-    const userCount = (userSource?.groups[event] ?? []).length
+    const userCount = (inspection.effectiveUserGroups[event] ?? []).length
     const groups = (inspection.effective[event] ?? []).map((group, index) =>
       groupViewOf(group, {
         file: inspection.staleInUse ? null : index < userCount ? 'user' : 'project',
         event,
         ledger,
+        projectRoot,
       }),
     )
     totalHooks += count.hookCount
@@ -331,6 +426,11 @@ export function buildSnapshot(inspection: HooksInspection): HooksSnapshot {
     projectRoot: inspection.projectRoot,
     cwd: inspection.cwd,
     cwdSource: inspection.cwdSource,
+    // 作用域三件套原样透传（纯函数不做任何推导：它是宿主的答案，页面只负责显示与回传）。
+    scope: inspection.scope,
+    workspaces: inspection.workspaces,
+    workspacesAvailable: inspection.workspacesAvailable,
+    session: inspection.session,
     files,
     events,
     total: { hookCount: totalHooks, disabledCount: totalDisabled, groupCount: totalGroups },
@@ -374,6 +474,66 @@ function sessionIdOf(request: Request): string | undefined {
   }
 }
 
+/**
+ * "看/改**哪一份**文件"的显式作用域参数。
+ *
+ * 路由只做**字符串收窄**（语义在宿主）：
+ *   - `current`：会话 cwd 解析出的那份项目文件（**缺省值** —— 保住旧客户端的语义）；
+ *   - `user`：`$DSH_HOME/hooks.json`；
+ *   - `workspace`：`root(workspaceId)/.dsh/hooks.json`，`workspaceId` 必给。
+ *
+ * ⚠️ 这是**编辑**作用域，不是运行时开关：hook 仍然按触发事件的会话 cwd 跑（AGENTS §2.6）。
+ */
+export type ScopeTarget = { kind: 'current' } | { kind: 'user' } | { kind: 'workspace'; workspaceId: string }
+
+/** 作用域参数解析结果。 */
+type ScopeParse = { ok: true; target: ScopeTarget } | { ok: false; reason: string }
+
+/** 从 query 解析作用域（`scope` 缺省 = `current`）。**只做字符串收窄**，不认识的一律 400。 */
+function scopeOf(request: Request): ScopeParse {
+  let url: URL
+  try {
+    url = new URL(request.url)
+  } catch {
+    // 相对 URL：与 sessionId 同理，退回缺省语义比 500 有用。
+    return { ok: true, target: { kind: 'current' } }
+  }
+  const scope = url.searchParams.get('scope')
+  if (scope === null || scope === '' || scope === 'current') return { ok: true, target: { kind: 'current' } }
+  if (scope === 'user') return { ok: true, target: { kind: 'user' } }
+  if (scope === 'workspace') {
+    const workspaceId = url.searchParams.get('workspaceId')
+    if (workspaceId === null || workspaceId.length === 0) {
+      return { ok: false, reason: 'scope=workspace 时必须给 workspaceId' }
+    }
+    return { ok: true, target: { kind: 'workspace', workspaceId } }
+  }
+  return { ok: false, reason: `未知的 scope ${JSON.stringify(scope)}（只认 current / user / workspace）` }
+}
+
+/** 把写请求的 `file` + `workspaceId` 归一成作用域（写路径与读路径**同一个**类型）。 */
+function writeTargetOf(file: FileKind, workspaceId: string | undefined): ScopeTarget {
+  if (file === 'user') return { kind: 'user' }
+  // 给了 workspaceId 就必须按它解析 —— 解析不到就拒写，**绝不回落**会话项目（§2.2）。
+  return workspaceId === undefined ? { kind: 'current' } : { kind: 'workspace', workspaceId }
+}
+
+/**
+ * 作用域解析失败（工作区不在清单里、宿主没有清单…）。
+ *
+ * 用异常而不是返回值：`inspect` 要么给出一份完整快照，要么**明确失败**，没有第三种形状 ——
+ * 返回值联合会让每个调用点都要多判一次，而漏判的那次就是把"看不到"糊成"空配置"。
+ * 路由捕获它并翻成**精确**状态码（不是 500）。
+ */
+export class ScopeError extends Error {
+  readonly code: string
+  constructor(code: string, message: string) {
+    super(message)
+    this.name = 'ScopeError'
+    this.code = code
+  }
+}
+
 /** 一次写入的结果（宿主给，路由只负责翻成 HTTP）。 */
 export interface WriteOutcome {
   ok: boolean
@@ -390,6 +550,8 @@ export interface DryRunRequest {
   groupIndex: number
   /** **文件里的** hook 下标（`rawIndex`）。 */
   hookIndex: number
+  /** 与写请求同一套作用域字段：`file:'project'` + 选中工作区时必须给（§2.2）。 */
+  workspaceId?: string
 }
 
 /** 试运行结果。`exitCode: null` = 子进程没起来（与台账里的语义一致）。 */
@@ -408,9 +570,11 @@ export interface DryRunOutcome {
 }
 
 /** 校验试运行请求。畸形请求一律 400，绝不让它走到执行路径。 */
-function parseDryRunRequest(body: unknown): { ok: true; request: DryRunRequest } | { ok: false; reason: string } {
+function parseDryRunRequest(
+  body: unknown,
+): { ok: true; request: DryRunRequest; target: ScopeTarget } | { ok: false; reason: string } {
   if (!isObject(body)) return { ok: false, reason: '请求体不是对象' }
-  const { file, event, groupIndex, hookIndex } = body
+  const { file, event, groupIndex, hookIndex, workspaceId } = body
   if (file !== 'project' && file !== 'user') return { ok: false, reason: 'file 必须是 project / user' }
   if (typeof event !== 'string') return { ok: false, reason: 'event 不是支持的 7 个事件之一' }
   if (!isHookEvent(event)) return { ok: false, reason: 'event 不是支持的 7 个事件之一' }
@@ -420,14 +584,35 @@ function parseDryRunRequest(body: unknown): { ok: true; request: DryRunRequest }
   if (typeof hookIndex !== 'number' || !Number.isInteger(hookIndex) || hookIndex < 0) {
     return { ok: false, reason: 'hookIndex 必须是非负整数' }
   }
-  return { ok: true, request: { file, event, groupIndex, hookIndex } }
+  // 与写路径同一条纪律（§2.2）：试运行也要定点到被选中的作用域，绝不回落会话项目。
+  if (workspaceId !== undefined) {
+    if (typeof workspaceId !== 'string' || workspaceId.length === 0) {
+      return { ok: false, reason: 'workspaceId 必须是非空字符串' }
+    }
+    if (file === 'user') return { ok: false, reason: 'file 为 user 时不许带 workspaceId' }
+  }
+  const request: DryRunRequest =
+    workspaceId === undefined
+      ? { file, event, groupIndex, hookIndex }
+      : { file, event, groupIndex, hookIndex, workspaceId }
+  return { ok: true, request, target: writeTargetOf(file, workspaceId) }
 }
 
-/** 路由需要的三个能力：读快照、定点写、试运行。 */
+/** 路由需要的三个能力：读快照、定点写、试运行。**都带显式作用域**（`target`）。 */
 export interface RouteDeps {
-  inspect(sessionId: string | undefined): Promise<HooksInspection>
-  write(request: HooksRequest, sessionId: string | undefined, signal: AbortSignal): Promise<WriteOutcome>
-  dryRun(request: DryRunRequest, sessionId: string | undefined, signal: AbortSignal): Promise<DryRunOutcome>
+  inspect(sessionId: string | undefined, target: ScopeTarget): Promise<HooksInspection>
+  write(
+    request: HooksRequest,
+    target: ScopeTarget,
+    sessionId: string | undefined,
+    signal: AbortSignal,
+  ): Promise<WriteOutcome>
+  dryRun(
+    request: DryRunRequest,
+    target: ScopeTarget,
+    sessionId: string | undefined,
+    signal: AbortSignal,
+  ): Promise<DryRunOutcome>
 }
 
 /**
@@ -445,9 +630,13 @@ function statusFor(error: string | undefined): number {
     case 'invalid-json':
     case 'no-project':
     case 'no-version':
+    // 宿主没有工作区清单：不是"你的请求错了"，而是"这个宿主给不了那个能力"。
+    case 'no-workspace-registry':
       return 409
     case 'absent':
     case 'not-found':
+    // 工作区已经不在清单里（可能被删过）—— 当成"目标不存在"，与 not-found 同档。
+    case 'unknown-workspace':
       return 404
     case 'sandbox':
       return 403
@@ -486,7 +675,7 @@ export function registerHooksRoute(connection: ConnectionFetchBridge, deps: Rout
           if (isObject(body) && body.op === 'dryRun') {
             const parsedDryRun = parseDryRunRequest(body)
             if (!parsedDryRun.ok) return jsonResponse(400, { ok: false, error: 'bad-op', detail: parsedDryRun.reason })
-            const outcome = await deps.dryRun(parsedDryRun.request, sessionId, request.signal)
+            const outcome = await deps.dryRun(parsedDryRun.request, parsedDryRun.target, sessionId, request.signal)
             if (!outcome.ok) {
               return jsonResponse(statusFor(outcome.error), {
                 ok: false,
@@ -499,7 +688,12 @@ export function registerHooksRoute(connection: ConnectionFetchBridge, deps: Rout
           const parsed = parseHooksRequest(body)
           if (!parsed.ok) return jsonResponse(400, { ok: false, error: 'bad-op', detail: parsed.reason })
           // `request.signal`：客户端断开时中止这次写入（官方契约里桥接器会中止处理函数的信号）。
-          const outcome = await deps.write(parsed.request, sessionId, request.signal)
+          const outcome = await deps.write(
+            parsed.request,
+            writeTargetOf(parsed.request.file, parsed.request.workspaceId),
+            sessionId,
+            request.signal,
+          )
           if (!outcome.ok) {
             return jsonResponse(statusFor(outcome.error), {
               ok: false,
@@ -512,9 +706,15 @@ export function registerHooksRoute(connection: ConnectionFetchBridge, deps: Rout
             data: { file: parsed.request.file, version: outcome.version ?? null },
           })
         }
-        const inspection = await deps.inspect(sessionId)
+        const scope = scopeOf(request)
+        if (!scope.ok) return jsonResponse(400, { ok: false, error: 'bad-op', detail: scope.reason })
+        const inspection = await deps.inspect(sessionId, scope.target)
         return jsonResponse(200, { ok: true, data: buildSnapshot(inspection) })
       } catch (error) {
+        // 作用域解析失败要**精确**说清（404 工作区不在清单 / 409 宿主没有清单），不许糊成 500。
+        if (error instanceof ScopeError) {
+          return jsonResponse(statusFor(error.code), { ok: false, error: error.code, detail: error.message })
+        }
         // 技术原文留在 detail 里，页面自己决定怎么措辞 —— 绝不把 FsError 原文当主文案。
         return jsonResponse(500, { ok: false, error: 'internal', detail: messageOf(error) })
       }

@@ -30,6 +30,14 @@ export interface LedgerEntry {
   event: HookEvent
   /** 执行的那条命令（**完整**，匹配用；输出才截断）。 */
   command: string
+  /**
+   * 这次执行发生在哪个项目根下（`RunContext.projectRoot`）。
+   *
+   * 为什么必须记：同一个 `ctx` 服务所有会话 —— 两个项目里**命令字面相同**的 hook 会互相
+   * 上色（在 A 项目看到 B 项目的绿点）。旧的"只看当前项目"页面里这已经是隐患，换成作用域
+   * 下拉框后会直接被用户看见，所以匹配条件必须是 `event + command + projectRoot` 三者。
+   */
+  projectRoot: string
   /** `undefined` = 子进程没起来（infra 失败），这本身是正面证据。 */
   exitCode: number | undefined
   /** 解码后的判决：`deny` / `ask` / `allow` / `block` / `none` / `pass`。 */
@@ -90,14 +98,26 @@ export class ExecutionLedger {
 /**
  * 找某条 hook 的最近一次**真实**执行记录。
  *
- * 匹配条件是 `event + command` **两者都要**：命令改过之后旧记录就不再匹配 ——
- * 于是行会退回"未运行"的灰色，而不是拿**旧命令**的结果给新命令画绿。
- * 这是 §3.8 里"缓存记录不能给不同 command 上色"的落地方式。
+ * 匹配条件是 `event + command + projectRoot` **三者都要**：
+ *   - 命令改过之后旧记录不再匹配 —— 行会退回"未运行"的灰色，而不是拿**旧命令**的结果给
+ *     新命令画绿（这是 §3.8 里"缓存记录不能给不同 command 上色"的落地方式）；
+ *   - **项目根**也要匹配 —— 否则同一条命令在别的项目跑过，会在这里给这一行上色
+ *     （切工作区就能看到"别的项目的绿点"，见 §2.3）。
  */
-export function latestRunFor(entries: LedgerEntry[], event: HookEvent, command: string): LedgerEntry | undefined {
+export function latestRunFor(
+  entries: LedgerEntry[],
+  query: { event: HookEvent; command: string; projectRoot: string },
+): LedgerEntry | undefined {
   for (let i = entries.length - 1; i >= 0; i--) {
     const entry = entries[i]
-    if (entry !== undefined && entry.event === event && entry.command === command) return entry
+    if (
+      entry !== undefined &&
+      entry.event === query.event &&
+      entry.command === query.command &&
+      entry.projectRoot === query.projectRoot
+    ) {
+      return entry
+    }
   }
   return undefined
 }

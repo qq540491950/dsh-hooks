@@ -55,6 +55,9 @@ import {
   starterText,
 } from '../src/host/write.ts'
 
+// 客户端**写请求层**：唯一的"作用域 → 请求体"构造函数（§2.2）。纯函数，不需要浏览器 / react。
+import { CURRENT_SCOPE, dryRunFor, intentFor, scopeQuery, scopeTargetOf } from '../src/client/write.ts'
+
 const HERE = path.dirname(fileURLToPath(import.meta.url))
 const LIB = path.join(HERE, '..', 'lib', 'index.js')
 const CLIENT = path.join(HERE, '..', 'lib', 'client.js')
@@ -67,7 +70,9 @@ const failures = []
 function test(title, fn) {
   const onError = (error) => {
     failed++
-    const detail = error && error.stack ? error.stack.split('\n').slice(0, 3).join('\n    ') : String(error)
+    // 失败详情多给几行：assert 的"实际 / 期望"是 message 的一部分，只截 3 行会把值截掉
+    // （排查时最需要的那半句正好没了）。
+    const detail = error && error.stack ? error.stack.split('\n').slice(0, 8).join('\n    ') : String(error)
     failures.push(`${title}\n    ${detail}`)
   }
   try {
@@ -250,6 +255,57 @@ await test('C：假 loader 真跑 factory —— 经 ctx.inject(["slots"]) 注�
   assert.equal(typeof registrations[0].component, 'function')
 })
 
+test('C：作用域 → 请求体的**唯一**构造函数（选中工作区时每个 op 都必须带 workspaceId）', () => {
+  // 这条是 §2.2 的地基：只要有一个 op 的请求体漏了 `workspaceId`，宿主就会按会话 cwd 落笔
+  // —— 页面看着 A 项目、改到 B 项目，而且**静默**。所以每个 op 都逐个验一遍。
+  const ops = [
+    { op: 'createFile' },
+    { op: 'setHookDisabled', event: 'PreToolUse', groupIndex: 0, hookIndex: 1, disabled: true },
+    { op: 'setHookCommand', event: 'PreToolUse', groupIndex: 0, hookIndex: 1, command: 'x' },
+    { op: 'setHookTimeout', event: 'PreToolUse', groupIndex: 0, hookIndex: 1, timeoutSec: 30 },
+    { op: 'setGroupMatcher', event: 'PreToolUse', groupIndex: 0, matcher: null },
+    { op: 'addHook', event: 'PreToolUse', groupIndex: 0, command: 'x', timeoutSec: null },
+    { op: 'addGroup', event: 'PreToolUse', matcher: 'pwsh', command: 'x', timeoutSec: null },
+    { op: 'removeHook', event: 'PreToolUse', groupIndex: 0, hookIndex: 1 },
+    { op: 'moveHook', event: 'PreToolUse', groupIndex: 0, hookIndex: 1, direction: 1 },
+    { op: 'removeGroup', event: 'PreToolUse', groupIndex: 0 },
+  ]
+  for (const op of ops) {
+    const workspaceBody = intentFor('w-1', op)
+    assert.equal(workspaceBody.file, 'project', `${op.op}：工作区作用域 → file 必须是 project`)
+    assert.equal(workspaceBody.workspaceId, 'w-1', `${op.op}：★ 选中工作区时**必须**带 workspaceId（§2.2）`)
+    const userBody = intentFor('user', op)
+    assert.equal(userBody.file, 'user', `${op.op}：用户级作用域 → file 必须是 user`)
+    assert.equal('workspaceId' in userBody, false, `${op.op}：用户级作用域不许带 workspaceId`)
+  }
+  // 试运行同一套寻址
+  assert.deepEqual(dryRunFor('w-1', { event: 'PreToolUse', groupIndex: 0, hookIndex: 1 }), {
+    file: 'project',
+    workspaceId: 'w-1',
+    event: 'PreToolUse',
+    groupIndex: 0,
+    hookIndex: 1,
+  })
+  assert.equal('workspaceId' in dryRunFor('user', { event: 'Stop', groupIndex: 0, hookIndex: 0 }), false)
+  // ★ `'current'`（**当前会话的项目**）：它必须**不带** workspaceId —— 带上就等于谎称"它是某个
+  //   工作区"，宿主会照白名单去查 → `unknown-workspace`（404）。这是"会话项目不在清单里时页面
+  //   也能编辑它"的唯一落地方式。
+  assert.deepEqual(scopeTargetOf(CURRENT_SCOPE), { file: 'project' })
+  assert.equal('workspaceId' in scopeTargetOf(CURRENT_SCOPE), false)
+  assert.deepEqual(intentFor(CURRENT_SCOPE, { op: 'createFile' }), { file: 'project', op: 'createFile' })
+  for (const op of ops) {
+    const body = intentFor(CURRENT_SCOPE, op)
+    assert.equal(body.file, 'project', `${op.op}：当前会话项目 → file 必须是 project`)
+    assert.equal('workspaceId' in body, false, `${op.op}：当前会话项目**不许**带 workspaceId（带=404）`)
+  }
+  assert.equal('workspaceId' in dryRunFor(CURRENT_SCOPE, { event: 'Stop', groupIndex: 0, hookIndex: 0 }), false)
+  // 读也必须定点（否则看的是当前会话项目、写的是选中的工作区 —— 另一条"看着 A 改到 B"）
+  assert.equal(scopeQuery('user'), '?scope=user')
+  assert.equal(scopeQuery(CURRENT_SCOPE), '?scope=current', '当前会话项目走 scope=current（不是 workspace）')
+  assert.equal(scopeQuery('w-1'), '?scope=workspace&workspaceId=w-1')
+  assert.equal(scopeQuery('a b&c'), '?scope=workspace&workspaceId=a%20b%26c')
+})
+
 //#endregion
 
 //#region D. 真实渲染（假 React + 假 fetch；渲染的是**产物里注册到座位上的那个组件**）
@@ -306,6 +362,14 @@ function createFakeReact() {
       // 表单控件：渲染测试要能读到**当前值**并模拟输入（§4.5：输入后要重新渲染再看）。
       value: typeof props.value === 'string' ? props.value : undefined,
       onChange: typeof props.onChange === 'function' ? props.onChange : undefined,
+      // UI 纪律要求开关是 `role="switch"` + `aria-checked`（§6.4）—— 这两个属性必须能被断言，
+      // 否则"语义正确"只能靠读代码。`tag` 是**宿主标签名**（select/option/optgroup/button/textarea），
+      // `type` 是 `type=` 属性（button / text），两者不能混。
+      tag: typeof node.type === 'string' ? node.type : undefined,
+      role: typeof props.role === 'string' ? props.role : undefined,
+      ariaChecked: props['aria-checked'],
+      type: typeof props.type === 'string' ? props.type : undefined,
+      disabled: props.disabled === true,
     })
     flatten(node.children, out)
     return out
@@ -351,7 +415,11 @@ function componentFromArtifact(react) {
 
 /** 渲染一次 + 跑完 effect 引发的重渲染。 */
 async function renderSection(component, harness, respond) {
-  globalThis.fetch = async () => ({ json: async () => respond })
+  // `respond` 可以是对象（所有请求同一个回答），也可以是 `(url, options) => body` ——
+  // 后者是切换作用域必须的：GET 会按 `scope=` 拿到**不同**的快照（D16/D17 就靠它）。
+  globalThis.fetch = async (url, options) => ({
+    json: async () => (typeof respond === 'function' ? respond(String(url), options ?? {}) : respond),
+  })
   const pass = () => {
     harness.begin()
     return component()
@@ -365,93 +433,249 @@ async function renderSection(component, harness, respond) {
   return harness.flatten(tree)
 }
 
-await test('D：真实渲染 —— 7 个事件全列、三态分别说清、状态色只来自台账', async () => {
-  // 造一个"什么情况都有"的快照：三态文件各一个 + 四种状态的 hook。
-  const run = (exitCode, decision) => ({ at: 1, exitCode, decision, durationMs: 12, stdout: '', stderr: 'out' })
-  const hook = (rawIndex, command, extra = {}) => ({
-    rawIndex,
-    command,
-    timeoutSec: null,
-    defaultTimeoutSec: 600,
-    disabled: false,
-    lastRun: null,
-    ...extra,
-  })
-  const groups = [
-    {
-      file: 'project',
-      rawIndex: 0,
-      matcher: 'pwsh',
-      matcherOk: true,
-      matcherProblem: null,
-      hooks: [
-        hook(0, 'echo never-run'),
-        hook(1, 'echo ok', { lastRun: run(0, 'pass') }),
-        hook(2, 'echo deny', { lastRun: run(0, 'deny') }),
-        hook(3, 'echo off', { disabled: true }),
-      ],
-    },
-  ]
-  const fileOf = (kind, state, own = []) => {
-    let hookCount = 0
-    let disabledCount = 0
-    for (const group of own) {
+/**
+ * 状态变更后的"推进"：重新渲染 → 跑这次收集的 effect → 等微任务 → 若状态又变了再渲染一次。
+ *
+ * §4.5：事件闭包是**当次渲染**的，点了/输入了之后必须重新渲染再查 DOM，
+ * 拿旧节点继续断言的测试会"测到一个已经不存在的界面"。
+ */
+async function advance(component, harness) {
+  harness.begin()
+  let tree = component()
+  for (const effect of harness.store.effects) effect()
+  await new Promise((resolve) => setTimeout(resolve, 0))
+  await new Promise((resolve) => setTimeout(resolve, 0))
+  if (harness.store.dirty) {
+    harness.begin()
+    tree = component()
+  }
+  return harness.flatten(tree)
+}
+
+/** 按类名取第一个元素（找不到直接断言失败：静默 undefined 会让后面的报错指向别处）。 */
+function firstByClass(nodes, className) {
+  const found = nodes.find(
+    (node) => typeof node.className === 'string' && node.className.split(' ').includes(className),
+  )
+  assert.ok(found !== undefined, `应当有一个 .${className} 元素`)
+  return found
+}
+
+/** 按类名取全部元素。 */
+function allByClass(nodes, className) {
+  return nodes.filter((node) => typeof node.className === 'string' && node.className.split(' ').includes(className))
+}
+
+/**
+ * 取某个元素的**文本内容**。
+ *
+ * `flatten` 是"先推元素、再推它的子节点"，所以紧跟其后的文本节点就是它的内容；
+ * 遇到下一个**有类名的元素**就停下（那是兄弟节点，不是子节点）。
+ */
+function textOfClass(nodes, className) {
+  const index = nodes.findIndex(
+    (node) => typeof node.className === 'string' && node.className.split(' ').includes(className),
+  )
+  assert.ok(index >= 0, `应当有一个 .${className} 元素`)
+  let text = ''
+  for (let at = index + 1; at < nodes.length; at++) {
+    const node = nodes[at]
+    if (typeof node.className === 'string' && node.className !== '') break
+    if (node.text !== undefined) text += node.text
+  }
+  return text
+}
+
+/** 拼接页面上的全部文案（断言子串用；精确匹配事件名仍请用 texts）。 */
+function joinedText(nodes) {
+  return nodes
+    .filter((node) => node.text !== undefined)
+    .map((node) => node.text)
+    .join('')
+}
+
+/** 取第 n 个开关（`role="switch"` 的按钮；类名 dsh-hooks__switch）。 */
+function switchNode(nodes, index = 0) {
+  const switches = allByClass(nodes, 'dsh-hooks__switch')
+  assert.ok(switches[index] !== undefined, `应当有第 ${index + 1} 个开关`)
+  assert.equal(switches[index].role, 'switch', '开关必须是 role="switch"（不是原生 checkbox）')
+  assert.equal(typeof switches[index].ariaChecked, 'boolean', '开关必须带 aria-checked（无障碍语义）')
+  assert.equal(typeof switches[index].onClick, 'function', '开关必须能点')
+  return switches[index]
+}
+
+/** 取工具条按钮（按 `title`；工具条按钮刻意不用 `__btn` 类，见 styles.ts 的注释）。 */
+function toolButton(nodes, label) {
+  const found = nodes.find(
+    (node) =>
+      typeof node.className === 'string' && node.className.includes('dsh-hooks__toolbtn') && node.title === label,
+  )
+  assert.ok(found !== undefined, `应当有一个工具条按钮「${label}」`)
+  assert.equal(typeof found.onClick, 'function', `「${label}」按钮必须真的带 onClick`)
+  return found
+}
+
+/** 造一条 hook（快照 `HookView`）。 */
+function snapshotHook(rawIndex, command, extra = {}) {
+  return { rawIndex, command, timeoutSec: null, defaultTimeoutSec: 600, disabled: false, lastRun: null, ...extra }
+}
+
+/**
+ * 造一份文件视图（`FileView`，含 7 个事件的可寻址视图）。
+ *
+ * `groupsByEvent` 形如 `{ PreToolUse: [{ rawIndex: 0, matcher: 'pwsh', hooks: [...] }] }`。
+ */
+function snapshotFile(kind, state, groupsByEvent = {}, overrides = {}) {
+  let hookCount = 0
+  const events = HOOK_EVENTS.map((event) => {
+    const groups = (groupsByEvent[event] ?? []).map((group) => ({
+      file: kind,
+      rawIndex: group.rawIndex,
+      matcher: group.matcher ?? null,
+      matcherOk: group.matcherOk ?? true,
+      matcherProblem: group.matcherProblem ?? null,
+      hooks: group.hooks,
+    }))
+    let enabled = 0
+    let disabled = 0
+    for (const group of groups) {
       for (const one of group.hooks) {
-        if (one.disabled) disabledCount += 1
-        else hookCount += 1
+        if (one.disabled) disabled += 1
+        else enabled += 1
       }
     }
-    return {
-      kind,
-      path: kind === 'user' ? 'C:/u/.dsh/hooks.json' : 'D:/proj/.dsh/hooks.json',
-      state,
-      message: state === 'error' ? 'FsError: cannot read text: Unexpected token {' : null,
-      version: null,
-      hookCount,
-      skipped: [],
-      matcherErrors: [],
-      events: HOOK_EVENTS.map((event) => ({
+    hookCount += enabled + disabled
+    return { event, groups, hookCount: enabled, disabledCount: disabled, runCount: 0 }
+  })
+  return {
+    kind,
+    path: kind === 'user' ? 'C:/u/.dsh/hooks.json' : 'D:/p/.dsh/hooks.json',
+    state,
+    message: state === 'error' ? 'FsError: cannot read text: Unexpected token {' : null,
+    version: state === 'absent' ? null : 'v1',
+    hookCount,
+    skipped: [],
+    matcherErrors: [],
+    events,
+    ...overrides,
+  }
+}
+
+/**
+ * 造一份整页快照（`HooksSnapshot`）。
+ *
+ * 缺省 = **工作区作用域** `w-1`（项目级文件是"主文件"、用户级是只读的另一个来源）：
+ * 页面默认作用域是用户（D14 单独测），这里缺省用工作区是为了让"定位到哪一份文件"随手可测。
+ */
+function snapshotOf(options = {}) {
+  const scopeValue = options.scope ?? 'w-1'
+  const workspaces = options.workspaces ?? [
+    { id: 'w-1', title: 'agent-go', path: 'D:/p', projectRoot: 'D:/p', isCurrent: true },
+  ]
+  const known = workspaces.find((workspace) => workspace.id === scopeValue)
+  const projectRoot = options.projectRoot ?? 'D:/p'
+  const userFile = options.userFile ?? snapshotFile('user', 'ok')
+  const projectFile = options.projectFile ?? snapshotFile('project', 'ok')
+  const scope =
+    scopeValue === 'user'
+      ? scopeView({ kind: 'user', requested: 'user', projectRoot: null, isCurrentSession: null })
+      : scopeValue === 'current'
+        ? // `scope=current`：会话 cwd 解析出来的项目 —— **不是**清单里的某个工作区，
+          // 所以 workspaceId / workspacePath 都是 null（页面据此说"当前会话的项目"而不是"这个工作区"）。
+          scopeView({
+            kind: 'workspace',
+            requested: 'current',
+            workspaceId: null,
+            workspaceTitle: null,
+            workspacePath: null,
+            projectRoot,
+            isCurrentSession: options.isCurrentSession ?? true,
+          })
+        : scopeView({
+            kind: 'workspace',
+            requested: 'workspace',
+            workspaceId: scopeValue,
+            workspaceTitle: known?.title ?? scopeValue,
+            workspacePath: known?.path ?? projectRoot,
+            projectRoot,
+            isCurrentSession: options.isCurrentSession ?? true,
+          })
+  return {
+    route: '/api/hooks',
+    projectRoot,
+    cwd: projectRoot,
+    cwdSource: 'session',
+    scope,
+    workspaces,
+    workspacesAvailable: options.workspacesAvailable ?? true,
+    // 三态：显式传 `session: null` 表示"当前会话未知"（页面必须说不知道）。
+    session: options.session === undefined ? sessionEffect({ projectRoot }) : options.session,
+    files: scopeValue === 'user' ? [userFile] : [projectFile, userFile],
+    events:
+      options.events ??
+      HOOK_EVENTS.map((event) => ({
         event,
-        groups: event === 'PreToolUse' ? own : [],
-        hookCount: event === 'PreToolUse' ? hookCount : 0,
-        disabledCount: event === 'PreToolUse' ? disabledCount : 0,
+        groups: [],
+        hookCount: 0,
+        disabledCount: 0,
+        fromUser: 0,
+        fromProject: 0,
         runCount: 0,
       })),
-    }
+    total: options.total ?? { hookCount: 1, disabledCount: 0, groupCount: 1 },
+    staleInUse: options.staleInUse ?? false,
+    capabilities: { writable: options.writable ?? true },
   }
-  const snapshot = {
-    route: '/api/hooks',
-    projectRoot: 'D:/proj',
-    cwd: 'D:/proj',
-    cwdSource: 'session',
-    files: [fileOf('project', 'ok', groups), fileOf('user', 'error')],
-    events: [],
+}
+
+await test('D：真实渲染 —— 作用域/来源说清、7 个事件全列、状态色只来自台账', async () => {
+  // 造一个"什么情况都有"的快照：选中的项目级（4 条不同状态的 hook）+ 用户级读不出来。
+  const run = (exitCode, decision) => ({ at: 1, exitCode, decision, durationMs: 12, stdout: '', stderr: 'out' })
+  const hooks = [
+    snapshotHook(0, 'echo never-run'),
+    snapshotHook(1, 'echo ok', { lastRun: run(0, 'pass') }),
+    snapshotHook(2, 'echo deny', { lastRun: run(0, 'deny') }),
+    snapshotHook(3, 'echo off', { disabled: true }),
+  ]
+  const snapshot = snapshotOf({
+    scope: 'w-1',
+    projectFile: snapshotFile('project', 'ok', { PreToolUse: [{ rawIndex: 0, matcher: 'pwsh', hooks }] }),
+    userFile: snapshotFile('user', 'error'),
+    session: sessionEffect({ hookCount: 4, groupCount: 1, fromUser: 0, fromProject: 4 }),
     total: { hookCount: 4, disabledCount: 1, groupCount: 1 },
-    staleInUse: false,
-    capabilities: { writable: true },
-  }
+  })
 
   const harness = createFakeReact()
   const component = componentFromArtifact(harness.React)
   const nodes = await renderSection(component, harness, { ok: true, data: snapshot })
   const texts = nodes.filter((node) => node.text !== undefined).map((node) => node.text)
-  // JSX 的 `{...}` 插值会变成**独立子节点**，所以像"生效 4 条"这种文案会被切成好几段；
+  // JSX 的 `{...}` 插值会变成**独立子节点**，所以像"当前会话生效 4 条"这种文案会被切成好几段；
   // 断言子串时要按文档顺序拼起来看（精确匹配事件名仍用 `texts`）。
   const joined = texts.join('')
 
-  // ① 7 个事件**全列**（两张卡各 7 个）——"空"与"不存在"必须长得不一样（§3.6）
+  // ① 7 个事件**全列**（含 0 条）——"空"与"不存在"必须长得不一样（§3.6）
   for (const event of HOOK_EVENTS) {
-    assert.equal(texts.filter((text) => text === event).length, 2, `${event} 必须在两张文件卡里都出现（含 0 条）`)
+    assert.equal(
+      texts.filter((text) => text === event).length,
+      1,
+      `${event} 必须在选中的作用域里出现（含 0 条，且只出现一次：折叠块默认收起）`,
+    )
   }
   assert.ok(joined.includes('没有配置'), '0 条的事件必须明说"没有配置"，而不是消失')
-  // ② 三态分别说清（§3.9）
-  assert.ok(joined.includes('读不出来'), 'error 必须说"读不出来"（≠ 没有配置）')
-  assert.ok(joined.includes('已读取'), 'ok 必须说"已读取"')
+  // ② 两个来源都列 + 三态分别说清（§3.6/§2.9/§3.9）
+  assert.ok(joined.includes('已读取'), '选中的那份是 ok → 说"已读取"')
+  assert.ok(joined.includes('读不出来'), '另一份（用户级）坏了 → 说"读不出来"（≠ 没有配置）')
   assert.ok(!joined.includes('FsError'), '绝不把内部错误原文当文案 —— 本次渲染里它一次都不该出现')
-  assert.ok(joined.includes('生效 4 条'), '总数必须来自快照')
-  assert.ok(joined.includes('已停用'), '停用要有可见标签')
+  assert.ok(joined.includes('D:/p/.dsh/hooks.json'), '选中的项目级文件路径要显示')
+  assert.ok(joined.includes('C:/u/.dsh/hooks.json'), '另一个来源（用户级）也**永远都列**（§3.6）')
+  // ③ 条数口径（D4）：`钩子 N` = 文件总条数（含停用）；`已安装 N` = 启用中条数
+  assert.ok(joined.includes('钩子 4'), '钩子 N = 这个文件的总条数（含已停用）')
+  assert.ok(joined.includes('已安装 3'), '已安装 N = 启用中条数')
+  assert.ok(joined.includes('已停用 1'), '另有停用时追加 · 已停用 M')
+  // ④ 「当前会话生效」那一行（D3 + §2.6）：与所选作用域**无关**的那一份
+  assert.ok(joined.includes('当前会话生效 4 条（用户级 0 + 项目级 4）'), '页面必须能回答"实际会跑什么"')
 
-  // ③ 状态色**只**来自台账与 disabled（§3.8）
+  // ⑤ 状态色**只**来自台账与 disabled（§3.8）
   const dots = nodes.filter((node) => typeof node.className === 'string' && node.className.includes('dsh-hooks__dot'))
   assert.equal(dots.length, 4, '每条 hook 恰好一个状态点')
   assert.ok(!dots[0].className.includes('--'), '没有记录 → 灰（"没报错就报绿"是被禁的）')
@@ -459,6 +683,15 @@ await test('D：真实渲染 —— 7 个事件全列、三态分别说清、状
   assert.ok(dots[2].className.includes('--deny'), 'decision deny → 红')
   assert.ok(!dots[3].className.includes('--ok'), '已停用不许画绿')
   assert.ok(dots[0].title.includes('未运行'), '灰点必须能解释自己')
+
+  // ⑥ 开关的可访问性语义（§6.4）：启用中 aria-checked=true、停用 false
+  const switches = allByClass(nodes, 'dsh-hooks__switch')
+  assert.equal(switches.length, 4, '每条 hook 一个开关')
+  assert.deepEqual(
+    switches.map((node) => node.ariaChecked),
+    [true, true, true, false],
+    'aria-checked 必须如实反映启停（停用的开关不能是"开"档）',
+  )
 })
 
 await test('D：真实渲染 —— 取数失败时主文案是人话，技术原文只作补充', async () => {
@@ -478,70 +711,21 @@ await test('D：真实渲染 —— 取数失败时主文案是人话，技术�
   )
 })
 
-/** 造一份最小可用快照：项目级 1 条 hook + 用户级空（两份都是 `ok`，所以只有一个写入按钮）。 */
-function minimalSnapshot() {
-  const emptyEvents = HOOK_EVENTS.map((event) => ({ event, groups: [], hookCount: 0, disabledCount: 0, runCount: 0 }))
-  return {
-    route: '/api/hooks',
-    projectRoot: 'D:/p',
-    cwd: 'D:/p',
-    cwdSource: 'session',
-    files: [
-      {
-        kind: 'project',
-        path: 'D:/p/.dsh/hooks.json',
-        state: 'ok',
-        message: null,
-        version: 'v1',
-        hookCount: 1,
-        skipped: [],
-        matcherErrors: [],
-        events: HOOK_EVENTS.map((event) => ({
-          event,
-          groups:
-            event === 'PreToolUse'
-              ? [
-                  {
-                    file: 'project',
-                    rawIndex: 0,
-                    matcher: 'pwsh',
-                    matcherOk: true,
-                    matcherProblem: null,
-                    hooks: [
-                      {
-                        rawIndex: 0,
-                        command: 'echo a',
-                        timeoutSec: null,
-                        defaultTimeoutSec: 600,
-                        disabled: false,
-                        lastRun: null,
-                      },
-                    ],
-                  },
-                ]
-              : [],
-          hookCount: event === 'PreToolUse' ? 1 : 0,
-          disabledCount: 0,
-          runCount: 0,
-        })),
-      },
-      {
-        kind: 'user',
-        path: 'C:/u/.dsh/hooks.json',
-        state: 'ok',
-        message: null,
-        version: 'v1',
-        hookCount: 0,
-        skipped: [],
-        matcherErrors: [],
-        events: emptyEvents,
-      },
-    ],
-    events: [],
-    total: { hookCount: 1, disabledCount: 0, groupCount: 1 },
-    staleInUse: false,
-    capabilities: { writable: true },
-  }
+/**
+ * 造一份最小可用快照：**用户作用域**（页面默认），用户级文件里 1 条 hook（`echo a`）。
+ *
+ * 为什么是用户级：页面默认作用域就是用户（D6/用户要求），快照的 `scope.kind` 必须与它一致
+ * —— 否则"宿主回显的作用域"和"页面正在用的作用域"是两回事，测试就不再测真实形态了。
+ * 需要工作区作用域的用例（D16/D17、以及"两个来源同时出现"）自己驱动下拉框切过去。
+ */
+function minimalSnapshot(overrides = {}) {
+  return snapshotOf({
+    scope: 'user',
+    userFile: snapshotFile('user', 'ok', {
+      PreToolUse: [{ rawIndex: 0, matcher: 'pwsh', hooks: [snapshotHook(0, 'echo a')] }],
+    }),
+    ...overrides,
+  })
 }
 
 /** 取写入按钮（可写时每条 hook 一个；"新建文件"按钮的 className 相同，所以按数量断言）。 */
@@ -564,12 +748,12 @@ function buttonByLabel(nodes, label) {
   return found
 }
 
-await test('D：点"停用"发的是定点写请求（file + 原始下标 + 目标值）', async () => {
+await test('D：点开关发的是定点写请求（file + workspaceId + 原始下标 + 目标值）', async () => {
   const harness = createFakeReact()
   const component = componentFromArtifact(harness.React)
   const nodes = await renderSection(component, harness, { ok: true, data: minimalSnapshot() })
   const buttons = writeButtons(nodes)
-  assert.equal(buttons.length, 4, '可写时一行四个按钮：试运行、编辑、停用、删除（这里只有一条 hook）')
+  assert.equal(buttons.length, 3, '可写时一行三个动作按钮：试运行、编辑、删除（启停是右侧那个开关，不再是按钮）')
 
   const calls = []
   globalThis.fetch = async (_url: string, options: { method?: string; body?: string } = {}) => {
@@ -582,14 +766,15 @@ await test('D：点"停用"发的是定点写请求（file + 原始下标 + 目�
           : { ok: true, data: minimalSnapshot() },
     }
   }
-  buttonByLabel(nodes, '停用').onClick()
+  switchNode(nodes).onClick()
   await new Promise((resolve) => setTimeout(resolve, 0))
   await new Promise((resolve) => setTimeout(resolve, 0))
 
-  assert.equal(calls[0].method, 'POST', '停用是一次写请求，不是又一次取数')
+  assert.equal(calls[0].method, 'POST', '切开关是一次写请求，不是又一次取数')
   assert.deepEqual(
     calls[0].body,
-    { file: 'project', op: 'setHookDisabled', event: 'PreToolUse', groupIndex: 0, hookIndex: 0, disabled: true },
+    // 页面默认作用域 = 用户 ⇒ `file:'user'`，且**不带** workspaceId（用户级不属于任何工作区）。
+    { file: 'user', op: 'setHookDisabled', event: 'PreToolUse', groupIndex: 0, hookIndex: 0, disabled: true },
     '请求体只能是定点操作（绝不回传整份文件），且下标必须是**文件里的**下标',
   )
 })
@@ -598,8 +783,8 @@ await test('D：写失败按错误码分别说清，且只渲染在页面级通�
   const harness = createFakeReact()
   const component = componentFromArtifact(harness.React)
   const nodes = await renderSection(component, harness, { ok: true, data: minimalSnapshot() })
-  // 索引 1 是"停用"（索引 0 是"编辑"）—— 这里要触发的是写请求。
-  const button = buttonByLabel(nodes, '停用')
+  // 这里要触发的是写请求 —— 启停是右侧那个 `role="switch"` 的开关。
+  const button = switchNode(nodes)
 
   globalThis.fetch = async () => ({
     json: async () => ({ ok: false, error: 'stale', detail: 'FS_STALE_VERSION: 期望 v1' }),
@@ -617,9 +802,11 @@ await test('D：写失败按错误码分别说清，且只渲染在页面级通�
     .join('')
   assert.ok(joined.includes('刚被别处改过了'), 'stale 必须说"该刷新"，而不是含混的"保存失败"')
   assert.ok(joined.includes('FS_STALE_VERSION'), '技术原文只作补充（排查要用得上），不是主文案')
-  assert.ok(joined.includes('生效 1 条'), '失败**不**清空已有内容 —— 用户要对着旧内容决定下一步')
+  assert.ok(joined.includes('当前会话生效 1 条'), '失败**不**清空已有内容 —— 用户要对着旧内容决定下一步')
+  // §3.7：行内操作失败进页面级横幅；表单错误通道（__newerror）此时必须是空的。
   const banners = after.filter((node) => typeof node.className === 'string' && node.className.includes('banner--error'))
   assert.equal(banners.length, 1, '一条错误只允许一个渲染点（§3.7）')
+  assert.equal(allByClass(after, 'dsh-hooks__newerror').length, 0, '行内失败**不许**写进表单内的错误通道')
 })
 
 await test('D：行内编辑命令 —— 文本框里是当前命令，保存发的是定点写请求', async () => {
@@ -627,9 +814,9 @@ await test('D：行内编辑命令 —— 文本框里是当前命令，保存�
   const component = componentFromArtifact(harness.React)
   const first = await renderSection(component, harness, { ok: true, data: minimalSnapshot() })
 
-  // 没在编辑时：一行两个按钮（编辑、停用）
+  // 没在编辑时：一行三个动作按钮（试运行、编辑、删除）
   const idle = writeButtons(first)
-  assert.equal(idle.length, 4, '一行应当有"试运行"、"编辑"、"停用"、"删除"四个按钮')
+  assert.equal(idle.length, 3, '一行应当有"试运行"、"编辑"、"删除"三个按钮')
   buttonByLabel(first, '编辑').onClick()
 
   // 点"编辑"后重新渲染（§4.5：事件闭包是当次渲染的）
@@ -665,7 +852,7 @@ await test('D：行内编辑命令 —— 文本框里是当前命令，保存�
   assert.deepEqual(
     calls[0].body,
     {
-      file: 'project',
+      file: 'user',
       op: 'setHookCommand',
       event: 'PreToolUse',
       groupIndex: 0,
@@ -711,7 +898,7 @@ await test('D：删除是两步 —— 第一步只改状态不发请求，第�
   assert.equal(calls[0].method, 'POST')
   assert.deepEqual(
     calls[0].body,
-    { file: 'project', op: 'removeHook', event: 'PreToolUse', groupIndex: 0, hookIndex: 0 },
+    { file: 'user', op: 'removeHook', event: 'PreToolUse', groupIndex: 0, hookIndex: 0 },
     '删除也是定点操作：宿主拿这两个**文件下标**定位要删的那一条',
   )
 })
@@ -741,8 +928,8 @@ await test('D：点"试运行"发 dryRun 请求，结果贴在这一行，且那
   assert.equal(calls.length, 1, '试运行只发一次请求')
   assert.deepEqual(
     calls[0].body,
-    { op: 'dryRun', file: 'project', event: 'PreToolUse', groupIndex: 0, hookIndex: 0 },
-    '试运行也是定点寻址（文件 + 事件 + 两个文件下标）',
+    { op: 'dryRun', file: 'user', event: 'PreToolUse', groupIndex: 0, hookIndex: 0 },
+    '试运行也是定点寻址（文件 + 事件 + 两个文件下标）；换到工作区作用域时同一构造函数会带上 workspaceId',
   )
 
   harness.begin()
@@ -775,14 +962,21 @@ await test('D：点"试运行"发 dryRun 请求，结果贴在这一行，且那
 await test('D：文件不存在时说"不存在"（不是"读不出来"），并给出"新建这个文件"', async () => {
   const harness = createFakeReact()
   const component = componentFromArtifact(harness.React)
-  const snapshot = minimalSnapshot()
-  // 用户级那份文件不存在 —— 这正是"用户删掉 hooks.json 之后"的状态。
-  snapshot.files[1].state = 'absent'
-  const nodes = await renderSection(component, harness, { ok: true, data: snapshot })
-  const joined = nodes
-    .filter((node) => node.text !== undefined)
-    .map((node) => node.text)
-    .join('')
+  // 选中的项目级文件不存在、用户级那份是好的 —— 这正是"还没建过这个项目的 hooks.json"的状态。
+  const snapshotFor = (scopeValue) =>
+    snapshotOf({
+      scope: scopeValue,
+      projectFile: snapshotFile('project', 'absent'),
+      userFile: snapshotFile('user', 'ok'),
+    })
+  const initial = await renderSection(component, harness, (url) => ({
+    ok: true,
+    data: snapshotFor(url.includes('scope=workspace') ? 'w-1' : 'user'),
+  }))
+  // 切到那个工作区（页面里的"文件不存在"发生在项目级那份上）
+  firstByClass(initial, 'dsh-hooks__select').onChange({ target: { value: 'w-1' } })
+  const nodes = await advance(component, harness)
+  const joined = joinedText(nodes)
   assert.ok(joined.includes('文件不存在'), '"不存在"必须**明说**，而不是让那一格空着')
   assert.ok(
     !joined.includes('读不出来'),
@@ -794,7 +988,7 @@ await test('D：文件不存在时说"不存在"（不是"读不出来"），并
   globalThis.fetch = async (_url: string, options: { method?: string; body?: string } = {}) => {
     const method = options.method ?? 'GET'
     calls.push({ method, body: typeof options.body === 'string' ? JSON.parse(options.body) : null })
-    return { json: async () => ({ ok: true, data: { file: 'user', version: 'v2' } }) }
+    return { json: async () => ({ ok: true, data: { file: 'project', version: 'v2' } }) }
   }
   buttonByLabel(nodes, '新建这个文件').onClick()
   await new Promise((resolve) => setTimeout(resolve, 0))
@@ -803,9 +997,494 @@ await test('D：文件不存在时说"不存在"（不是"读不出来"），并
   assert.equal(calls.length, 1, '"新建"是一次写请求')
   assert.deepEqual(
     calls[0].body,
-    { file: 'user', op: 'createFile' },
-    '新建的必须是**那一份**不存在文件（用户级），不是项目级',
+    { file: 'project', workspaceId: 'w-1', op: 'createFile' },
+    '新建的必须是**当前作用域**那一份（选中的工作区的项目级文件），且带 workspaceId',
   )
+})
+
+//#region D14–D20. 作用域选择器（§8 的渲染断言）
+//   每条都先红后绿：注入违规 → 确认**精确**报错 → 还原。
+
+await test('D14：默认作用域 = 用户 —— 用户级横幅、只读那份是用户文件、没有项目级卡', async () => {
+  const harness = createFakeReact()
+  const component = componentFromArtifact(harness.React)
+  const urls = []
+  const nodes = await renderSection(component, harness, (url) => {
+    urls.push(url)
+    return {
+      ok: true,
+      data: snapshotOf({
+        scope: 'user',
+        userFile: snapshotFile('user', 'ok', {
+          PreToolUse: [{ rawIndex: 0, hooks: [snapshotHook(0, 'echo user-level')] }],
+        }),
+        projectFile: snapshotFile('project', 'ok', {
+          PreToolUse: [{ rawIndex: 0, hooks: [snapshotHook(0, 'echo project-level')] }],
+        }),
+      }),
+    }
+  })
+  const joined = joinedText(nodes)
+
+  assert.equal(urls.length, 1, '挂载后应当恰好取数一次')
+  assert.ok(urls[0].includes('scope=user'), '默认必须读**用户级**那一份（用户要求默认全局）')
+  // ① 第一条横幅是用户级语义（"对所有项目生效"）
+  const banner = textOfClass(nodes, 'dsh-hooks__banner')
+  assert.ok(banner.includes('用户级配置'), `第一条横幅必须是用户级语义，实际：${banner}`)
+  assert.ok(banner.includes('所有'), '必须说清"对所有项目生效"（§2.1）')
+  // ② 没有项目级卡片：路径只有用户级那份，项目级的命令一次都不出现
+  assert.ok(joined.includes('C:/u/.dsh/hooks.json'), '显示的是用户级文件')
+  assert.ok(!joined.includes('D:/p/.dsh/hooks.json'), '不许出现项目级文件卡')
+  assert.ok(!joined.includes('echo project-level'), '项目级那份的 hook 不许被渲染出来')
+  assert.ok(joined.includes('echo user-level'))
+  // ③ 下拉框的当前值就是"用户"
+  assert.equal(firstByClass(nodes, 'dsh-hooks__select').value, 'user')
+})
+
+await test('D15：下拉选项 = 用户 + 所有工作区（数量与 title 对得上）', async () => {
+  const workspaces = [
+    { id: 'w-1', title: 'agent-go', path: 'D:/p', projectRoot: 'D:/p', isCurrent: true },
+    { id: 'w-2', title: 'dsh-hooks', path: 'D:/q', projectRoot: 'D:/q', isCurrent: false },
+  ]
+  const harness = createFakeReact()
+  const component = componentFromArtifact(harness.React)
+  const nodes = await renderSection(component, harness, { ok: true, data: minimalSnapshot({ workspaces }) })
+  const joined = joinedText(nodes)
+  const select = firstByClass(nodes, 'dsh-hooks__select')
+  assert.equal(select.tag, 'select', '必须是**原生** select（不做自定义弹层，§6.2）')
+
+  const options = nodes.filter((node) => node.tag === 'option')
+  assert.equal(options.length, 1 + workspaces.length, '选项 = 1 个"用户" + 每个工作区一个')
+  assert.deepEqual(
+    options.map((option) => option.value),
+    ['user', 'w-1', 'w-2'],
+    '选项值就是 scope 的取值（user 或 workspaceId）',
+  )
+  assert.ok(
+    nodes.some((node) => node.tag === 'optgroup'),
+    '工作区要用 <optgroup> 分组',
+  )
+  for (const workspace of workspaces) {
+    assert.ok(joined.includes(workspace.title), `选项里必须有 ${workspace.title}`)
+    assert.ok(
+      options.some((option) => option.value === workspace.id),
+      `${workspace.id} 必须可选中`,
+    )
+  }
+})
+
+await test('D16：选中工作区后点开关 ⇒ 请求体带 workspaceId（开关是 role=switch + aria-checked）', async () => {
+  const workspaces = [{ id: 'w-1', title: 'agent-go', path: 'D:/p', projectRoot: 'D:/p', isCurrent: false }]
+  const userFile = snapshotFile('user', 'ok')
+  const projectFile = snapshotFile('project', 'ok', {
+    PreToolUse: [{ rawIndex: 0, matcher: 'pwsh', hooks: [snapshotHook(0, 'echo a')] }],
+  })
+  const snapshotFor = (scopeValue) =>
+    snapshotOf({ scope: scopeValue, workspaces, isCurrentSession: false, userFile, projectFile })
+
+  const harness = createFakeReact()
+  const component = componentFromArtifact(harness.React)
+  const urls = []
+  const first = await renderSection(component, harness, (url) => {
+    urls.push(url)
+    return { ok: true, data: snapshotFor(url.includes('scope=workspace') ? 'w-1' : 'user') }
+  })
+  assert.ok(urls[0].includes('scope=user'), '页面默认还是用户作用域')
+
+  // 切换下拉框 → 重新渲染 → 重新取数（§4.5：别拿旧节点判断）
+  firstByClass(first, 'dsh-hooks__select').onChange({ target: { value: 'w-1' } })
+  const after = await advance(component, harness)
+  assert.ok(
+    urls.some((url) => url.includes('scope=workspace') && url.includes('workspaceId=w-1')),
+    `切作用域后必须按选中工作区取数，实际请求：${urls.join(' , ')}`,
+  )
+  assert.ok(joinedText(after).includes('echo a'), '显示的是那个工作区的 hook')
+
+  // 开关的可访问性语义（§6.4）
+  const sw = switchNode(after)
+  assert.equal(sw.ariaChecked, true, '启用中的 hook → 开关处于"开"（aria-checked=true）')
+
+  const calls = []
+  globalThis.fetch = async (url, options = {}) => {
+    const method = options.method ?? 'GET'
+    calls.push({ method, url: String(url), body: typeof options.body === 'string' ? JSON.parse(options.body) : null })
+    return {
+      json: async () =>
+        method === 'POST'
+          ? { ok: true, data: { file: 'project', version: 'v2' } }
+          : { ok: true, data: snapshotFor('w-1') },
+    }
+  }
+  switchNode(after).onClick()
+  await new Promise((resolve) => setTimeout(resolve, 0))
+  await new Promise((resolve) => setTimeout(resolve, 0))
+
+  assert.equal(calls[0].method, 'POST', '点开关是一次写请求')
+  assert.equal('workspaceId' in calls[0].body, true, '★ 选中工作区时请求体**必须**带 workspaceId（§2.2）')
+  assert.deepEqual(calls[0].body, {
+    file: 'project',
+    workspaceId: 'w-1',
+    op: 'setHookDisabled',
+    event: 'PreToolUse',
+    groupIndex: 0,
+    hookIndex: 0,
+    disabled: true,
+  })
+})
+
+await test('D17：选中非当前工作区 ⇒ 黄底横幅（含沙箱提示）；选中当前工作区 ⇒ 不出现', async () => {
+  const workspaces = [
+    { id: 'w-1', title: 'agent-go', path: 'D:/p', projectRoot: 'D:/p', isCurrent: false },
+    { id: 'w-2', title: 'dsh-hooks', path: 'D:/q', projectRoot: 'D:/q', isCurrent: true },
+  ]
+  const other = createFakeReact()
+  const otherNodes = await renderSection(componentFromArtifact(other.React), other, {
+    ok: true,
+    data: snapshotOf({ scope: 'w-1', workspaces, isCurrentSession: false, projectRoot: 'D:/p' }),
+  })
+  const otherBanner = textOfClass(otherNodes, 'dsh-hooks__banner')
+  const otherBanners = otherNodes.filter(
+    (node) => typeof node.className === 'string' && node.className.includes('banner--warn'),
+  )
+  assert.equal(otherBanners.length, 1, '非当前工作区必须有一条**黄底**横幅')
+  assert.ok(
+    otherBanner.includes('不会') && otherBanner.includes('当前会话'),
+    `横幅要说清"不会影响当前会话"：${otherBanner}`,
+  )
+  assert.ok(otherBanner.includes('sandbox') || otherBanner.includes('沙箱'), '要提前提示可能被当前会话沙箱拒绝（§1.6）')
+  assert.ok(otherBanner.includes('agent-go'), '要说清正在看/改哪个工作区')
+
+  const current = createFakeReact()
+  const currentNodes = await renderSection(componentFromArtifact(current.React), current, {
+    ok: true,
+    data: snapshotOf({ scope: 'w-2', workspaces, isCurrentSession: true, projectRoot: 'D:/q' }),
+  })
+  const currentBanner = textOfClass(currentNodes, 'dsh-hooks__banner')
+  assert.ok(!currentBanner.includes('不会'), `当前工作区不该有"不会影响当前会话"的横幅：${currentBanner}`)
+  assert.ok(currentBanner.includes('立即'), '当前工作区要说"改动立即生效"（§2.1）')
+  assert.equal(
+    currentNodes.filter((node) => typeof node.className === 'string' && node.className.includes('banner--warn')).length,
+    0,
+    '当前工作区不是警告情形',
+  )
+})
+
+await test('D18：搜索是纯前端过滤 —— 卡片变少、原始下标不变、无结果说"没有匹配的 hook"', async () => {
+  const file = snapshotFile('project', 'ok', {
+    PreToolUse: [
+      {
+        rawIndex: 1,
+        matcher: 'pwsh',
+        hooks: [snapshotHook(0, 'echo keep-me'), snapshotHook(1, 'echo drop-me')],
+      },
+    ],
+  })
+  const harness = createFakeReact()
+  const component = componentFromArtifact(harness.React)
+  const nodes = await renderSection(component, harness, { ok: true, data: minimalSnapshot({ userFile: file }) })
+  assert.equal(allByClass(nodes, 'dsh-hooks__hookcard').length, 2, '没过滤时两条 hook 都在')
+
+  // 输入过滤词 → 重新渲染 → 再看（§4.5）
+  firstByClass(nodes, 'dsh-hooks__search').onChange({ target: { value: 'keep' } })
+  const filtered = await advance(component, harness)
+  assert.equal(allByClass(filtered, 'dsh-hooks__hookcard').length, 1, '过滤后只剩一条卡')
+  const joined = joinedText(filtered)
+  assert.ok(joined.includes('筛选后 1 / 共 2'), '要说清"筛选后 N / 共 M"（M 是文件里的总条数）')
+  assert.ok(!joined.includes('echo drop-me'))
+
+  // ★ 原始下标不变：剩下的那条 hook 在文件里是 group 1 / hook 0，请求体必须原样回传
+  const calls = []
+  globalThis.fetch = async (_url, options = {}) => {
+    const method = options.method ?? 'GET'
+    calls.push({ method, body: typeof options.body === 'string' ? JSON.parse(options.body) : null })
+    return {
+      json: async () =>
+        method === 'POST'
+          ? { ok: true, data: { file: 'user', version: 'v2' } }
+          : { ok: true, data: minimalSnapshot({ userFile: file }) },
+    }
+  }
+  switchNode(filtered).onClick()
+  await new Promise((resolve) => setTimeout(resolve, 0))
+  await new Promise((resolve) => setTimeout(resolve, 0))
+  assert.deepEqual(
+    calls[0].body,
+    {
+      file: 'user',
+      op: 'setHookDisabled',
+      event: 'PreToolUse',
+      groupIndex: 1,
+      hookIndex: 0,
+      disabled: true,
+    },
+    '过滤只影响渲染：发出去的必须是**文件里**的真实下标（否则会改错 hook）',
+  )
+
+  // 无结果时说"没有匹配的 hook"（≠"没有配置"）
+  firstByClass(filtered, 'dsh-hooks__search').onChange({ target: { value: 'zzz-not-there' } })
+  const empty = await advance(component, harness)
+  const emptyJoined = joinedText(empty)
+  assert.equal(allByClass(empty, 'dsh-hooks__hookcard').length, 0)
+  assert.ok(emptyJoined.includes('没有匹配的 hook'), '过滤无结果要单独说清')
+  assert.ok(!emptyJoined.includes('没有配置'), '过滤无结果 ≠ 没有配置（两者不许混）')
+})
+
+await test('D19：「＋新建」提交 ⇒ addGroup（event/matcher/command 正确）；表单错误只渲染在表单里', async () => {
+  const harness = createFakeReact()
+  const component = componentFromArtifact(harness.React)
+  const first = await renderSection(component, harness, { ok: true, data: minimalSnapshot() })
+  const calls = []
+  globalThis.fetch = async (_url, options = {}) => {
+    const method = options.method ?? 'GET'
+    calls.push({ method, body: typeof options.body === 'string' ? JSON.parse(options.body) : null })
+    return method === 'POST'
+      ? { json: async () => ({ ok: true, data: { file: 'project', version: 'v2' } }) }
+      : { json: async () => ({ ok: true, data: minimalSnapshot() }) }
+  }
+
+  // 打开表单（工具条按钮）→ 表单必须真的出现
+  toolButton(first, '新建').onClick()
+  const opened = await advance(component, harness)
+  assert.equal(allByClass(opened, 'dsh-hooks__newform').length, 1, '点「＋新建」必须展开表单')
+  assert.equal(allByClass(opened, 'dsh-hooks__input').length, 2, '表单有 matcher / timeout 两个文本框')
+
+  // 事件 `Stop` 没有 matcher：那个输入框必须**不渲染**（填了也不生效是界面的错）
+  const eventSelect = firstByClass(opened, 'dsh-hooks__newselect')
+  assert.equal(eventSelect.tag, 'select', '事件也用原生 select')
+  eventSelect.onChange({ target: { value: 'Stop' } })
+  let tree = await advance(component, harness)
+  assert.equal(allByClass(tree, 'dsh-hooks__input').length, 1, 'matcherless 事件下只剩 timeout 一个输入框')
+
+  // 切回 PreToolUse → 填 matcher / command / timeout（§4.5：每次输入后重新渲染再看）
+  firstByClass(tree, 'dsh-hooks__newselect').onChange({ target: { value: 'PreToolUse' } })
+  tree = await advance(component, harness)
+  const inputs = allByClass(tree, 'dsh-hooks__input')
+  assert.equal(inputs.length, 2)
+  inputs[0].onChange({ target: { value: 'pwsh' } })
+  tree = await advance(component, harness)
+  allByClass(tree, 'dsh-hooks__editor')[0].onChange({ target: { value: 'echo new-hook' } })
+  tree = await advance(component, harness)
+  allByClass(tree, 'dsh-hooks__input')[1].onChange({ target: { value: '30' } })
+  tree = await advance(component, harness)
+
+  // 注意：`advance` 每次都会重跑取数 effect（假 React 的 useEffect 是"每次渲染都收集"），
+  // 所以断言"提交发的那一次"之前要把已记录的清掉。
+  calls.length = 0
+  buttonByLabel(tree, '创建').onClick()
+  await new Promise((resolve) => setTimeout(resolve, 0))
+  await new Promise((resolve) => setTimeout(resolve, 0))
+  assert.equal(calls.length, 1, '提交只发一次请求')
+  assert.equal(calls[0].method, 'POST')
+  assert.deepEqual(
+    calls[0].body,
+    {
+      file: 'user',
+      op: 'addGroup',
+      event: 'PreToolUse',
+      matcher: 'pwsh',
+      command: 'echo new-hook',
+      timeoutSec: 30,
+    },
+    '「＋新建」= 一次 addGroup 定点操作（宿主负责建组 / 建文件）',
+  )
+
+  // ★ 失败错误只渲染在**表单内**（§3.7）：页面级横幅一条都不许有
+  const failing = createFakeReact()
+  const failingComponent = componentFromArtifact(failing.React)
+  const initial = await renderSection(failingComponent, failing, { ok: true, data: minimalSnapshot() })
+  globalThis.fetch = async (_url, options = {}) => {
+    const method = options.method ?? 'GET'
+    return {
+      json: async () =>
+        method === 'POST'
+          ? { ok: false, error: 'exists', detail: 'FS_EXISTS: 目标已存在' }
+          : { ok: true, data: minimalSnapshot() },
+    }
+  }
+  toolButton(initial, '新建').onClick()
+  let formTree = await advance(failingComponent, failing)
+  allByClass(formTree, 'dsh-hooks__editor')[0].onChange({ target: { value: 'echo x' } })
+  formTree = await advance(failingComponent, failing)
+  buttonByLabel(formTree, '创建').onClick()
+  await new Promise((resolve) => setTimeout(resolve, 0))
+  await new Promise((resolve) => setTimeout(resolve, 0))
+  const afterFail = await advance(failingComponent, failing)
+  const failJoined = joinedText(afterFail)
+  assert.ok(failJoined.includes('已经存在'), '表单里要说清"文件已经存在"（人话，不是码）')
+  assert.ok(failJoined.includes('FS_EXISTS'), '技术原文只作补充（排查要用得上）')
+  assert.equal(allByClass(afterFail, 'dsh-hooks__newerror').length, 1, '表单错误**只**渲染在表单内')
+  assert.equal(
+    afterFail.filter((node) => typeof node.className === 'string' && node.className.includes('banner--error')).length,
+    0,
+    '§3.7：表单失败**不许**同时写进页面级横幅（一条错误只允许一个渲染点）',
+  )
+})
+
+await test('D20：workspacesAvailable:false ⇒ 明说"宿主没有提供工作区清单"，而不是空下拉', async () => {
+  const harness = createFakeReact()
+  const component = componentFromArtifact(harness.React)
+  const nodes = await renderSection(component, harness, {
+    ok: true,
+    data: snapshotOf({ scope: 'user', workspaces: [], workspacesAvailable: false }),
+  })
+  const joined = joinedText(nodes)
+  assert.ok(
+    joined.includes('宿主没有提供工作区清单'),
+    '"宿主没有清单"必须**明说**（空下拉会让人以为"我没有工作区"，§3.6/§3.9）',
+  )
+  const options = nodes.filter((node) => node.tag === 'option')
+  assert.deepEqual(
+    options.map((option) => option.value),
+    ['user', 'current'],
+    '没有清单时只剩"用户"与"当前会话项目"（后者**不需要** registry：它按会话 cwd 解析）——不是空下拉',
+  )
+  assert.ok(!nodes.some((node) => node.tag === 'optgroup'), '没有清单就不该有工作区分组')
+
+  // 反向：清单存在但为空 → 另一种说法（"还没有工作区"，空 ≠ 不存在）
+  const emptyHarness = createFakeReact()
+  const emptyNodes = await renderSection(componentFromArtifact(emptyHarness.React), emptyHarness, {
+    ok: true,
+    data: snapshotOf({ scope: 'user', workspaces: [], workspacesAvailable: true }),
+  })
+  const emptyJoined = joinedText(emptyNodes)
+  assert.ok(emptyJoined.includes('还没有工作区'), '清单为空是另一句文案')
+  assert.ok(!emptyJoined.includes('宿主没有提供工作区清单'), '"空清单"与"没有清单"必须长得不一样')
+})
+
+await test('D21：会话项目不在工作区清单里 ⇒ 下拉补「当前会话项目」，选中后读写都不带 workspaceId', async () => {
+  // 本机正在开发的这个插件项目就是这种形态：会话项目**不是** registry 里的工作区。
+  const projectRoot = 'D:/dev/dsh-hooks'
+  const workspaces = [{ id: 'w-1', title: 'agent-go', path: 'D:/p', projectRoot: 'D:/p', isCurrent: false }]
+  const userFile = snapshotFile('user', 'ok')
+  const projectFile = snapshotFile('project', 'ok', {
+    PreToolUse: [{ rawIndex: 0, matcher: 'pwsh', hooks: [snapshotHook(0, 'echo a')] }],
+  })
+  const snapshotFor = (scopeValue) => snapshotOf({ scope: scopeValue, workspaces, projectRoot, userFile, projectFile })
+
+  const harness = createFakeReact()
+  const component = componentFromArtifact(harness.React)
+  const urls = []
+  const first = await renderSection(component, harness, (url) => {
+    urls.push(url)
+    return { ok: true, data: snapshotFor(url.includes('scope=current') ? 'current' : 'user') }
+  })
+  const firstJoined = joinedText(first)
+
+  // ① 下拉里必须出现「当前会话项目（<路径最后一段>）」，且排在「用户」之后、工作区之前
+  const options = first.filter((node) => node.tag === 'option')
+  assert.deepEqual(
+    options.map((option) => option.value),
+    ['user', 'current', 'w-1'],
+    '会话项目不在清单里时必须补一个 current 选项（否则改不到正在开发的这个项目）',
+  )
+  assert.ok(firstJoined.includes('当前会话项目（dsh-hooks）'), `label 要带路径最后一段：${firstJoined}`)
+  // ② 原来那句"这里改不到"的死提示必须变成指向这个选项
+  assert.ok(firstJoined.includes('就能编辑它'), '提示要指向「当前会话项目」选项，而不是让人无路可走')
+  assert.ok(!firstJoined.includes('这里改不到它的项目级配置'), '死提示必须消失')
+
+  // ③ 选中它 → GET 走 scope=current（**不是** scope=workspace&workspaceId=current，那必然 404）
+  firstByClass(first, 'dsh-hooks__select').onChange({ target: { value: 'current' } })
+  const after = await advance(component, harness)
+  const currentUrls = urls.filter((url) => url.includes('scope=current'))
+  assert.ok(currentUrls.length >= 1, `选中后必须按 scope=current 取数，实际：${urls.join(' , ')}`)
+  assert.ok(!urls.some((url) => url.includes('workspaceId=current')), 'current 不许被当成工作区 id（那会 404）')
+  assert.ok(joinedText(after).includes('echo a'), '显示的是会话项目的文件')
+  // ④ 横幅说的是"项目"而不是"工作区"（后者会编造一个不存在的工作区）
+  const banner = textOfClass(after, 'dsh-hooks__banner')
+  assert.ok(banner.includes('这个项目'), `会话项目那条路要说"这个项目"：${banner}`)
+  assert.ok(!banner.includes('这个工作区'), '不许把会话项目说成"某个工作区"')
+
+  // ⑤ 写请求：file:'project' 且**不带** workspaceId（宿主按会话 cwd 落笔）
+  const calls = []
+  globalThis.fetch = async (_url, options = {}) => {
+    const method = options.method ?? 'GET'
+    calls.push({ method, body: typeof options.body === 'string' ? JSON.parse(options.body) : null })
+    return {
+      json: async () =>
+        method === 'POST'
+          ? { ok: true, data: { file: 'project', version: 'v2' } }
+          : { ok: true, data: snapshotFor('current') },
+    }
+  }
+  switchNode(after).onClick()
+  await new Promise((resolve) => setTimeout(resolve, 0))
+  await new Promise((resolve) => setTimeout(resolve, 0))
+  assert.equal(calls[0].method, 'POST')
+  assert.equal('workspaceId' in calls[0].body, false, '当前会话项目**不许**带 workspaceId（带=404）')
+  assert.deepEqual(calls[0].body, {
+    file: 'project',
+    op: 'setHookDisabled',
+    event: 'PreToolUse',
+    groupIndex: 0,
+    hookIndex: 0,
+    disabled: true,
+  })
+})
+
+await test('D22：取数失败时有恢复控件（重试 / 回到用户级配置），workspace 失败时后者突出', async () => {
+  const harness = createFakeReact()
+  const component = componentFromArtifact(harness.React)
+  const urls = []
+  const failing = async (url) => {
+    urls.push(String(url))
+    return { ok: false, error: 'unknown-workspace', detail: '工作区 w-gone 不在宿主的清单里（可能被删过）' }
+  }
+  const nodes = await renderSection(component, harness, failing)
+  const joined = joinedText(nodes)
+  assert.ok(joined.includes('已经不在宿主的清单里'), '主文案是人话（§3.9）')
+
+  // 两个恢复控件都在，且 workspace 这次失败时「回到用户级配置」是突出的那一个
+  const retry = toolButton(nodes, '重试')
+  const backToUser = toolButton(nodes, '回到用户级配置')
+  assert.ok(
+    backToUser.className.includes('dsh-hooks__toolbtn--primary'),
+    'unknown-workspace 时「回到用户级配置」要突出（它会解掉这个死胡同）',
+  )
+  assert.ok(
+    !retry.className.includes('dsh-hooks__toolbtn--primary'),
+    '这时「重试」不是首选（同一个已删除的工作区会再失败一次）',
+  )
+
+  // 点「回到用户级配置」⇒ 必须重新取数，且 URL 是 scope=user
+  const before = urls.length
+  backToUser.onClick()
+  await advance(component, harness)
+  assert.ok(urls.length > before, '点了必须真的重新取数（不能只是清一清状态）')
+  assert.ok(urls[urls.length - 1].includes('scope=user'), `重新取的 URL 必须含 scope=user：${urls[urls.length - 1]}`)
+
+  // 对照：非 workspace 类失败（比如宿主内部错误）时突出的是「重试」——证明上面的突出是**有条件**的
+  const otherHarness = createFakeReact()
+  const other = await renderSection(componentFromArtifact(otherHarness.React), otherHarness, {
+    ok: false,
+    error: 'internal',
+    detail: 'boom',
+  })
+  const otherRetry = toolButton(other, '重试')
+  const otherBack = toolButton(other, '回到用户级配置')
+  assert.ok(otherRetry.className.includes('dsh-hooks__toolbtn--primary'), '内部错误时首选是「重试」')
+  assert.ok(!otherBack.className.includes('dsh-hooks__toolbtn--primary'))
+})
+
+await test('D：当前会话未知 ⇒ 说"无法判断实际会跑什么"，绝不显示「生效 0 条」', async () => {
+  const harness = createFakeReact()
+  const component = componentFromArtifact(harness.React)
+  // 三态：`session === null` = 当前会话未知（读不到 ≠ 没有）
+  const unknown = await renderSection(component, harness, {
+    ok: true,
+    data: minimalSnapshot({ session: null }),
+  })
+  const unknownJoined = joinedText(unknown)
+  assert.ok(unknownJoined.includes('当前会话未知，无法判断实际会跑什么'), '必须说"不知道"')
+  assert.ok(!unknownJoined.includes('当前会话生效'), '不许把"不知道"说成"没有"')
+  assert.ok(!unknownJoined.includes('生效 0 条'))
+
+  // 对照：**已知**为 0 条时反而必须照实说 —— 证明上面那条不是"一律禁止"（否则是平凡通过的断言）
+  const knownHarness = createFakeReact()
+  const known = await renderSection(componentFromArtifact(knownHarness.React), knownHarness, {
+    ok: true,
+    data: minimalSnapshot({ session: sessionEffect({ hookCount: 0, groupCount: 0, fromUser: 0, fromProject: 0 }) }),
+  })
+  assert.ok(joinedText(known).includes('当前会话生效 0 条（用户级 0 + 项目级 0）'), '已知的 0 条要如实说')
 })
 
 //#endregion
@@ -887,6 +1566,7 @@ test('E：功能标记必须真的出现在产物里（源码存在 ≠ 已交�
     '/api/hooks', // data-plane.ts：设置页路由
     '改写会动到目标之外的字段', // write.ts：写路径（接线之前它整块被 esbuild 丢掉了）
     '已截断', // ledger.ts：执行台账（状态色的唯一证据来源）
+    'unknown-workspace', // index.ts + data-plane.ts：作用域写入的拒写码（§2.2）
   ]
   for (const marker of markers) {
     assert.ok(source.includes(marker), `产物里应当出现 ${marker} —— 检查它所在的模块是不是没被 import 进去`)
@@ -1271,6 +1951,117 @@ test('helper：contextMessage 形状对齐 createUserMessage', () => {
 
 //#endregion
 
+//#region F. 作用域：写路径 / 请求校验 / 台账匹配（纯函数，不碰 fs）
+//   §8 的 F1–F4。全部**先红后绿**：每条都做过"注入违规 → 精确报错 → 还原"（见 docs/plan-workspace-scope.md §8）。
+
+test('F：addGroup —— 新建事件数组 / 追加到已有组 / matcher·timeout 为 null 时不写键', () => {
+  // ① 事件数组**不存在** → 创建它。两种顶层形状都要支持（与解析用同一条 `hooksMapOf` 判定）。
+  const bare = applied({}, { op: 'addGroup', event: 'PreToolUse', matcher: 'pwsh', command: 'echo a', timeoutSec: 20 })
+  assert.deepEqual(bare.doc, {
+    PreToolUse: [{ matcher: 'pwsh', hooks: [{ type: 'command', command: 'echo a', timeout: 20 }] }],
+  })
+  assert.equal(preservationProblem({}, bare.doc, bare.changes), undefined, '新建事件数组也必须过保留性证明')
+
+  const wrapped = applied(
+    { hooks: {} },
+    { op: 'addGroup', event: 'Stop', matcher: null, command: 'echo s', timeoutSec: null },
+  )
+  assert.deepEqual(wrapped.doc, { hooks: { Stop: [{ hooks: [{ type: 'command', command: 'echo s' }] }] } })
+  assert.equal(preservationProblem({ hooks: {} }, wrapped.doc, wrapped.changes), undefined)
+
+  // ② 追加到**已有**事件数组 → 落在末尾，前面的组一个字不动
+  const doc = { hooks: { PreToolUse: [{ matcher: 'a', hooks: [{ command: 'x' }] }] } }
+  const appended = applied(doc, {
+    op: 'addGroup',
+    event: 'PreToolUse',
+    matcher: '',
+    command: 'echo b',
+    timeoutSec: null,
+  })
+  assert.equal(appended.doc.hooks.PreToolUse.length, 2)
+  assert.deepEqual(appended.doc.hooks.PreToolUse[1], { hooks: [{ type: 'command', command: 'echo b' }] })
+  assert.equal(
+    'matcher' in appended.doc.hooks.PreToolUse[1],
+    false,
+    'matcher 为 null/空串 → 不写这个键（不是空字符串）',
+  )
+  assert.equal('timeout' in appended.doc.hooks.PreToolUse[1].hooks[0], false, 'timeoutSec 为 null → 不写这个键')
+  assert.deepEqual(appended.doc.hooks.PreToolUse[0], doc.hooks.PreToolUse[0], '已有组一个字段都不许动')
+  assert.equal(preservationProblem(doc, appended.doc, appended.changes), undefined)
+
+  // ③ 空 command 是非法操作（不可信输入不许进 applyOp）
+  const empty = applyOp(
+    {},
+    { file: 'project', op: 'addGroup', event: 'Stop', matcher: null, command: '', timeoutSec: null },
+  )
+  assert.equal(empty.ok, false)
+  assert.equal(empty.reason, 'bad-op')
+})
+
+test('F：addGroup 的保留性证明（带 _comment + 未知键；顺手丢字段必须被拒）', () => {
+  const doc = {
+    _comment: 'keep me',
+    hooks: { Stop: [{ hooks: [{ command: 'echo stop' }] }] },
+    extra: { nested: [1, 2, 3] },
+  }
+  const { doc: next, changes } = applied(doc, {
+    op: 'addGroup',
+    event: 'PreToolUse',
+    matcher: 'pwsh',
+    command: 'echo a',
+    timeoutSec: null,
+  })
+  assert.equal(next._comment, 'keep me')
+  assert.deepEqual(next.extra, { nested: [1, 2, 3] }, '未知键必须原样保留（结构上不可能丢）')
+  assert.deepEqual(next.hooks.Stop, doc.hooks.Stop, '别的事件一个字都不许动')
+  assert.equal(preservationProblem(doc, next, changes), undefined)
+
+  // 注入：顺手"重建整个 hooks 映射"（丢了 unknown 键）→ 必须被证明抓住、调用方据此**拒写**
+  const lossy = JSON.parse(JSON.stringify(next))
+  delete lossy.extra
+  const problem = preservationProblem(doc, lossy, changes)
+  assert.equal(typeof problem, 'string', '丢了未知键必须被抓住')
+  assert.ok(problem.includes('目标之外的字段'), `提示要能看出性质：${String(problem)}`)
+
+  // 反向验证点二：把"新建的事件数组"声明成 index 而不是 key → 新文档里会留下一个空数组 → 必须不过
+  const wrong = [{ path: ['hooks', 'PreToolUse', 0], mode: 'index' }]
+  assert.equal(
+    typeof preservationProblem(doc, next, wrong),
+    'string',
+    '新建事件数组的 changes 声明成 index 时证明必须不过（否则这条断言是平凡通过的）',
+  )
+})
+
+test('F：parseHooksRequest 校验 workspaceId（非字符串 / 空串 / file:user 带它 → 全 400）', () => {
+  const base = {
+    op: 'setHookDisabled',
+    file: 'project',
+    event: 'PreToolUse',
+    groupIndex: 0,
+    hookIndex: 0,
+    disabled: true,
+  }
+  for (const workspaceId of [42, '', null, {}, []]) {
+    const parsed = parseHooksRequest({ ...base, workspaceId })
+    assert.equal(parsed.ok, false, `workspaceId=${JSON.stringify(workspaceId)} 必须被拒`)
+    assert.ok(parsed.reason.includes('workspaceId'), `拒了要说清是 workspaceId 的问题：${parsed.reason}`)
+  }
+  const user = parseHooksRequest({ ...base, file: 'user', workspaceId: 'w1' })
+  assert.equal(user.ok, false, 'file:user 带 workspaceId 是自相矛盾的请求（用户级不属于任何工作区）')
+
+  // 合法：原样带出来（宿主据此**定点**到那个工作区，绝不回落会话项目）
+  const good = parseHooksRequest({ ...base, workspaceId: 'w1' })
+  assert.equal(good.ok, true)
+  assert.equal(good.request.workspaceId, 'w1')
+  assert.equal(good.request.file, 'project')
+  // 不给时**不许**凭空补一个 `workspaceId: undefined` 键（请求体形状是契约的一部分）
+  const none = parseHooksRequest(base)
+  assert.equal(none.ok, true)
+  assert.equal('workspaceId' in none.request, false)
+})
+
+//#endregion
+
 //#region 3. 集成测试（真子进程 + 真文件系统 + 假 ctx）
 
 /**
@@ -1486,6 +2277,9 @@ function makeCtx(options = {}) {
         return { get: (id) => agents.get(id), currentInitiator: () => options.initiator }
       }
       if (service === 'sandboxPolicy') return options.sandboxPolicy
+      // 工作区清单：**默认缺席**（服务渐进可用，真实宿主上也可能还没加载）——
+      // 于是"宿主没有提供工作区清单"这条降级路径默认就被覆盖到，而不是只靠显式构造。
+      if (service === 'workspaceRegistry') return options.workspaceRegistry
       return undefined
     },
   }
@@ -2420,6 +3214,10 @@ async function callRoute(route, query = '') {
     projectRoot: null,
     cwd: null,
     cwdSource: 'none',
+    scope: scopeView({ kind: 'user', requested: 'current', projectRoot: null, isCurrentSession: null }),
+    workspaces: [],
+    workspacesAvailable: false,
+    session: null,
     files: [],
     events: [],
     total: { hookCount: 0, disabledCount: 0, groupCount: 0 },
@@ -2428,6 +3226,43 @@ async function callRoute(route, query = '') {
   }
   const data = body !== null && typeof body === 'object' && body.data ? body.data : emptyData
   return { status: response.status, body, data }
+}
+
+/**
+ * 造一个作用域回显（`HooksSnapshot.scope`）。
+ *
+ * 缺省是"当前会话的项目"这一形态；测 `scope=user` / 别的 `workspace` 时用 overrides 覆盖。
+ */
+function scopeView(overrides = {}) {
+  return {
+    kind: 'workspace',
+    requested: 'current',
+    workspaceId: null,
+    workspaceTitle: null,
+    workspacePath: null,
+    projectRoot: '/p',
+    isCurrentSession: true,
+    ...overrides,
+  }
+}
+
+/**
+ * 造一个"当前会话实际会跑什么"的条数视图（`HooksSnapshot.session`）。
+ *
+ * **三态**：`projectRoot` 拿不到时整块应当是 `null`（见 `sessionlessSnapshot`），
+ * 所以这个 helper 只造"已知"那一态。
+ */
+function sessionEffect(overrides = {}) {
+  return {
+    projectRoot: '/p',
+    hookCount: 1,
+    disabledCount: 0,
+    groupCount: 1,
+    fromUser: 0,
+    fromProject: 1,
+    staleInUse: false,
+    ...overrides,
+  }
 }
 
 /** POST 一个定点操作（走真实 handler，不碰浏览器）。 */
@@ -2462,8 +3297,14 @@ function emptyInspection(overrides = {}) {
     projectRoot: '/p',
     cwd: '/p',
     cwdSource: 'session',
+    scope: scopeView(),
+    workspaces: [],
+    workspacesAvailable: false,
+    session: sessionEffect(),
     sources: [],
     effective: {},
+    effectiveUserGroups: {},
+    effectiveProjectGroups: {},
     staleInUse: false,
     writable: false,
     ledger: [],
@@ -2682,6 +3523,63 @@ await test('P：GET —— 文件写坏时如实报 error，同时说清"运行�
   })
 })
 
+await test('P：stale（沿用上一份可用配置）时来源条数必须自洽 —— 不许 0 + 0 对不上 hookCount', async () => {
+  await withIsolatedHome(async () => {
+    const dir = await makeProject()
+    const s = await script(dir, 'p.mjs', 'process.exit(0)')
+    await writeHooks(dir, { hooks: { PreToolUse: [{ matcher: 'pwsh', hooks: [{ command: cmd(s) }] }] } })
+    await fsp.writeFile(
+      path.join(process.env.DSH_HOME, 'hooks.json'),
+      JSON.stringify({ hooks: { PreToolUse: [{ hooks: [{ command: 'u1' }] }] } }),
+      'utf8',
+    )
+    const conn = makeConnection()
+    const captured = []
+    const { agent } = fakeAgent(dir)
+    const h = await mount({
+      connection: conn.connection,
+      fs: makeFs({ version: true, watch: 'capture', captured }),
+      initiator: agent,
+    })
+
+    // 先成功加载一次（写入 last-good），再把项目级文件写坏 → 运行中的仍是上一份可用配置。
+    await h.listeners.get('tools/pre-execute')[0]({ name: 'pwsh', arguments: {}, callId: 'c', agent }, nextAllow)
+    await fsp.writeFile(path.join(dir, '.dsh', 'hooks.json'), '{"hooks": {', 'utf8')
+    for (const { changed } of captured) changed()
+
+    const { data } = await callRoute(conn.routes[0])
+    assert.equal(data.staleInUse, true)
+    const pre = data.events.find((event) => event.event === 'PreToolUse')
+    assert.equal(pre.hookCount, 2, '运行中的是上一份可用配置：用户级 1 + 项目级 1')
+    assert.equal(pre.fromUser, 1)
+    assert.equal(
+      pre.fromProject,
+      1,
+      '**stale 时 fromProject 也不许是 0**：用"新鲜读"会得到 0，而 hookCount 是 2 —— 页面会显示' +
+        '"生效 2 条（用户级 0 + 项目级 0）"，与它上面那条 stale 横幅直接打架',
+    )
+    // 不变式：每事件 + 总计都要 fromUser + fromProject === hookCount
+    for (const view of data.events) {
+      assert.equal(view.fromUser + view.fromProject, view.hookCount, `${view.event} 的来源条数必须自洽`)
+    }
+    assert.equal(
+      data.events.reduce((sum, view) => sum + view.fromUser + view.fromProject, 0),
+      data.total.hookCount,
+      '总计也必须自洽',
+    )
+    // 会话生效口径（D3 那一行）同理：自洽，且不是 0 + 0
+    assert.notEqual(data.session, null)
+    assert.equal(data.session.fromUser + data.session.fromProject, data.session.hookCount)
+    assert.equal(data.session.hookCount, 2)
+    assert.equal(data.session.fromProject, 1)
+    assert.equal(data.session.staleInUse, true)
+    // 而 `files[]` **仍然**用新鲜读：那份文件此刻确实是坏的（与"运行中的条数"是两件事，都要说清）
+    const project = data.files.find((file) => file.kind === 'project')
+    assert.equal(project.state, 'error')
+    assert.equal(project.hookCount, 0, 'files[] = 这份文件此刻长什么样（读不出来 → error + 0 条）')
+  })
+})
+
 await test('P：GET —— 没有会话上下文时只列用户级，绝不编造项目路径', async () => {
   await withIsolatedHome(async () => {
     const conn = makeConnection()
@@ -2698,6 +3596,12 @@ await test('P：GET —— 没有会话上下文时只列用户级，绝不编�
       '只列用户级',
     )
     assert.equal(data.events.length, 7, '即使没有项目，7 个事件也要全列')
+    assert.equal(
+      data.session,
+      null,
+      '**三态**：当前会话未知 ⇒ `session` 整块 null（一个数字都不编）—— 页面必须说"当前会话未知"，' +
+        '绝不许显示"当前会话生效 0 条"（读不到 ≠ 没有，AGENTS §2.8/§2.9）',
+    )
   })
 })
 
@@ -2767,6 +3671,235 @@ await test('P：handler 抛错 → 500 信封，且**没有 data**（错误契�
 
 //#endregion
 
+//#region P5–P9. 作用域（`scope` / `workspaceId`）—— 只读快照的读路径
+//   §8 的 P5–P9。搞错这一层就会"看着 A 项目、改到 B 项目"，所以每条都先红后绿。
+
+/** 造一个假 `workspaceRegistry`（形状与官方 `dsh-workspace` 的记录对齐：id / path / title）。 */
+function fakeRegistry(records, overrides = {}) {
+  return {
+    list: () => records,
+    get: (id) => records.find((record) => record.id === id),
+    ...overrides,
+  }
+}
+
+await test('P：scope=user ⇒ 只列用户级；events 恒 7 项且等于用户级合并；会话生效视图仍如实给', async () => {
+  await withIsolatedHome(async () => {
+    const dir = await makeProject()
+    await writeHooks(dir, { hooks: { PreToolUse: [{ matcher: 'pwsh', hooks: [{ command: 'p1' }] }] } })
+    await fsp.writeFile(
+      path.join(process.env.DSH_HOME, 'hooks.json'),
+      JSON.stringify({ hooks: { PreToolUse: [{ hooks: [{ command: 'u1' }] }] } }),
+      'utf8',
+    )
+    const conn = makeConnection()
+    const { agent } = fakeAgent(dir)
+    await mount({ connection: conn.connection, fs: makeFs({ version: true }), initiator: agent })
+
+    const { status, data } = await callRoute(conn.routes[0], '?scope=user')
+    assert.equal(status, 200)
+    assert.deepEqual(
+      data.files.map((file) => file.kind),
+      ['user'],
+      'scope=user 时只有用户级一份（项目级不在这个作用域里）',
+    )
+    assert.equal(data.files[0].path, path.join(process.env.DSH_HOME, 'hooks.json'))
+    assert.equal(data.scope.kind, 'user')
+    assert.equal(data.scope.requested, 'user')
+    assert.equal(data.scope.projectRoot, null, '用户级作用域不绑任何项目 → projectRoot 必须是 null（不编造）')
+    assert.equal(data.scope.workspaceId, null)
+    assert.equal(data.events.length, 7, '7 个事件永远全列（含 0 条）')
+    const pre = data.events.find((event) => event.event === 'PreToolUse')
+    assert.equal(pre.hookCount, 1)
+    assert.equal(pre.fromProject, 0, 'scope=user 的生效视图里没有项目级贡献')
+    assert.equal(pre.groups[0].hooks[0].command, 'u1')
+
+    // §2.6：作用域回答"我在改哪份文件"，`session` 回答"当前会话实际会跑什么" —— 两者都必须给。
+    assert.equal(data.session.hookCount, 2, '会话生效 = 用户级 1 + 项目级 1（与所选作用域无关）')
+    assert.equal(data.session.fromUser, 1)
+    assert.equal(data.session.fromProject, 1)
+    assert.equal(data.session.projectRoot, dir)
+  })
+})
+
+await test('P：scope=workspace ⇒ 读 root(X)/.dsh/hooks.json；scope 三项各自正确、互不代替', async () => {
+  await withIsolatedHome(async () => {
+    const session = await makeProject('inner')
+    const other = await makeProject('sub')
+    await writeHooks(other, { hooks: { PreToolUse: [{ hooks: [{ command: 'other-1' }] }] } })
+    await fsp.writeFile(
+      path.join(process.env.DSH_HOME, 'hooks.json'),
+      JSON.stringify({ hooks: { Stop: [{ hooks: [{ command: 'u1' }] }] } }),
+      'utf8',
+    )
+    const conn = makeConnection()
+    const { agent } = fakeAgent(session)
+    await mount({
+      connection: conn.connection,
+      fs: makeFs({ version: true }),
+      initiator: agent,
+      workspaceRegistry: fakeRegistry([
+        { id: 'w-other', title: 'agent-go', path: other },
+        { id: 'w-sub', path: path.join(other, 'sub') },
+        { id: 'w-current', title: 'current', path: path.join(session, 'inner') },
+      ]),
+    })
+
+    const { status, data } = await callRoute(conn.routes[0], '?scope=workspace&workspaceId=w-other')
+    assert.equal(status, 200)
+    assert.deepEqual(
+      data.files.map((file) => file.kind),
+      ['project', 'user'],
+      '工作区作用域 = 选中的那份项目级 + 用户级',
+    )
+    assert.equal(data.files[0].path, path.join(other, '.dsh', 'hooks.json'), '读的必须**就是** root(X)/.dsh/hooks.json')
+    const pre = data.files[0].events.find((event) => event.event === 'PreToolUse')
+    assert.equal(pre.groups[0].hooks[0].command, 'other-1', '读的是那个工作区的文件，不是会话项目的')
+    // scope 三项：工作区路径、项目根、是否当前会话 —— 各自正确，页面必须分别显示
+    assert.equal(data.scope.kind, 'workspace')
+    assert.equal(data.scope.requested, 'workspace')
+    assert.equal(data.scope.workspaceId, 'w-other')
+    assert.equal(data.scope.workspaceTitle, 'agent-go')
+    assert.equal(data.scope.workspacePath, other)
+    assert.equal(data.scope.projectRoot, other)
+    assert.equal(data.scope.isCurrentSession, false, '当前会话在另一个项目里 → false（页面据此出黄底横幅）')
+    // 顶层 projectRoot/cwd 永远是**当前会话**在哪里（与所选作用域无关，AGENTS §2.8）
+    assert.equal(data.projectRoot, session)
+    assert.equal(data.cwd, session)
+    // 生效视图 = 用户级在前、项目级在后（合并语义与运行时的那一份一致）
+    const merged = data.events.find((event) => event.event === 'PreToolUse')
+    assert.equal(merged.hookCount, 1)
+    assert.equal(merged.groups[0].file, 'project', 'PreToolUse 只配在项目级，所以它的组来自 project')
+
+    // 清单：每条都带 projectRoot 与 isCurrent；**项目根 ≠ 工作区路径**时两者分别给
+    assert.equal(data.workspacesAvailable, true)
+    assert.deepEqual(
+      data.workspaces.map((workspace) => workspace.id),
+      ['w-other', 'w-sub', 'w-current'],
+    )
+    assert.equal(data.workspaces[0].isCurrent, false)
+    assert.equal(data.workspaces[0].projectRoot, other)
+    assert.equal(data.workspaces[1].title, 'w-sub', '没有 title 时用 id 兜底（不留空字符串）')
+    assert.equal(data.workspaces[1].path, path.join(other, 'sub'))
+    assert.equal(
+      data.workspaces[1].projectRoot,
+      other,
+      '工作区是仓库子目录时 projectRoot 是它的祖先 —— 两者必须**分别**给，页面才能分别显示',
+    )
+    assert.equal(data.workspaces[2].isCurrent, true, '当前会话的项目根就是它')
+
+    // 选中**当前**工作区 ⇒ isCurrentSession 为 true（页面据此换掉那条黄底横幅）
+    const current = await callRoute(conn.routes[0], '?scope=workspace&workspaceId=w-current')
+    assert.equal(current.data.scope.isCurrentSession, true)
+    assert.equal(current.data.scope.projectRoot, session, '工作区是仓库子目录 → 项目根是仓库根（两者不同）')
+    assert.equal(current.data.scope.workspacePath, path.join(session, 'inner'), '工作区路径照原样给，不许拿项目根顶上')
+    assert.equal(
+      current.data.files[0].path,
+      path.join(session, '.dsh', 'hooks.json'),
+      '读的是 root(X)/.dsh/hooks.json —— X 是**项目根**（最近含 .git 的祖先），不是工作区路径',
+    )
+  })
+})
+
+await test('P：scope=workspace + 未知 id ⇒ 404 unknown-workspace（绝不回落会话项目）', async () => {
+  await withIsolatedHome(async () => {
+    const dir = await makeProject()
+    await writeHooks(dir, { hooks: { PreToolUse: [{ hooks: [{ command: 'p1' }] }] } })
+    const conn = makeConnection()
+    const { agent } = fakeAgent(dir)
+    await mount({
+      connection: conn.connection,
+      fs: makeFs({ version: true }),
+      initiator: agent,
+      workspaceRegistry: fakeRegistry([{ id: 'w1', title: 'w1', path: dir }]),
+    })
+
+    const missing = await callRoute(conn.routes[0], '?scope=workspace&workspaceId=nope')
+    assert.equal(missing.status, 404, '工作区已经不在清单里 = 目标不存在（不是 500）')
+    assert.equal(missing.body.error, 'unknown-workspace')
+    assert.equal(missing.body.data, undefined, '失败响应**没有 data**（页面先补空形状再解引用）')
+    assert.ok(missing.body.detail.includes('nope'), 'detail 要能定位是哪个 id')
+    assert.equal(
+      missing.data.files.length,
+      0,
+      '**绝不回落**：请求了一个未知工作区时，不许把当前会话的项目文件当答案发下来（§2.2）',
+    )
+
+    const noId = await callRoute(conn.routes[0], '?scope=workspace')
+    assert.equal(noId.status, 400, 'scope=workspace 缺 workspaceId 是请求不合法（只做字符串收窄，语义在宿主）')
+    assert.equal(noId.body.error, 'bad-op')
+
+    const typo = await callRoute(conn.routes[0], '?scope=wrokspace')
+    assert.equal(typo.status, 400, '不认识的 scope 不许被静默当成 current 的别名')
+  })
+})
+
+await test('P：宿主没有 workspaceRegistry ⇒ workspacesAvailable:false + 空清单，且不报 500', async () => {
+  await withIsolatedHome(async () => {
+    const dir = await makeProject()
+    await writeHooks(dir, { hooks: { PreToolUse: [{ hooks: [{ command: 'p1' }] }] } })
+    const conn = makeConnection()
+    const { agent } = fakeAgent(dir)
+    // 刻意**不给** workspaceRegistry：真实宿主上服务也可能还没加载（渐进可用）。
+    await mount({ connection: conn.connection, fs: makeFs({ version: true }), initiator: agent })
+
+    const { status, data } = await callRoute(conn.routes[0])
+    assert.equal(status, 200, '"宿主没有清单"不是错误：当前项目与用户级配置照常可读可改')
+    assert.equal(data.workspacesAvailable, false, '**false = 宿主没有清单**（≠ 没有工作区）—— 页面必须明说')
+    assert.deepEqual(data.workspaces, [])
+    assert.deepEqual(
+      data.files.map((file) => file.kind),
+      ['project', 'user'],
+      '缺省作用域仍然是 current：两个来源照常都列',
+    )
+
+    // 显式要一个工作区：409（"这个宿主给不了那个能力"），不是 500
+    const asked = await callRoute(conn.routes[0], '?scope=workspace&workspaceId=w1')
+    assert.equal(asked.status, 409)
+    assert.equal(asked.body.error, 'no-workspace-registry')
+  })
+})
+
+await test('P：scope 缺省 = current（回归护栏：与显式 scope=current 逐字段一致）', async () => {
+  await withIsolatedHome(async () => {
+    const dir = await makeProject()
+    await writeHooks(dir, {
+      hooks: {
+        PreToolUse: [{ matcher: 'pwsh', hooks: [{ command: 'p1' }, { command: 'p2', timeout: 30 }] }],
+        Stop: [{ hooks: [{ command: 'p3' }] }],
+      },
+    })
+    await fsp.writeFile(
+      path.join(process.env.DSH_HOME, 'hooks.json'),
+      JSON.stringify({ hooks: { PreToolUse: [{ hooks: [{ command: 'u1' }] }] } }),
+      'utf8',
+    )
+    const conn = makeConnection()
+    const { agent } = fakeAgent(dir)
+    await mount({ connection: conn.connection, fs: makeFs({ version: true }), initiator: agent })
+
+    const implicit = await callRoute(conn.routes[0])
+    const explicit = await callRoute(conn.routes[0], '?scope=current')
+    assert.deepEqual(implicit.data, explicit.data, '缺省与显式 current 必须逐字段一致')
+    assert.deepEqual(
+      implicit.data.files.map((file) => file.kind),
+      ['project', 'user'],
+      '缺省语义与今天一致：两个来源都列（老客户端不许被这次改动影响）',
+    )
+    assert.equal(implicit.data.projectRoot, dir)
+    assert.equal(implicit.data.scope.kind, 'workspace')
+    assert.equal(implicit.data.scope.requested, 'current')
+    assert.equal(
+      implicit.data.scope.workspaceId,
+      null,
+      'current 不是清单里的某一条 → 不许拿某条工作区来代称"当前项目"（AGENTS §2.8）',
+    )
+    assert.equal(implicit.data.scope.isCurrentSession, true)
+  })
+})
+
+//#endregion
+
 //#region P4. 执行台账（状态色的唯一证据来源）+ 可寻址视图
 
 /** 造一条台账记录。 */
@@ -2776,6 +3909,8 @@ function ledgerEntry(overrides = {}) {
     sessionId: 's1',
     event: 'PreToolUse',
     command: 'c',
+    // 状态色的匹配条件是 event + command + **projectRoot** 三者（§2.3）。
+    projectRoot: '/p',
     exitCode: 0,
     decision: 'pass',
     durationMs: 1,
@@ -2785,7 +3920,7 @@ function ledgerEntry(overrides = {}) {
   }
 }
 
-test('L：台账有界（全局 500 / 单会话 200）、输出截断、匹配按 event+command', () => {
+test('L：台账有界（全局 500 / 单会话 200）、输出截断、匹配按 event+command+projectRoot', () => {
   const global = new ExecutionLedger()
   // 每条一个独立会话，避免单会话上限先起作用（两个上限是**各自**生效的，要分开验）。
   for (let i = 0; i < MAX_GLOBAL + 200; i++) {
@@ -2797,7 +3932,7 @@ test('L：台账有界（全局 500 / 单会话 200）、输出截断、匹配�
   for (let i = 0; i < MAX_PER_SESSION + 100; i++) perSession.push(ledgerEntry({ at: i, sessionId: 'only' }))
   assert.equal(perSession.size, MAX_PER_SESSION, '单会话必须封顶')
   assert.equal(
-    latestRunFor(perSession.entries(), 'PreToolUse', 'c').at,
+    latestRunFor(perSession.entries(), { event: 'PreToolUse', command: 'c', projectRoot: '/p' }).at,
     MAX_PER_SESSION + 99,
     '丢的是最旧的，留的是最新的',
   )
@@ -2810,9 +3945,15 @@ test('L：台账有界（全局 500 / 单会话 200）、输出截断、匹配�
 
   const fresh = new ExecutionLedger()
   fresh.push(ledgerEntry({ event: 'PreToolUse', command: 'old' }))
-  assert.equal(latestRunFor(fresh.entries(), 'PreToolUse', 'old').command, 'old')
-  assert.equal(latestRunFor(fresh.entries(), 'PreToolUse', 'new'), undefined, '命令改过 → 旧记录不匹配')
-  assert.equal(latestRunFor(fresh.entries(), 'Stop', 'old'), undefined, '事件不同也不匹配')
+  const query = (overrides) => ({ event: 'PreToolUse', command: 'old', projectRoot: '/p', ...overrides })
+  assert.equal(latestRunFor(fresh.entries(), query({})).command, 'old')
+  assert.equal(latestRunFor(fresh.entries(), query({ command: 'new' })), undefined, '命令改过 → 旧记录不匹配')
+  assert.equal(latestRunFor(fresh.entries(), query({ event: 'Stop' })), undefined, '事件不同也不匹配')
+  assert.equal(
+    latestRunFor(fresh.entries(), query({ projectRoot: '/other' })),
+    undefined,
+    '**项目根不同也不匹配** —— 同一条命令在别的项目跑过，不许给这个项目的行上色（§2.3）',
+  )
 })
 
 await test('P：行级状态来自真实执行；命令一改就回落到"未运行"（不许画旧状态）', async () => {
@@ -3194,6 +4335,199 @@ await test('P：not-preservable 会以 409 透传给页面（页面要能分别�
   assert.equal(response.status, 409)
   assert.equal(response.body.error, 'not-preservable')
   assert.equal(response.body.detail, '改写会动到目标之外的字段')
+})
+
+//#endregion
+
+//#region P3b. 作用域写入（§8 的 P3-10 / P3-11 / P3-12）：绝不改错文件
+
+await test('P3：带 workspaceId 的写 ⇒ 只改那个工作区的文件，当前会话项目的文件**字节不变**', async () => {
+  await withIsolatedHome(async () => {
+    const session = await makeProject()
+    const other = await makeProject()
+    await writeHooks(session, { hooks: { PreToolUse: [{ hooks: [{ command: 'session-1' }] }] } })
+    await writeHooks(other, { hooks: { PreToolUse: [{ hooks: [{ command: 'other-1' }] }] } })
+    const sessionFile = path.join(session, '.dsh', 'hooks.json')
+    const otherFile = path.join(other, '.dsh', 'hooks.json')
+    const before = fs.readFileSync(sessionFile, 'utf8')
+    const beforeHash = sha256(before)
+
+    const conn = makeConnection()
+    const writes = []
+    const { agent } = fakeAgent(session)
+    await mount({
+      connection: conn.connection,
+      fs: makeFs({ version: true, writes }),
+      initiator: agent,
+      workspaceRegistry: fakeRegistry([{ id: 'w-other', title: 'other', path: other }]),
+    })
+
+    const response = await postRoute(conn.routes[0], {
+      op: 'setHookCommand',
+      file: 'project',
+      workspaceId: 'w-other',
+      event: 'PreToolUse',
+      groupIndex: 0,
+      hookIndex: 0,
+      command: 'changed-in-other',
+    })
+    assert.equal(response.status, 200)
+    // ① 目标（另一个工作区）的文件真的变了
+    assert.equal(
+      JSON.parse(fs.readFileSync(otherFile, 'utf8')).hooks.PreToolUse[0].hooks[0].command,
+      'changed-in-other',
+    )
+    // ② 落盘的路径**就是**那个工作区的文件（不是会话项目的）
+    assert.equal(writes.length, 1)
+    assert.equal(writes[0].path, otherFile, '写盘路径必须是 root(workspaceId)/.dsh/hooks.json')
+    // ③ 当前会话项目的文件**一个字节都没变**（§2.2 的核心断言）
+    assert.equal(fs.readFileSync(sessionFile, 'utf8'), before, '当前会话项目的文件不许被碰')
+    assert.equal(sha256(fs.readFileSync(sessionFile, 'utf8')), beforeHash)
+
+    // ④ 反向：**不带** workspaceId（= 页面里的「当前会话项目」，没有工作区 id 可带）
+    //    必须落到会话项目，而且那个工作区的文件不许被碰。
+    const sessionWrite = await postRoute(conn.routes[0], {
+      op: 'setHookCommand',
+      file: 'project',
+      event: 'PreToolUse',
+      groupIndex: 0,
+      hookIndex: 0,
+      command: 'changed-in-session',
+    })
+    assert.equal(sessionWrite.status, 200, '不带 workspaceId 的写按会话 cwd 解析（旧语义，向后兼容）')
+    assert.equal(writes.length, 2)
+    assert.equal(writes[1].path, sessionFile, '「当前会话项目」的写必须落到会话项目的文件')
+    assert.equal(
+      JSON.parse(fs.readFileSync(sessionFile, 'utf8')).hooks.PreToolUse[0].hooks[0].command,
+      'changed-in-session',
+    )
+    assert.equal(
+      JSON.parse(fs.readFileSync(otherFile, 'utf8')).hooks.PreToolUse[0].hooks[0].command,
+      'changed-in-other',
+      '另一个工作区的文件不许被这次写碰到',
+    )
+  })
+})
+
+await test('P3：未知 workspaceId ⇒ 拒写 unknown-workspace，两边的文件都没变', async () => {
+  await withIsolatedHome(async () => {
+    const session = await makeProject()
+    const other = await makeProject()
+    await writeHooks(session, { hooks: { PreToolUse: [{ hooks: [{ command: 'session-1' }] }] } })
+    await writeHooks(other, { hooks: { PreToolUse: [{ hooks: [{ command: 'other-1' }] }] } })
+    const sessionFile = path.join(session, '.dsh', 'hooks.json')
+    const otherFile = path.join(other, '.dsh', 'hooks.json')
+    const sessionBefore = fs.readFileSync(sessionFile, 'utf8')
+    const otherBefore = fs.readFileSync(otherFile, 'utf8')
+
+    const conn = makeConnection()
+    const writes = []
+    const { agent } = fakeAgent(session)
+    await mount({
+      connection: conn.connection,
+      fs: makeFs({ version: true, writes }),
+      initiator: agent,
+      workspaceRegistry: fakeRegistry([{ id: 'w-other', title: 'other', path: other }]),
+    })
+
+    const response = await postRoute(conn.routes[0], {
+      op: 'setHookCommand',
+      file: 'project',
+      workspaceId: 'w-gone',
+      event: 'PreToolUse',
+      groupIndex: 0,
+      hookIndex: 0,
+      command: 'should-never-land',
+    })
+    assert.equal(response.status, 404)
+    assert.equal(response.body.error, 'unknown-workspace', '**绝不回落会话项目**：宁可写失败，也不改写错的文件')
+    assert.equal(writes.length, 0, '拒写时一次都不许触到写盘')
+    assert.equal(fs.readFileSync(sessionFile, 'utf8'), sessionBefore, '当前会话项目文件不许变')
+    assert.equal(fs.readFileSync(otherFile, 'utf8'), otherBefore)
+
+    // 宿主没有清单（服务缺席）是另一种错误：409，文案不同
+    const noRegistry = makeConnection()
+    const { agent: agent2 } = fakeAgent(session)
+    await mount({ connection: noRegistry.connection, fs: makeFs({ version: true }), initiator: agent2 })
+    const asked = await postRoute(noRegistry.routes[0], {
+      op: 'setHookCommand',
+      file: 'project',
+      workspaceId: 'w-other',
+      event: 'PreToolUse',
+      groupIndex: 0,
+      hookIndex: 0,
+      command: 'x',
+    })
+    assert.equal(asked.status, 409)
+    assert.equal(asked.body.error, 'no-workspace-registry')
+  })
+})
+
+await test('P3：addGroup 在文件不存在时自动建文件；createIfAbsent 竞态 ⇒ exists 如实拒写', async () => {
+  await withIsolatedHome(async () => {
+    const dir = await makeProject()
+    const projectFile = path.join(dir, '.dsh', 'hooks.json')
+    const conn = makeConnection()
+    const { agent } = fakeAgent(dir)
+    await mount({ connection: conn.connection, fs: makeFs({ version: true }), initiator: agent })
+
+    // ① 「＋新建」一次搞定：文件不存在也能建出含这条 hook 的骨架（D2）
+    const created = await postRoute(conn.routes[0], {
+      op: 'addGroup',
+      file: 'project',
+      event: 'PreToolUse',
+      matcher: 'pwsh',
+      command: 'echo first',
+      timeoutSec: 30,
+    })
+    assert.equal(created.status, 200)
+    const onDisk = JSON.parse(fs.readFileSync(projectFile, 'utf8'))
+    assert.deepEqual(onDisk, {
+      hooks: { PreToolUse: [{ matcher: 'pwsh', hooks: [{ type: 'command', command: 'echo first', timeout: 30 }] }] },
+    })
+    assert.deepEqual(parseHookConfig(onDisk).errors, [], '自动建出来的文件必须立刻是合法配置')
+
+    // ② 竞态：prepareWrite 看到的是 absent，但别人在我们读完之后建了文件 →
+    //    `createIfAbsent` 抛错，宿主必须**如实**报 exists 并提示刷新，绝不静默覆盖。
+    const racing = await makeProject()
+    const racingFile = path.join(racing, '.dsh', 'hooks.json')
+    const fsImpl = makeFs({ version: true })
+    fsImpl.writeText = async (target, content, expected) => {
+      if (expected && expected.kind === 'createIfAbsent') {
+        // 仿真：别人先写了一份（内容与我们要写的不同），provider 因此拒绝
+        await fsp.mkdir(path.dirname(target.displayPath), { recursive: true })
+        await fsp.writeFile(target.displayPath, '{"hooks":{"Stop":[]}}\n', 'utf8')
+        throw new Error('FS_EXISTS: 目标已存在（createIfAbsent 只对不存在的目标生效）')
+      }
+      throw new Error('不该走到这里')
+    }
+    const conn2 = makeConnection()
+    const { agent: agent2 } = fakeAgent(racing)
+    await mount({ connection: conn2.connection, fs: fsImpl, initiator: agent2 })
+    const conflicted = await postRoute(conn2.routes[0], {
+      op: 'addGroup',
+      file: 'project',
+      event: 'PreToolUse',
+      matcher: null,
+      command: 'echo x',
+      timeoutSec: null,
+    })
+    assert.equal(conflicted.status, 409)
+    assert.equal(conflicted.body.error, 'exists', '竞态如实报 exists（页面提示刷新），不是 500、也不是静默覆盖')
+    assert.equal(fs.readFileSync(racingFile, 'utf8'), '{"hooks":{"Stop":[]}}\n', '别人写下的内容一个字节都不许被覆盖')
+
+    // ③ 非新增类 op 在文件不存在时仍然 absent 拒写（不许顺手建出一份空配置）
+    const notNew = await postRoute(conn.routes[0], {
+      op: 'setHookDisabled',
+      file: 'user',
+      event: 'PreToolUse',
+      groupIndex: 0,
+      hookIndex: 0,
+      disabled: true,
+    })
+    assert.equal(notNew.status, 404)
+    assert.equal(notNew.body.error, 'absent')
+  })
 })
 
 //#endregion
