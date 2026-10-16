@@ -8,52 +8,74 @@
  *
  * ## 统一尺度（Fix C：用户说"整体风格乱" = 同一行里混了太多尺寸/对齐）
  *   - 控件高 **28px**（按钮 / 输入 / 下拉触发器 / 开关所在行都按它）；字号 **12px**（辅助）
- *     与 **13px**（正文/标题）；命令一律等宽 12px。
- *   - 圆角 **8px**（卡）/ **6px**（控件）；卡 padding `10px 12px`；图标格 28×28、圆角 6px。
- *   - 间距只用 **8 / 12 / 16** 三档（行内 `gap` 用 8，区块之间 12）。
+ *     与 **13px**（正文/标题）；命令一律等宽 12px；事件名后面的英文枚举 11px。
+ *   - 圆角 **8px**（卡）/ **6px**（控件）；卡 padding `10px 12px`；槽位 28×28、圆角 6px。
+ *   - **区块之间只有 12 / 16 两档**（`.dsh-hooks` 的 `gap:12px`；同层级内部的行/卡间距用 8，
+ *     那是"一组兄弟"而不是"两个区块"）。
  *   - 同一行里只允许一种行高：所有直接子项 `align-items:center` + 行 `min-height:28px`。
- *     **例外**：折叠里的 7 个事件行固定 **32px**（等距成一列，右侧 ghost 按钮不再忽高忽低）。
+ *     **例外**：折叠里的 7 个事件行固定 **32px**（等距成一列，右侧的 `＋` 不再忽高忽低）。
+ *   - **同级只用一种字符风格**：折叠开关 `▸/▾`、动作 `＋/↻`、勾选 `✓` —— 不再混 `+` / `>` 之类。
  *
  * ## 纪律
  * - **绝不硬编码颜色**（§3.1）：只用 `var(--dsw-alias-*)`，十六进制只作 fallback。
- * - **不写 inline 样式**（§3.2）；开关/卡的分层全部在这里。
+ * - **不写 inline 样式**（§3.2）；分层全部在这里。
  * - 每个可收缩子项 `min-width: 0`；长命令省略号；**不垫外层留白**（§3.12）。
- * - 卡**无描边**（靠 `settings-card-fill` 分层），hover 用 `interactive-bg-hover`。
- *   ⚠️ 这是对 §3.11 字面写法的一处**有意偏离**（§3.11 允许卡带 `settings-card-stroke`）：
- *   用户看真机截图后的原话是"整体风格乱"，卡描边 + 卡片内按钮描边叠起来正是"描边套描边"的画面。
- *   现在只留 fill 分层 + hover 底色，靠间距和圆角区分层级（记录在 README 的对应小节）。
+ * - **卡 = 官方卡片配方**：`settings-card-stroke`（可见的发丝描边）+ `settings-card-fill`（兜底填充）
+ *   + `--dsw-radius-xl`（20px），与 `agent-preset` / `settings-models` / `settings-plugin-inventory`
+ *   三个官方包一致。⚠️ 上一轮曾经"靠 fill 分层、去掉描边"（当时的理由是"描边套描边 = 乱"）——
+ *   真机上 `settings-card-fill` = `bg-layer-2` = **与设置面板底色逐位相同（ΔRGB 0）**，等于什么都
+ *   没画；`stroke` = `border-l4` = `#fff3` 叠上去 = `#565658`（ΔRGB 126）。**该偏离已撤销**，
+ *   理由是实测（`hooks-fidelity` 的逐像素 token 事实表），不是审美。
+ * - **折叠区 / 诊断区走另一套官方语言**：只画分隔线（`border-bottom:.5px solid var(--dsw-alias-border-l2)`，
+ *   ΔRGB 77），不加底色、不加圆角、不加卡片描边 —— 卡片语言与分隔线语言**不混在同一层**。
  * - **描边按钮只允许出现在工具条**（`__toolbtn`，即 `↻ 刷新` / `＋ 新建`）。内容区（卡片动作 /
  *   折叠事件行 / 空状态 / 表单）一律走无描边的 `__btn`（ghost 或 primary）。这条有机器断言：
  *   `tools/verify.ts` 数 `__btn--outline`，收起态必须是 0（真机那屏就是 7 个描边小按钮 = 乱）。
  *
- * ## 新增 token 先核对（本轮）
- * `--dsw-alias-label-primary/secondary/tertiary`、`--dsw-alias-border-l3`、
- * `--dsw-alias-interactive-bg-hover`、`--dsw-alias-button-primary-fill`、
- * `--dsw-alias-button-primary-hover`、`--dsw-alias-label-primary-foreground`、
- * `--dsw-alias-brand-primary`、`--dsw-alias-bg-layer-3`、`--dsw-alias-settings-card-*`
- * 都在安装目录的官方 CSS（`dsh-client-ui-primitives` / `dsh-client-ui-agent-preset`）里出现过。
- * ⚠️ 已核对**不存在**的（因此永远落到 fallback）：`--dsw-alias-text-*` 与
- * `--dsw-alias-state-warning-primary`（方案 §6.4 把它们的清理划给单独一次提交，本轮不动）。
+ * ## token 必须先核对（判据 = 官方 theme 的 token 表，不是"看着像"）
+ * 判据文件：安装目录 asar 里 `@deepseek-ai/dsh-client-ui-theme/lib/client.js` 的
+ * `base_css_default`（第 1142 行，`body{--dsw-alias-…}` 两套：亮色 + `body[data-ds-dark-theme]`）
+ * 与 `design_platform_css_default`（第 1148 行，`--dsw-static-*` 调色板）。
+ * 已核对**有定义**：`label-primary/secondary/tertiary`、`label-primary-foreground`、`border-l2/l3/l4`、
+ * `interactive-bg-hover/active`、`bg-layer-1/2/3`、`bg-module-platform`、`settings-card-fill/stroke`、
+ * `button-primary-fill/hover`、`brand-primary`、`state-success-primary`、`state-error-primary`、
+ * `state-warn-primary`、`state-warn-tertiary`、`shadow-lv3`、`radius-xl`。
+ * ⚠️ 已核对**一处定义都没有**（真机永远走 fallback —— 黄横幅实测底色 `#453d27` 就是 fallback 在
+ * 起作用）：`--dsw-alias-state-warning-primary`、`--dsw-alias-state-warning-background`、
+ * `--dsw-alias-state-error-background`、`--dsw-alias-state-success-background`、
+ * `--dsw-alias-state-ok-*`、`--dsw-alias-interactive-bg-pressed`、`--dsw-alias-text-*`。
+ * 官方真名分别是 `state-warn-primary` / `state-warn-tertiary` / （错误底无变体，用官方
+ * `Tag[data-tone=danger]` 的 `color-mix` 配方）/ `state-success-*` / `interactive-bg-active`。
+ * `tools/verify.ts` 的 D35 对这份名单做**否定断言**（注释里写名字可以，声明里写就不行）。
  */
 export const styles = `
-/* ── 页面骨架：只用 8/12/16 三档间距 ──
-   max-width:720px 与同目录 dsh-skill-manager 的基准一致：设置面板内容区本身约 660px 宽，
-   但在宽窗口 / 独立渲染时卡片不该被拉到满屏（预览里的第 ② 屏就是用来盯这件事的）。 */
+/* ── 页面骨架：区块之间只有 12 / 16 两档间距 ──
+   max-width:720px 与同目录 dsh-skill-manager 的基准一致。
+   ⚠️ 设置面板的**内容区真宽是 564px**（panel 800 / 导航 188 / 内容 padding:0 24px 24px，
+   由 hooks-fidelity 在真机截图上逐像素量出）—— 离线自查截图必须按 564px 渲染，按 660/612 做出来
+   的换行位置全是错的（上一轮"预览看着对、真机不对"的根因就是这个）。
+   ⚠️ 本模板字符串里**不许出现反引号**：会提前结束模板，esbuild 报的是 CSS 语法错（离现场很远）。 */
 .dsh-hooks { box-sizing:border-box; display:flex; flex-direction:column; gap:12px; min-width:0; max-width:720px;
   color:var(--dsw-alias-label-primary, inherit); font-size:13px; line-height:18px; }
 .dsh-hooks *, .dsh-hooks *::before, .dsh-hooks *::after { box-sizing:border-box; }
 
-/* ── 两行工具条 ── */
+/* ── 工具条**只有一行**（v3）；第二行是一句人话（.dsh-hooks__metaline，次要色、12px） ──
+   .dsh-hooks__spacer 是唯一的"把后面的东西推到右边"的手段（工具条的 刷新/新建、第二行的
+   会话口径都靠它）—— 同一条纪律不要用两种写法（真机截图里"第一行有刷新、第二行有计数"的错位
+   就是两行各自为政造成的）。 */
 .dsh-hooks__toolbar { display:flex; align-items:center; gap:8px; min-width:0; min-height:28px; flex-wrap:wrap; }
+.dsh-hooks__metaline { display:flex; align-items:center; gap:12px; min-width:0; min-height:18px; }
+.dsh-hooks__spacer { flex:1 1 auto; min-width:0; }
 .dsh-hooks__field { display:flex; align-items:center; gap:6px; min-width:0; flex:none; }
 .dsh-hooks__label { flex:none; font-size:12px; color:var(--dsw-alias-label-secondary, inherit); }
 .dsh-hooks__count { flex:none; font-size:12px; color:var(--dsw-alias-label-secondary, inherit); }
-.dsh-hooks__installed { flex:none; font-size:12px; color:var(--dsw-alias-label-secondary, inherit); }
-/* 「当前会话生效 N 条」：一条**行内**短句，不是横幅（用户反馈"堆叠横幅"是噪音）。 */
-.dsh-hooks__session { flex:1 1 auto; min-width:0; font-size:12px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis;
-  color:var(--dsw-alias-label-tertiary, var(--dsw-alias-label-secondary, inherit)); }
+.dsh-hooks__filecount { flex:none; font-size:12px; color:var(--dsw-alias-label-secondary, inherit); }
+/* 「本会话生效 N 个」：一条**行内**短句，不是横幅（用户反馈"堆叠横幅"是噪音）。
+   它只在"和屏幕上这一份不是同一件事"时渲染（见 section.tsx 的 sessionLineNeeded）。 */
+.dsh-hooks__session { flex:none; min-width:0; max-width:100%; font-size:12px; white-space:nowrap; overflow:hidden;
+  text-overflow:ellipsis; color:var(--dsw-alias-label-tertiary, var(--dsw-alias-label-secondary, inherit)); }
 .dsh-hooks__actions { display:flex; align-items:center; gap:8px; flex:none; white-space:nowrap; }
-.dsh-hooks__toolbarActions { display:flex; align-items:center; gap:8px; flex:none; margin-left:auto; white-space:nowrap; }
+.dsh-hooks__toolbarActions { display:flex; align-items:center; gap:8px; flex:none; white-space:nowrap; }
 
 /* ── 控件：统一 28px 高 / 12px 字 / 6px 圆角 ──
    **描边按钮只允许出现在工具条**（__toolbtn）与输入类控件上。内容区（卡片动作 / 折叠区 /
@@ -100,11 +122,16 @@ export const styles = `
   color:var(--dsw-alias-label-primary-foreground, inherit); }
 .dsh-hooks__toolbtn--primary:hover:not(:disabled) {
   background:var(--dsw-alias-button-primary-hover, var(--dsw-alias-button-primary-fill, var(--dsw-alias-brand-primary))); }
-.dsh-hooks__search { flex:1 1 180px; }
+.dsh-hooks__search { flex:0 1 200px; }
 .dsh-hooks__input { flex:0 1 220px; }
 .dsh-hooks__input::placeholder, .dsh-hooks__search::placeholder {
   color:var(--dsw-alias-label-tertiary, var(--dsw-alias-label-secondary, inherit)); }
 .dsh-hooks__muted { font-size:12px; color:var(--dsw-alias-label-secondary, inherit); }
+/* 文件路径（mono + 可断行）。★ **盘符路径的例外口径**（F3）：.dsh-hooks__path 只允许出现在
+   **空状态块**里（"当前文件路径"＝用户要创建/编辑的那个文件，路径是可操作信息）；
+   另一处允许出现盘符路径的地方是**诊断折叠**。正文其它地方（点击行 / 信息行 / 另一来源那一行 /
+   卡片 / 折叠事件行 / 表单）一律不许用这个类，也不许把路径拼进可见文本。
+   D 区有断言守着"正常态首屏可见文本不含盘符路径"。 */
 .dsh-hooks__path { font-family:ui-monospace, monospace; font-size:12px; overflow-wrap:anywhere; min-width:0;
   color:var(--dsw-alias-label-secondary, inherit); }
 
@@ -129,19 +156,36 @@ export const styles = `
 .dsh-hooks__optionlabel { flex:1 1 auto; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
 .dsh-hooks__check { flex:none; font-size:12px; color:var(--dsw-alias-label-secondary, inherit); }
 
-/* ── 一条 hook 一张卡：无描边、靠底色分层 + hover 底色 ── */
+/* ── 一条 hook 一张卡：**官方卡片配方**（agent-preset / settings-models /
+   settings-plugin-inventory 三个官方包是同一套原文）──
+       border: .5px solid var(--dsw-alias-settings-card-stroke);   ← 可见性全在这里
+       background: var(--dsw-alias-settings-card-fill);            ← 与面板同色（等于没有）
+       border-radius: var(--dsw-radius-xl);                        ← 官方 20px
+   ⚠️ 上一轮曾经"靠底色分层、去掉描边"（当时以为描边套描边是"乱"的来源）—— 在真机上
+   settings-card-fill 解析成 bg-layer-2，**与设置面板底色逐位相同（ΔRGB 0）**，于是卡片
+   什么都没画。hooks-fidelity 逐像素量过：stroke = border-l4 = #fff3 叠在 #2c2c2e 上
+   = #565658（ΔRGB 126）。所以**撤销那次偏离**，回到 AGENTS §3.11 的写法。
+   hover 底色仍然用 interactive-bg-hover（#ffffff14 → #3d3d3e，Δ49）。 */
 .dsh-hooks__list { display:flex; flex-direction:column; gap:8px; min-width:0; }
-.dsh-hooks__hookcard { display:flex; flex-direction:column; gap:6px; min-width:0; padding:10px 12px; border-radius:8px;
-  background:var(--dsw-alias-settings-card-fill, rgba(127,127,127,.06)); border:0; }
+.dsh-hooks__hookcard { display:flex; flex-direction:column; gap:6px; min-width:0; padding:10px 12px;
+  border-radius:var(--dsw-radius-xl, 20px);
+  background:var(--dsw-alias-settings-card-fill, rgba(127,127,127,.06));
+  border:.5px solid var(--dsw-alias-settings-card-stroke, rgba(127,127,127,.35)); }
 .dsh-hooks__hookcard:hover { background:var(--dsw-alias-interactive-bg-hover, rgba(127,127,127,.12)); }
 .dsh-hooks__cardmain { display:flex; align-items:center; gap:12px; min-width:0; }
-.dsh-hooks__icon { flex:none; width:28px; height:28px; border-radius:6px; display:flex; align-items:center; justify-content:center;
-  font-family:ui-monospace, monospace; font-size:12px; font-weight:600;
-  background:var(--dsw-alias-bg-module-platform, rgba(127,127,127,.12));
-  color:var(--dsw-alias-label-secondary, inherit); }
+/* 28×28 槽位：装**状态点**（v3 起不再装事件首字母 —— 事件名中文化之后那个字母没有信息量，
+   而状态色正好需要一个位置；颜色仍然只来自台账 / disabled，§3.8）。
+   槽位底色用 bg-module-platform（真机 #353638，比卡片底 #2c2c2e 亮一档，ΔRGB 29）。 */
+.dsh-hooks__slot { flex:none; width:28px; height:28px; border-radius:6px; display:flex; align-items:center; justify-content:center;
+  background:var(--dsw-alias-bg-module-platform, rgba(127,127,127,.12)); }
+.dsh-hooks__slot .dsh-hooks__dot { width:10px; height:10px; }
 .dsh-hooks__cardtext { display:flex; flex-direction:column; gap:2px; min-width:0; flex:1 1 auto; }
 .dsh-hooks__eventname { font-size:13px; font-weight:500; line-height:18px; min-width:0;
   overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+/* 中文名是主、英文枚举是次要（mono、11px、第三级色）：用户查文档 / 配 hooks.json 时需要原文，
+   但**主文案**不该是一个英文枚举（用户原话"不像面向用户看的"）。 */
+.dsh-hooks__eventid { margin-left:6px; font-family:ui-monospace, monospace; font-size:11px; font-weight:400;
+  color:var(--dsw-alias-label-tertiary, var(--dsw-alias-label-secondary, inherit)); }
 .dsh-hooks__cmd { font-family:ui-monospace, monospace; font-size:12px; line-height:16px; min-width:0;
   white-space:nowrap; overflow:hidden; text-overflow:ellipsis; color:var(--dsw-alias-label-secondary, inherit); }
 .dsh-hooks__tag { flex:none; font-size:11px; padding:1px 6px; border-radius:999px;
@@ -154,63 +198,106 @@ export const styles = `
   background:var(--dsw-alias-bg-module-platform, transparent); color:var(--dsw-alias-label-primary, inherit); }
 .dsh-hooks__dry { font-size:12px; color:var(--dsw-alias-label-secondary, inherit); overflow-wrap:anywhere; }
 
-/* ── 状态点（颜色只能来自台账 / disabled，§3.8） ── */
+/* ── 状态点（颜色只能来自台账 / disabled，§3.8）──
+   ⚠️ token 名以官方 theme 表为准（dsh-client-ui-theme/lib/client.js 的 base_css_default）：
+   警告族写作 **state-warn-**，成功族是 **state-success-**。过去写的
+   state-warning-primary / state-success-background 等名字官方**一处定义都没有** ⇒ 真机上
+   永远走 fallback（黄横幅实测底色 #453d27 就是 fallback 在起作用）。 */
 .dsh-hooks__dot { flex:none; width:8px; height:8px; border-radius:50%;
   background:var(--dsw-alias-label-tertiary, var(--dsw-alias-label-secondary, rgba(127,127,127,.6))); }
-.dsh-hooks__dot--ok { background:var(--dsw-alias-state-success-primary, var(--dsw-alias-state-success-background, #3a3)); }
-.dsh-hooks__dot--deny { background:var(--dsw-alias-state-error-primary, var(--dsw-alias-state-error-background, #c33)); }
-.dsh-hooks__dot--warn { background:var(--dsw-alias-state-warning-primary, var(--dsw-alias-state-warning-background, #c93)); }
+.dsh-hooks__dot--ok { background:var(--dsw-alias-state-success-primary, #3a3); }
+.dsh-hooks__dot--deny { background:var(--dsw-alias-state-error-primary, #c33); }
+.dsh-hooks__dot--warn { background:var(--dsw-alias-state-warn-primary, #c93); }
 
-/* ── 开关：36×20、旋钮 16（参考图尺度），语义仍是 role="switch" ── */
+/* ── 开关：36×20、旋钮 16，语义仍是 role="switch" —— **照官方 Switch.module.css 的原文**：
+   关：轨道 border-l3（#ffffff29 → #4e4e50）、旋钮 switch-thumb（#adb2b8）；
+   开：轨道 brand-primary（深色下 = #f9fafb 近白药丸）、旋钮 label-primary-foreground（#0f1115）。
+   真机截图量到的正是"白色药丸 + 近黑旋钮"，这样两种状态都有足够对比度（旧版关态旋钮也是近黑，
+   在 #353638 轨道上几乎看不见）。 */
 .dsh-hooks__switch { position:relative; flex:none; width:36px; height:20px; padding:2px; border-radius:999px; cursor:pointer;
-  border:.5px solid var(--dsw-alias-border-l3, rgba(127,127,127,.35));
-  background:var(--dsw-alias-bg-module-platform, rgba(127,127,127,.2)); }
-.dsh-hooks__switch--on { background:var(--dsw-alias-button-primary-fill, var(--dsw-alias-brand-primary)); border-color:transparent; }
+  border:0; background:var(--dsw-alias-border-l3, rgba(127,127,127,.35)); }
+.dsh-hooks__switch--on { background:var(--dsw-alias-button-primary-fill, var(--dsw-alias-brand-primary)); }
 .dsh-hooks__switch:disabled { opacity:.5; cursor:default; }
 .dsh-hooks__knob { display:block; width:16px; height:16px; border-radius:50%; transition:transform .12s ease;
-  background:var(--dsw-alias-label-primary-foreground, #fff); }
-.dsh-hooks__switch--on .dsh-hooks__knob { transform:translateX(16px); }
+  background:var(--dsw-alias-switch-thumb, #adb2b8); }
+.dsh-hooks__switch--on .dsh-hooks__knob { transform:translateX(16px);
+  background:var(--dsw-alias-label-primary-foreground, #0f1115); }
 
-/* ── 唯一的提示行（0–1 条；不再堆叠横幅） ── */
-.dsh-hooks__alert { display:flex; align-items:flex-start; gap:8px; padding:8px 10px; border-radius:6px; font-size:12px;
-  line-height:18px; background:var(--dsw-alias-state-warning-background, rgba(200,150,0,.16)); }
-.dsh-hooks__alert--error { background:var(--dsw-alias-state-error-background, rgba(200,60,60,.16)); }
-.dsh-hooks__alert--info { background:var(--dsw-alias-bg-module-platform, rgba(127,127,127,.12)); }
+/* ── 唯一的提示行（0–1 条；不再堆叠横幅） ──
+   ⚠️ 基类**只有布局、没有底色**。两种 tone：
+   - --info（非当前工作区 / 只读）＝ **中性信息行**：无底色、次要色文字 + ghost 动作。
+     过去它是黄底两行 + 绝对路径 + "报 sandbox 属预期"，用户的原话是"太差了"；而那个黄底
+     其实来自**不存在的 token**（state-warning-background 官方 0 定义 ⇒ 走 fallback）。
+   - --error（真错误）＝ 官方 Tag[data-tone=danger] 的配方：
+     color-mix(in srgb, var(--dsw-alias-state-error-primary) 10%, transparent)
+     （官方无 state-error-background 这个变体，不许自己配 rgba）。 */
+.dsh-hooks__alert { display:flex; align-items:center; gap:8px; padding:8px 10px; border-radius:6px; font-size:12px;
+  line-height:18px; min-width:0; }
+.dsh-hooks__alerttext { flex:1 1 auto; min-width:0; }
+.dsh-hooks__alert--info { color:var(--dsw-alias-label-secondary, inherit); }
+.dsh-hooks__alert--error {
+  background:color-mix(in srgb, var(--dsw-alias-state-error-primary) 10%, transparent); }
 .dsh-hooks__strong { font-weight:600; }
 
+/* 「另一个来源」那一行（只在有内容 / 读不出来时出现）：一行里"还有 N 个 hook" + ghost 动作。
+   **正文不许出现盘符路径**（路径/状态/版本都在诊断折叠里）。 */
+.dsh-hooks__other { display:flex; align-items:center; gap:8px; min-width:0; min-height:28px; flex-wrap:wrap; }
+
 /* ── 空状态块（一个作用域一条 hook 都没有时替代主列表）──
-   底色分层、**无描边**（§3.11：描边套描边就是"乱"的来源）；引导条不带分隔线，只靠间距。 */
-.dsh-hooks__empty { display:flex; flex-direction:column; gap:8px; min-width:0; padding:12px; border-radius:8px;
-  background:var(--dsw-alias-settings-card-fill, rgba(127,127,127,.06)); border:0; }
+   与 hook 卡片**同一套官方配方**（stroke 给可见性、fill 兜底、radius-xl），别在这里换语言。 */
+.dsh-hooks__empty { display:flex; flex-direction:column; gap:8px; min-width:0; padding:12px;
+  border-radius:var(--dsw-radius-xl, 20px);
+  background:var(--dsw-alias-settings-card-fill, rgba(127,127,127,.06));
+  border:.5px solid var(--dsw-alias-settings-card-stroke, rgba(127,127,127,.35)); }
 .dsh-hooks__emptytitle { font-size:13px; font-weight:500; line-height:18px; min-width:0; }
 .dsh-hooks__emptyactions { display:flex; align-items:center; gap:8px; min-width:0; flex-wrap:wrap; }
 .dsh-hooks__emptyguide { display:flex; align-items:center; gap:8px; min-width:0; flex-wrap:wrap; }
 
-/* ── 折叠区（全部事件 / 诊断）：默认收起，一行一个开关 ── */
+/* ── 折叠区（全部事件 / 诊断）：默认收起，一行一个开关 ──
+   这里是**官方"只画分隔线"那套语言**（settings-general 的 .row：border-bottom:.5px solid
+   var(--dsw-alias-border-l2)，真机 ΔRGB 77）—— 不加底色、不加圆角、不加卡片描边：
+   卡片语言（hook 卡片 / 空状态 / 表单）与分隔线语言**不许混在同一层**。 */
 .dsh-hooks__folds { display:flex; align-items:center; gap:12px; min-width:0; flex-wrap:wrap; }
 .dsh-hooks__disclosure { display:flex; align-items:center; gap:6px; border:0; background:transparent; cursor:pointer;
   font:inherit; font-size:12px; color:var(--dsw-alias-label-secondary, inherit); padding:0; }
 .dsh-hooks__disclosure:hover { color:var(--dsw-alias-label-primary, inherit); }
-.dsh-hooks__foldbody { display:flex; flex-direction:column; gap:8px; min-width:0; padding:10px 12px; border-radius:8px;
-  background:var(--dsw-alias-settings-card-fill, rgba(127,127,127,.06)); }
+.dsh-hooks__foldbody { display:flex; flex-direction:column; min-width:0; padding:0; }
 /* 事件行：**行高固定 32px**（7 行等距，扫起来是"一张表"而不是"一堆按钮"），
-   右侧的「＋新建」是 ghost 文字按钮（无描边）。中间那格占满剩余宽度 ⇒ 按钮被推到行尾、对齐成一列。 */
-.dsh-hooks__eventrow { display:flex; align-items:center; gap:8px; min-width:0; height:32px; }
+   右侧的「＋」是 ghost **字形按钮**（24×24、无描边、只有动作、不抢视线；title / aria-label
+   说清"在哪个事件下新建"）。中间那格占满剩余宽度 ⇒ 按钮被推到行尾、对齐成一列。 */
+.dsh-hooks__eventrow { display:flex; align-items:center; gap:8px; min-width:0; height:32px; padding:0 12px;
+  border-bottom:.5px solid var(--dsw-alias-border-l2, rgba(127,127,127,.12)); }
 .dsh-hooks__eventrow > .dsh-hooks__muted, .dsh-hooks__eventrow > .dsh-hooks__count {
   flex:1 1 auto; min-width:0; }
 .dsh-hooks__eventname--fold { flex:none; min-width:150px; }
-.dsh-hooks__diagrow { display:flex; gap:8px; min-width:0; }
+.dsh-hooks__glyphbtn { width:24px; height:24px; padding:0; justify-content:center; font-size:14px;
+  color:var(--dsw-alias-label-secondary, inherit); }
+/* 诊断行同样走"分隔线"语言（label + value 的表格式条目，官方 settings 的行就是这样）。 */
+.dsh-hooks__diagrow { display:flex; gap:8px; min-width:0; padding:6px 12px;
+  border-bottom:.5px solid var(--dsw-alias-border-l2, rgba(127,127,127,.12)); }
 .dsh-hooks__diagkey { flex:none; min-width:96px; font-size:12px; color:var(--dsw-alias-label-secondary, inherit); }
 .dsh-hooks__diagval { font-size:12px; min-width:0; overflow-wrap:anywhere; }
 
-/* ── 新建表单（错误只渲染在表单里，§3.7） ── */
-.dsh-hooks__newform { display:flex; flex-direction:column; gap:8px; min-width:0; padding:12px; border-radius:8px;
-  background:var(--dsw-alias-settings-card-fill, rgba(127,127,127,.06)); }
-.dsh-hooks__newfield { display:flex; align-items:center; gap:8px; min-width:0; flex-wrap:wrap; }
+/* ── 新建表单（错误只渲染在表单里，§3.7）── 与卡片同一套官方配方 ──
+   F1：**每个字段一个容器**（label + 控件同进同出），容器内部 nowrap ⇒ label 与它的控件
+   永远在同一行；只有**容器之间**才允许换行（.dsh-hooks__newrow 是那层 wrap）。
+   过去 5 个兄弟节点平铺在一个 wrap 行里，564px 下"匹配"的 label 与输入框被拆到两行。 */
+.dsh-hooks__newform { display:flex; flex-direction:column; gap:8px; min-width:0; padding:12px;
+  border-radius:var(--dsw-radius-xl, 20px);
+  background:var(--dsw-alias-settings-card-fill, rgba(127,127,127,.06));
+  border:.5px solid var(--dsw-alias-settings-card-stroke, rgba(127,127,127,.35)); }
+.dsh-hooks__newrow { display:flex; align-items:center; gap:16px; min-width:0; flex-wrap:wrap; }
+.dsh-hooks__newfield { display:flex; align-items:center; gap:8px; min-width:0; flex-wrap:nowrap; }
 .dsh-hooks__newfield > .dsh-hooks__editor { flex:1 1 240px; }
 .dsh-hooks__newlabel { flex:none; min-width:56px; font-size:12px; color:var(--dsw-alias-label-secondary, inherit); }
+/* 动作区（创建 / 取消）：不是字段容器，所以不叫 __newfield */
+.dsh-hooks__newactions { display:flex; align-items:center; gap:8px; min-width:0; flex-wrap:wrap; }
+/* 表单里"这个事件什么时候触发"的补充说明（官方 README 的「运行时机」，见 labels.ts 的出处） */
+.dsh-hooks__hint { flex:none; font-size:12px; color:var(--dsw-alias-label-tertiary, var(--dsw-alias-label-secondary, inherit)); }
+/* 表单内的错误行：与页面级错误**同一套官方 danger 配方**（Tag[data-tone=danger]）。
+   官方没有 state-error-background 这个变体 —— 自己配 rgba 就是硬编码颜色。 */
 .dsh-hooks__newerror { padding:8px 10px; border-radius:6px; font-size:12px; line-height:18px;
-  background:var(--dsw-alias-state-error-background, rgba(200,60,60,.16)); }
+  background:color-mix(in srgb, var(--dsw-alias-state-error-primary) 10%, transparent); }
 .dsh-hooks__select { font:inherit; font-size:12px; line-height:1; height:28px; padding:0 6px; border-radius:6px; max-width:260px;
   border:.5px solid var(--dsw-alias-border-l3, rgba(127,127,127,.35));
   background:var(--dsw-alias-bg-module-platform, transparent); color:var(--dsw-alias-label-primary, inherit); }

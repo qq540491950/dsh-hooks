@@ -2,45 +2,63 @@
  * 一张卡 = **一条 hook**（参考图的形态）。
  *
  * ```
- * ▣  PreToolUse                                   [ ●—— ]
+ * ●  工具运行前 PreToolUse                          [ ●—— ]
  *    node -e const fs=require('node:fs')…
+ *    未运行   匹配 pwsh|bash   默认 600 秒
  * ```
- *   - 左侧 28×28 圆角图标格 = 事件首字母（一眼看出事件，不靠颜色）；
- *   - 标题 = 事件名（`disabled` 时带"已停用"标签）；副标题 = command（mono、省略号）；
+ *   - 左侧 28×28 槽位装**状态点**（过去装事件首字母；事件名中文化之后那个字母就没有信息量了
+ *     —— 用户看不懂 `P`，而状态色正好需要一个位置，见 §3.8 与 README 的说明）；
+ *   - 标题 = **中文名主 + 英文枚举次要 mono**（`title` 给触发时机 + 原文）；`disabled` 时带"已停用"标签；
+ *   - 副标题 = command（mono、省略号）；
  *   - 右侧 = 开关（`role="switch"` + `aria-checked`，36×20）；
- *   - 第二行 = 状态点 + 状态文案 + matcher/timeout + 动作按钮。动作按钮在 CSS 里 hover/聚焦
- *     才显形（视觉更安静），但**始终在 DOM 里** —— 键盘用户能 Tab 到，离线渲染测试也看得见。
+ *   - 第二行 = 状态文案 + 匹配范围 + 超时 + 动作按钮。动作按钮在 CSS 里 hover/聚焦才显形
+ *     （视觉更安静），但**始终在 DOM 里** —— 键盘用户能 Tab 到，离线渲染测试也看得见。
+ *
+ * ## 第二行"说人话"（用户反馈它是字段 dump）
+ * `未运行（没有执行记录）` → `未运行`（**原因进 `title`**）；`matcher: X` → `匹配 X`；
+ * `matcher: null` → `匹配全部`；`10s` → `10 秒`、`600s 默认` → `默认 600 秒`。
+ * 这一行不许再出现 `matcher:` 这种接口字段名，也不许出现裸的 `10s`。
  *
  * ## 纯 props，零 hook（硬约束）
  * `tools/verify.ts` 的假 React 只能展开**不用 hook 的子组件**（它按位置发 `useState` 的值，
  * 只对最外层成立）。所以这里不持有任何状态：正在编辑哪一条、草稿、删除确认态、试运行结果
  * 全部由 `HooksSection` 通过 props 传下来 —— 状态只有一处，行组件只负责画与回调。
  *
- * ## 文本纪律（本轮修的真 bug）
+ * ## 文本纪律（修过的真 bug）
  * 页面上**不许出现 markdown 语法**（截图里 `**agent-go**` 把星号原样渲染出来了）。
  * 要强调就用 `<strong className="dsh-hooks__strong">`，**不要**在字符串里写星号对。
  */
 
 import { h } from './react.ts'
 import type { Jsx } from './react.ts'
+import { eventLabel, eventTitle } from './labels.ts'
 import type { HookView } from './wire.ts'
 
-/** 行状态：**颜色只能来自真实执行记录或 `disabled`**（§3.8）。 */
-export function statusOf(hook: HookView): { className: string; label: string } {
-  if (hook.disabled) return { className: 'dsh-hooks__dot', label: '已停用（不会运行）' }
+/**
+ * 行状态：**颜色只能来自真实执行记录或 `disabled`**（§3.8）。
+ *
+ * `label` 是**给用户看的一行短字**（`未运行` / `通过 · exit 0 · 12ms`），`reason` 是它凭什么
+ * 这么说的**短证据**，只作 `title`（不进可见文本 —— 用户反馈那一行是字段 dump）。
+ */
+export function statusOf(hook: HookView): { className: string; label: string; reason: string } {
+  if (hook.disabled) return { className: 'dsh-hooks__dot', label: '不会运行', reason: '已停用' }
   const run = hook.lastRun
-  if (run === null) return { className: 'dsh-hooks__dot', label: '未运行（没有执行记录）' }
-  const where = `exit ${run.exitCode === null ? 'spawn-failed' : String(run.exitCode)} · ${run.durationMs}ms`
+  if (run === null) return { className: 'dsh-hooks__dot', label: '未运行', reason: '没有执行记录' }
+  const where = `exit ${run.exitCode === null ? 'spawn-failed' : String(run.exitCode)} · ${String(run.durationMs)}ms`
   if (run.decision === 'deny' || run.decision === 'block') {
-    return { className: 'dsh-hooks__dot dsh-hooks__dot--deny', label: `已阻断 · ${where}` }
+    return {
+      className: 'dsh-hooks__dot dsh-hooks__dot--deny',
+      label: `已阻断 · ${where}`,
+      reason: `decision ${run.decision}`,
+    }
   }
-  if (run.exitCode === 0) return { className: 'dsh-hooks__dot dsh-hooks__dot--ok', label: `通过 · ${where}` }
-  return { className: 'dsh-hooks__dot dsh-hooks__dot--warn', label: `失败 · ${where}` }
-}
-
-/** 事件首字母（图标格里的那个字符）。 */
-function initialOf(event: string): string {
-  return event.slice(0, 1).toUpperCase()
+  if (run.exitCode === 0)
+    return { className: 'dsh-hooks__dot dsh-hooks__dot--ok', label: `通过 · ${where}`, reason: 'exit 0' }
+  return {
+    className: 'dsh-hooks__dot dsh-hooks__dot--warn',
+    label: `失败 · ${where}`,
+    reason: `exit ${String(run.exitCode)}`,
+  }
 }
 
 /** 一条 hook 的卡片。全部动作都是外面传进来的回调（本组件不知道怎么写盘）。 */
@@ -70,16 +88,23 @@ export function HookCard(props: {
   const { hook, event, matcher, matcherProblem, writable, busy, editing, draft, confirming, dryText } = props
   const status = statusOf(hook)
   const run = hook.lastRun
-  const dotTitle = run === null ? status.label : `${status.label}\n${run.stderr || run.stdout || '(无输出)'}`
+  const dotTitle = `${status.label}（${status.reason}）${
+    run === null ? '' : `\n${run.stderr || run.stdout || '(无输出)'}`
+  }`
+  const matchText = matcher === null ? '匹配全部' : `匹配 ${matcher}`
   return (
     <div className="dsh-hooks__hookcard">
       <div className="dsh-hooks__cardmain">
-        <span className="dsh-hooks__icon" aria-hidden="true" title={event}>
-          {initialOf(event)}
+        {/* 28×28 槽位：装状态点（颜色只来自台账 / disabled）。槽位本身没有颜色语义，
+            所以 `aria-hidden` —— 状态的文字说明就在下面那一行里。 */}
+        <span className="dsh-hooks__slot" aria-hidden="true">
+          {/* 状态点必须能解释自己（title 里有原因 + 最近一次的输出） */}
+          <span className={status.className} title={dotTitle} />
         </span>
         <span className="dsh-hooks__cardtext">
-          <span className="dsh-hooks__eventname" title={event}>
-            {event}
+          <span className="dsh-hooks__eventname" title={eventTitle(event)}>
+            {eventLabel(event)}
+            <span className="dsh-hooks__eventid">{event}</span>
             {hook.disabled ? <span className="dsh-hooks__tag">已停用</span> : null}
           </span>
           {editing ? (
@@ -111,16 +136,15 @@ export function HookCard(props: {
         </button>
       </div>
       <div className="dsh-hooks__detailRow">
-        {/* 状态点：没有记录就是灰色 —— 且必须能解释自己（title 里有原因） */}
-        <span className={status.className} title={dotTitle} />
-        <span className="dsh-hooks__meta">{status.label}</span>
-        {matcher === null ? null : (
-          <span className="dsh-hooks__meta" title={matcherProblem ?? 'matcher'}>
-            matcher: {matcher}
-          </span>
-        )}
+        {/* 状态文案：短句 + `title` 里给证据（颜色在左边的槽位里） */}
+        <span className="dsh-hooks__meta" title={status.reason}>
+          {status.label}
+        </span>
+        <span className="dsh-hooks__meta" title={matcherProblem ?? matchText}>
+          {matchText}
+        </span>
         <span className="dsh-hooks__meta" title="超时（未写则为默认值）">
-          {hook.timeoutSec === null ? `${String(hook.defaultTimeoutSec)}s 默认` : `${String(hook.timeoutSec)}s`}
+          {hook.timeoutSec === null ? `默认 ${String(hook.defaultTimeoutSec)} 秒` : `${String(hook.timeoutSec)} 秒`}
         </span>
         {matcherProblem === null ? null : <span className="dsh-hooks__tag">matcher 非法，这一组不会运行</span>}
         {writable ? (

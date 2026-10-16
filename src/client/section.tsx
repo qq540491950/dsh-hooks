@@ -1,17 +1,26 @@
 /**
- * 设置页「Hooks」——**两行工具条 + 一条 hook 一张卡 + 两个折叠区**。
+ * 设置页「Hooks」——**一行工具条 + 一句元信息 + 一条 hook 一张卡 + 两个折叠区**。
  *
- * ## 这一层的布局契约（用户按参考图定下的形态）
+ * ## 这一层的布局契约（v3：用户拿真机截图说"太差了"之后收成的形态）
  * ```
- * 作用域 [ 当前会话项目（dsh-hooks） ▾ ]  钩子 3            [🔍 搜索钩子…]
- * 已安装 2 · 已停用 1 · 会话将跑 4 条                        [↻ 刷新]  [＋ 新建]
+ * 作用域 [ 当前会话项目（dsh-hooks） ▾ ]                [↻ 刷新]  [＋ 新建]
+ * 1 个 hook · 其中 1 个已停用                              本会话生效 4 个
  * ─────────────────────────────────────────────────────────
- * ▣  PreToolUse                                     [ ●—— ]
+ * ●  工具运行前 PreToolUse                                  [ ●—— ]
  *    node -e const fs=require('node:fs')…
+ *    未运行   匹配 pwsh|bash   默认 600 秒
  * ▸ 查看全部事件（7）   ▸ 诊断
  * ```
- *   - **一张卡 = 一条 hook**（不是"一个事件一张卡"）：标题=事件名、副标题=命令、右侧开关；
- *   - 工具条**两行**：第一行 作用域 + 条数 + 搜索；第二行 计数 + 刷新/新建（对齐参考图）；
+ *   - **一张卡 = 一条 hook**（不是"一个事件一张卡"）：标题 = 中文名 + 英文枚举（mono 次要）、
+ *     副标题 = 命令、右侧开关；第二行是**人话**（`未运行` / `匹配 X` / `默认 600 秒`）；
+ *   - **工具条只有一行**：左边作用域、右边 `↻ 刷新` / `＋ 新建`。`钩子 N` chip 删掉了
+ *     （它夹在下拉与搜索框之间破坏分组），搜索框**只在 `fileTotal >= 5` 时**渲染
+ *     （1 条 hook 的页面上它是纯噪音）；
+ *   - **第二行是一句人话**（次要色）：`N 个 hook`，有停用时追加 `其中 M 个已停用`，
+ *     筛选时换成 `匹配 K / 共 N`。「本会话生效 X 个」**只在**它和屏幕上这一份**不是同一件事**时
+ *     出现（作用域 ≠ 当前会话项目，或会话未知）—— 选中当前会话项目时上面那句已经是答案。
+ *     过去同一屏把条数说了 5 遍（`钩子 1` / `已安装 1` / `（用户级 0 + 项目级 1）` / `0 条` / `1 条`），
+ *     现在 `（用户级 a + 项目级 b）` 与完整口径只留在**诊断折叠**里；
  *   - **0 条的事件不进主列表**，收进底部折叠 `查看全部事件（7）`；
  *   - **主列表为空时渲染空状态块**（真机那一屏就是它）：标题 + **分别说清**的副文案
  *     （文件不存在 = "这份 hooks.json 还不存在（这是空的，不是出错）"；存在但 0 条 =
@@ -27,8 +36,22 @@
  *   - **描边按钮只允许出现在工具条**（`↻ 刷新` / `＋ 新建`）：内容区（卡片动作 / 折叠事件行 /
  *     空状态 / 新建表单）一律 ghost 文字按钮。折叠收起时全页 `__btn--outline` 计数必须是 **0**
  *     （D 区有断言；真机上"7 个事件行各一个描边小按钮"就是"乱"的来源）；
- *   - **诊断收进底部折叠**（项目根 / 路径 / 状态 / 版本 / 清单 / matcher 诊断…）；
+ *   - **诊断收进底部折叠**（项目根 / cwd 来源 / 路径 / 状态 / 版本 / `写入权限` / 清单 / matcher 诊断…）；
  *   - 页面级提示**最多一条**（页面错误 > 文件坏了 > 非当前工作区 > 只读），不再堆叠横幅。
+ *
+ * ## 三条"面向用户"的硬规则（v3 的 P0，都有机器断言）
+ *   1. **非当前工作区**那条提醒是**一行信息**，不是黄底横幅，正文里**没有盘符路径**：
+ *      `本会话不读这份配置 —— 改动只影响以后在 X 里打开的会话。` + ghost 动作
+ *      `切回当前会话项目`（仅当目标 ≠ 当前作用域时）。被删掉的两条事实落进诊断折叠：
+ *      `项目根` 一行仍在，另加 `写入权限` = 「按调用会话的沙箱策略判定；被拒绝时报 sandbox」。
+ *      黄底（`state-warning-background`）**不再挂在 `__alert` 上** —— 样式里没有这个颜色，
+ *      自检对样式字符串做字面断言（"警告底色"不许回来）。
+ *   2. **另一个来源**（用户级 / 项目级里不是主文件的那一份）**只在"有东西"时出现**：
+ *      `file.hookCount > 0 || file.state === 'error'`。有内容 → `用户级（全局）还有 2 个 hook`
+ *      + ghost `切过去`；读不出来 → `用户级（全局）这份配置读不出来（详情见诊断）`。
+ *      两种情形正文里都**不含盘符路径**（路径与状态都在诊断折叠里）。
+ *   3. **折叠里的空事件行**右侧是 `＋` **字形按钮**（`title` = `在 X 下新建`，
+ *      `aria-label` = 中文名 + 英文原文），不再是六个「＋新建」文字按钮 —— 行高仍固定 32px。
  *
  * ## ⚠️ 对 AGENTS §3.6 的有意偏离（写在明处）
  * §3.6 要求"7 个事件分组永远全部渲染（含 0 条）"。本轮按用户明确要求改成"主列表只显示有内容的
@@ -59,6 +82,7 @@ import type { Jsx } from './react.ts'
 import { HOOK_EVENTS } from '../shared/constants.ts'
 import { styles } from './styles.ts'
 import { HookCard } from './hook-card.tsx'
+import { eventLabel, eventTitle } from './labels.ts'
 import { NewHookForm } from './new-hook.tsx'
 import { ScopePicker, type KeyLike, type ScopeOption } from './scope-picker.tsx'
 import {
@@ -273,7 +297,7 @@ function scopeHelp(snapshot: HooksSnapshot, scope: ScopeValue): string {
       ? `当前会话就在这个项目（项目根 ${String(view.projectRoot)}），改动对之后的调用立即生效。`
       : `当前会话就在这个工作区（项目根 ${String(view.projectRoot)}），改动对之后的调用立即生效。`
   }
-  const where = viaCurrent ? '当前会话的项目' : (view.workspaceTitle ?? view.workspaceId ?? scope)
+  const where = scopeWhere(snapshot, scope)
   if (view.isCurrentSession === false) {
     // ⚠️ 这一条是**一回事两句话**（用户反馈"横幅堆了三四行"）：压到 2 行以内，
     //    但两件事一件都不许丢 ——「改动不会作用于当前会话」+「可能被当前会话的沙箱拒绝」。
@@ -287,14 +311,21 @@ function scopeHelp(snapshot: HooksSnapshot, scope: ScopeValue): string {
 }
 
 /**
- * 「另一个来源」那一行摘要里的引导句：**只在目标作用域 ≠ 当前作用域时出现**。
+ * 「另一个来源」那一行的引导句 —— **只在目标作用域 ≠ 当前作用域时出现**。
  *
  * 否则就是"自己指自己"（真机截图里选中用户级，底部却写"要编辑请把作用域切到「用户（全局）」"）
- * —— 那种话会让用户以为页面坏了。目标 = 当前时退化成中性描述（只有路径 / 条数 / 状态）。
+ * —— 那种话会让用户以为页面坏了。
+ *
+ * v3 起这条规则由 `wantSwitchTo`（值比较）统一执行，不再按"来源 kind 对 kind"推：
+ * 底部摘要 / 空状态引导条 / 非当前工作区那一行的动作**共用**它，三处不会各有一套口径。
  */
-function otherFileGuide(selected: 'user' | 'workspace', file: 'project' | 'user'): string | null {
-  if (file === 'user') return selected === 'user' ? null : '用户（全局）'
-  return selected === 'workspace' ? null : '对应的工作区'
+function wantSwitchTo(snapshot: HooksSnapshot, target: ScopeValue): boolean {
+  return target !== echoedScopeOf(snapshot)
+}
+
+/** 那一份的名字（用户看得懂的那种）：`用户级（全局）` / `项目级`。 */
+function fileKindLabel(kind: 'project' | 'user'): string {
+  return kind === 'user' ? '用户级（全局）' : '项目级'
 }
 
 /** 选中作用域里"主文件"（要编辑的那份）：用户级作用域 → 用户文件；工作区作用域 → 项目文件。 */
@@ -311,6 +342,30 @@ function disabledCountOf(file: FileView): number {
 }
 
 /**
+ * 屏幕上是哪一份（用户看得懂的名字）：工作区标题 / 「当前会话的项目」/ 用户级。
+ *
+ * 一处推导、多处使用（提醒句、诊断），避免"同一个东西在两个地方叫两个名字"。
+ */
+function scopeWhere(snapshot: HooksSnapshot, fallback: ScopeValue): string {
+  const { scope: view } = snapshot
+  if (view.kind === 'user') return '用户（全局）'
+  if (view.workspaceId === null && view.workspacePath === null) return '当前会话的项目'
+  return view.workspaceTitle ?? view.workspaceId ?? fallback
+}
+
+/**
+ * 「本会话生效 X 个」这一句**要不要出现**。
+ *
+ * 只在它和屏幕上这一份**不是同一件事**时才说话：选中当前会话项目时，第二行的 `N 个 hook`
+ * 已经就是答案（再说一遍 = 用户反馈的"同一条信息说五遍"）。会话未知时必须出现 ——
+ * 那时候它说的是"我不知道"，不是"没有"（§2.8/§2.9）。
+ */
+function sessionLineNeeded(snapshot: HooksSnapshot): boolean {
+  if (snapshot.session === null) return true
+  return snapshot.scope.isCurrentSession !== true
+}
+
+/**
  * 空状态块要说的两件事 + 一条**引导**。
  *
  * `guide` 是这一屏最关键的一条路：页面默认落在**用户（全局）**，而真机上用户级文件根本不存在
@@ -320,6 +375,10 @@ function disabledCountOf(file: FileView): number {
 interface EmptyBlock {
   /** 文件不存在 / 文件在但 0 条 —— **两种情形分开说**（§2.9/§3.9：空 ≠ 不存在）。 */
   body: string
+  /**
+   * 当前文件路径。**这是"盘符路径只允许出现在两处"里的第一处**（另一处是诊断折叠）：
+   * 空状态里的路径是可操作信息（用户要拿它去建这个文件），不是泄漏。见 `EmptyState` 的注释。
+   */
   path: string
   /** 「新建配置文件」**只在文件不存在时**出现。 */
   canCreateFile: boolean
@@ -349,8 +408,8 @@ function emptyGuideOf(snapshot: HooksSnapshot): { text: string; action: string; 
   const raw = rawEmptyGuideOf(snapshot)
   // ★ 引导条存在的唯一意义是"把用户带到**别处**"：目标 = 当前作用域时直接不给（自己指自己）。
   //   正常情况下不会走到这一步（空状态就意味着当前这一份是空的），但规则必须钉死 ——
-  //   它和底部摘要那条 `otherFileGuide` 是同一条纪律的两半。
-  if (raw === null || raw.target === echoedScopeOf(snapshot)) return null
+  //   它和底部摘要那条 `wantSwitchTo` 是同一条纪律的两半（同一个判据，不各写一套）。
+  if (raw === null || !wantSwitchTo(snapshot, raw.target)) return null
   return raw
 }
 
@@ -360,7 +419,7 @@ function rawEmptyGuideOf(snapshot: HooksSnapshot): { text: string; action: strin
     const session = snapshot.session
     if (session === null || session.fromProject <= 0) return null
     return {
-      text: `当前会话项目（${lastSegment(session.projectRoot)}）里有 ${String(session.fromProject)} 条。`,
+      text: `当前会话项目（${lastSegment(session.projectRoot)}）里有 ${String(session.fromProject)} 个 hook。`,
       action: '切换过去',
       target: currentScopeTarget(snapshot),
     }
@@ -368,7 +427,7 @@ function rawEmptyGuideOf(snapshot: HooksSnapshot): { text: string; action: strin
   const userFile = snapshot.files.find((file) => file.kind === 'user')
   if (userFile === undefined || userFile.state !== 'ok' || userFile.hookCount <= 0) return null
   return {
-    text: `用户级（全局）里有 ${String(userFile.hookCount)} 条。`,
+    text: `用户级（全局）里有 ${String(userFile.hookCount)} 个 hook。`,
     action: '切换过去',
     target: 'user',
   }
@@ -388,6 +447,14 @@ function emptyBlockOf(snapshot: HooksSnapshot, file: FileView): EmptyBlock {
 /**
  * 空状态块：标题 + 分别说清的副文案 + 路径 + 主按钮（＋ 新建第一条 hook）+ 仅文件不存在时的
  * 次按钮（新建配置文件）+ 引导条。**纯 props、零 hook**（假 React 只支持无 hook 的子组件）。
+ *
+ * ★ **盘符路径的例外口径**（F3；写死在注释里，免得下一个人当成泄漏"顺手清理"）：
+ *   盘符路径只允许出现在**两处** ——
+ *     ① 这里（空状态块里的"当前文件路径"）：那正是用户要创建/编辑的那个文件，
+ *        路径本身就是**可操作信息**（他要拿它去建文件、或者在资源管理器里找它）；
+ *     ② 诊断折叠（开发者排查用）。
+ *   正文其它地方（工具条 / 点击行 / 信息行 / 另一来源那一行 / 卡片 / 折叠事件行 / 表单）
+ *   **一律不许出现**。D 区有一条断言守着"正常态（有 hook、非空状态）首屏可见文本不含盘符路径"。
  */
 function EmptyState(props: {
   block: EmptyBlock
@@ -719,8 +786,19 @@ export function HooksSection(props?: HooksSectionProps): Jsx {
   const options = scopeOptions(snapshot)
   const rows = primary === undefined ? [] : cardRows(primary, matches)
   const fileTotal = primary === undefined ? 0 : primary.hookCount
-  const installed = fileTotal - (primary === undefined ? 0 : disabledCountOf(primary))
+  const disabledTotal = primary === undefined ? 0 : disabledCountOf(primary)
   const shown = rows.length
+  /**
+   * 搜索框**只在真的有东西可筛时**出现（`fileTotal >= 5`）：1 条 hook 的页面上它是纯噪音。
+   *
+   * ⚠️ `|| needle !== ''` 那半条是**不能省**的：筛选词还在时把搜索框收掉，用户会看到
+   * "没有匹配的 hook"却**没有任何控件能清掉筛选** —— 那是真正的死胡同（文件从 5 条掉到 4 条
+   * 就会发生：删掉一条之后重新取数）。所以"要收"和"已经筛上了"是两件事。
+   */
+  const showSearch = fileTotal >= 5 || needle !== ''
+  /** 第二行那句人话：总条数（含已停用）+ 停用数 + 筛选口径 —— `钩子 N` / `已安装 N` 两个 chip 都删了。 */
+  const countText = needle === '' ? `${String(fileTotal)} 个 hook` : `匹配 ${String(shown)} / 共 ${String(fileTotal)}`
+  const metaText = disabledTotal === 0 ? countText : `${countText} · 其中 ${String(disabledTotal)} 个已停用`
   // 触发器 label / 勾选位置 / 说明文字全部按**回显**（`displayScope`），不按本地 state：
   // 否则同屏会出现"触发器说用户级、数据是项目级"（AGENTS §2.6）。
   const displayLabel = echoedLabelOf(snapshot)
@@ -729,24 +807,47 @@ export function HooksSection(props?: HooksSectionProps): Jsx {
     options.findIndex((option) => option.value === displayScope),
   )
   const help = scopeHelp(snapshot, displayScope)
+  /** 「切回当前会话项目」的目标：会话项目在清单里就用那个工作区 id，否则 `scope=current`。 */
+  const switchTarget = currentScopeTarget(snapshot)
+  const canSwitchBack = wantSwitchTo(snapshot, switchTarget)
 
   // ── 页面级提示**最多一条**（Fix A2）：页面错误 > 配置文件读不出来 > 非当前工作区 > 只读。
   const brokenFile = snapshot.files.find((file) => file.state === 'error')
-  const alert: { tone: 'error' | 'warn' | 'info'; text: string; detail: string } | null =
+  const alert: {
+    tone: 'error' | 'info'
+    text: string
+    detail: string
+    action: { label: string; onClick: () => void } | null
+  } | null =
     banner !== null
       ? // 技术原文只作**补充**（§3.9：绝不作为主文案，但排查要用得上）
-        { tone: 'error', text: writeErrorSentence(banner.code), detail: banner.detail }
+        { tone: 'error', text: writeErrorSentence(banner.code), detail: banner.detail, action: null }
       : brokenFile !== undefined || snapshot.staleInUse
         ? {
             tone: 'error',
             text: '有配置文件现在读不出来（内容不是合法 JSON）—— 运行中的 hook 仍在沿用上一份可用配置。',
             detail: brokenFile?.message ?? '',
+            action: null,
           }
         : snapshot.scope.kind === 'workspace' && snapshot.scope.isCurrentSession === false
-          ? { tone: 'warn', text: help, detail: '' }
+          ? {
+              tone: 'info',
+              // 一句话说清"这一份不是本会话在读的"，**不带路径**、不提内部机制（用户反馈黄底两行
+              // 横幅"太差了"）。被删掉的两条事实进了诊断折叠：`项目根` 一行仍在，另加 `写入权限`。
+              text: `本会话不读这份配置 —— 改动只影响以后在 ${scopeWhere(snapshot, displayScope)} 里打开的会话。`,
+              detail: '',
+              action: canSwitchBack
+                ? {
+                    label: '切回当前会话项目',
+                    onClick: () => {
+                      changeScope(switchTarget)
+                    },
+                  }
+                : null,
+            }
           : writable
             ? null
-            : { tone: 'info', text: '本页当前是只读模式（宿主没有提供写入能力）。', detail: '' }
+            : { tone: 'info', text: '本页当前是只读模式（宿主没有提供写入能力）。', detail: '', action: null }
 
   /** 全部事件折叠区的行（含 0 条 —— 这是"空"的可达路径）。 */
   const eventRows =
@@ -793,7 +894,7 @@ export function HooksSection(props?: HooksSectionProps): Jsx {
     <div className="dsh-hooks">
       <style>{styles}</style>
 
-      {/* ── 第一行工具条：作用域 + 条数 + 搜索 ── */}
+      {/* ── 工具条**只有一行**：左边作用域、右边 刷新/新建；搜索框只在 fileTotal >= 5 时出现 ── */}
       <div className="dsh-hooks__toolbar">
         <ScopePicker
           label={displayLabel}
@@ -814,31 +915,18 @@ export function HooksSection(props?: HooksSectionProps): Jsx {
             setScopeOpen(false)
           }}
         />
-        <span className="dsh-hooks__count" title="这个作用域文件里的 hook 条数（含已停用）">
-          钩子 {String(fileTotal)}
-        </span>
         <span className="dsh-hooks__spacer" />
-        <input
-          className="dsh-hooks__search"
-          type="search"
-          value={query}
-          placeholder="搜索钩子…"
-          onChange={(changeEvent) => {
-            setQuery(changeEvent.target.value)
-          }}
-        />
-      </div>
-
-      {/* ── 第二行工具条：计数（左）+ 刷新 / 新建（右） ── */}
-      <div className="dsh-hooks__toolbar">
-        <span className="dsh-hooks__installed">
-          已安装 {String(installed)}
-          {fileTotal - installed > 0 ? ` · 已停用 ${String(fileTotal - installed)}` : ''}
-          {needle === '' ? '' : ` · 筛选后 ${String(shown)} / 共 ${String(fileTotal)}`}
-        </span>
-        <span className="dsh-hooks__session" title="当前会话实际会跑的那一份（与所选作用域无关）">
-          {sessionLine(snapshot)}
-        </span>
+        {showSearch ? (
+          <input
+            className="dsh-hooks__search"
+            type="search"
+            value={query}
+            placeholder="搜索钩子…"
+            onChange={(changeEvent) => {
+              setQuery(changeEvent.target.value)
+            }}
+          />
+        ) : null}
         <span className="dsh-hooks__toolbarActions">
           <button
             type="button"
@@ -851,28 +939,60 @@ export function HooksSection(props?: HooksSectionProps): Jsx {
           >
             ↻ 刷新
           </button>
+          {/* F5：这个按钮是 **toggle** —— 表单开着的时候点它是"收起"，文案就必须写「收起」，
+              并带 `aria-expanded`（不然"文案说新建、动作是收起"就是骗人）。 */}
           <button
             type="button"
             className="dsh-hooks__toolbtn"
-            title="新建"
+            title={newOpen ? '收起' : '新建'}
+            aria-expanded={newOpen}
             disabled={busy || !writable}
             onClick={() => {
               setNewOpen(!newOpen)
               setFormError(null)
             }}
           >
-            ＋ 新建
+            {newOpen ? '收起' : '＋ 新建'}
           </button>
         </span>
       </div>
 
-      {/* 唯一的提示行（§2.1 / §2.9 / §3.9 的话都在这里，不再堆叠） */}
+      {/* ── 第二行：**一句人话**（次要色）。同一个条数不再在五个地方各说一遍；
+             「本会话生效 X 个」只在它和屏幕上这一份不是同一件事时才出现（选中当前会话项目时，
+             上面那句 `N 个 hook` 就是答案）。完整口径（用户级 a + 项目级 b）在诊断折叠里。
+
+             ⚠️ 这里**不显示文件路径**：盘符路径只允许出现在「空状态块」与「诊断折叠」两处
+             （D40 守着这条边界）。把绝对路径摆在首屏就是把内部信息丢给用户 —— 那正是本轮
+             要治的病；"我到底在改哪个文件"的答案在诊断折叠与空状态块里，不在这里。 ── */}
+      <div className="dsh-hooks__metaline">
+        <span className="dsh-hooks__filecount">{metaText}</span>
+        <span className="dsh-hooks__spacer" />
+        {sessionLineNeeded(snapshot) ? (
+          <span className="dsh-hooks__session" title="当前会话实际会跑的那一份（与所选作用域无关）">
+            {sessionShortLine(snapshot)}
+          </span>
+        ) : null}
+      </div>
+
+      {/* 唯一的提示行（§2.1 / §2.9 / §3.9 的话都在这里，不再堆叠）。
+          非当前工作区那条是**信息**（`--info`，没有黄底）+ 一个 ghost 动作（仅当目标 ≠ 当前作用域）。 */}
       {alert === null ? null : (
-        <div
-          className={`dsh-hooks__alert${alert.tone === 'error' ? ' dsh-hooks__alert--error' : alert.tone === 'info' ? ' dsh-hooks__alert--info' : ''}`}
-        >
-          {alert.text}
-          {alert.detail === '' ? null : <span className="dsh-hooks__muted">（{alert.detail}）</span>}
+        <div className={`dsh-hooks__alert dsh-hooks__alert--${alert.tone}`}>
+          <span className="dsh-hooks__alerttext">
+            {alert.text}
+            {alert.detail === '' ? null : <span className="dsh-hooks__muted">（{alert.detail}）</span>}
+          </span>
+          {alert.action === null ? null : (
+            <button
+              type="button"
+              className="dsh-hooks__btn dsh-hooks__btn--ghost"
+              title={alert.action.label}
+              disabled={busy}
+              onClick={alert.action.onClick}
+            >
+              {alert.action.label}
+            </button>
+          )}
         </div>
       )}
 
@@ -996,19 +1116,44 @@ export function HooksSection(props?: HooksSectionProps): Jsx {
         </div>
       )}
 
-      {/* 另一个来源：**一行只读摘要**（不再渲染第二张完整卡）。
-          末尾那句引导**只在目标 ≠ 当前作用域时**出现（`otherFileGuide`）：回显说当前就是用户级时，
-          绝不能再写"要编辑请把作用域切到「用户（全局）」" —— 那是自己指自己。 */}
-      {others.map((file) => {
-        const guide = otherFileGuide(snapshot.scope.kind, file.kind)
-        return (
-          <div className="dsh-hooks__muted" key={file.kind}>
-            {file.kind === 'user' ? '用户级（全局）' : '项目级'} · <span className="dsh-hooks__path">{file.path}</span>{' '}
-            · {String(file.hookCount)} 条 · {stateToken(file)}
-            {guide === null ? null : <> · 要编辑请把作用域切到「{guide}」</>}
-          </div>
-        )
-      })}
+      {/* 另一个来源：**只在"有东西"时出现**的一行摘要（不再渲染第二张完整卡、也不再为空行占位）。
+          正文里**没有任何盘符路径**（路径 / 状态 / 版本都在诊断折叠里）—— 用户反馈里那行
+          `用户级（全局） · C:\... · 0 条 · 文件不存在，要编辑请把作用域切到…` 同时犯了三个错：
+          为空还占一行、暴露绝对路径、教用户用界面。
+          动作只在该来源**不是**屏幕上这一份时出现（`wantSwitchTo`：目标 ≠ 当前作用域）。 */}
+      {others
+        .filter((file) => file.hookCount > 0 || file.state === 'error')
+        .map((file) => {
+          const name = fileKindLabel(file.kind)
+          const target: ScopeValue = file.kind === 'user' ? 'user' : currentScopeTarget(snapshot)
+          const switchable = wantSwitchTo(snapshot, target)
+          return (
+            <div className="dsh-hooks__other" key={file.kind}>
+              {file.state === 'error' ? (
+                <span className="dsh-hooks__muted">{name}这份配置读不出来（详情见诊断）</span>
+              ) : (
+                <Fragment>
+                  <span className="dsh-hooks__muted">
+                    {name}还有 {String(file.hookCount)} 个 hook
+                  </span>
+                  {switchable ? (
+                    <button
+                      type="button"
+                      className="dsh-hooks__btn dsh-hooks__btn--ghost"
+                      title={`切到${name}`}
+                      disabled={busy}
+                      onClick={() => {
+                        changeScope(target)
+                      }}
+                    >
+                      切过去
+                    </button>
+                  ) : null}
+                </Fragment>
+              )}
+            </div>
+          )
+        })}
 
       {/* ── 底部两个折叠区：全部事件（含 0 条）+ 诊断 ── */}
       <div className="dsh-hooks__folds">
@@ -1041,7 +1186,10 @@ export function HooksSection(props?: HooksSectionProps): Jsx {
         <div className="dsh-hooks__foldbody">
           {eventRows.map(({ event, file }) => (
             <div className="dsh-hooks__eventrow" key={event}>
-              <span className="dsh-hooks__eventname dsh-hooks__eventname--fold">{event}</span>
+              <span className="dsh-hooks__eventname dsh-hooks__eventname--fold" title={eventTitle(event)}>
+                {eventLabel(event)}
+                <span className="dsh-hooks__eventid">{event}</span>
+              </span>
               {file === undefined || file.groups.length === 0 ? (
                 <span className="dsh-hooks__muted">
                   没有配置
@@ -1049,15 +1197,18 @@ export function HooksSection(props?: HooksSectionProps): Jsx {
                 </span>
               ) : (
                 <span className="dsh-hooks__count">
-                  {String(file.hookCount)} 条
-                  {file.disabledCount > 0 ? `（另有 ${String(file.disabledCount)} 条已停用）` : ''}
+                  {String(file.hookCount)} 个
+                  {file.disabledCount > 0 ? `（另有 ${String(file.disabledCount)} 个已停用）` : ''}
                 </span>
               )}
               {writable ? (
+                // 空事件行右侧是 **`＋` 字形按钮**（过去是六个「＋新建」文字按钮 = 用户说的"噪音"）。
+                // 它仍然是一个真按钮：`title` / `aria-label` 说清"在哪个事件下新建"，键盘能 Tab 到。
                 <button
                   type="button"
-                  className="dsh-hooks__btn dsh-hooks__btn--ghost"
+                  className="dsh-hooks__btn dsh-hooks__btn--ghost dsh-hooks__glyphbtn"
                   title={`在 ${event} 下新建`}
+                  aria-label={`在 ${eventLabel(event)}（${event}）下新建`}
                   disabled={busy}
                   onClick={() => {
                     setNewEvent(event)
@@ -1065,7 +1216,7 @@ export function HooksSection(props?: HooksSectionProps): Jsx {
                     setFormError(null)
                   }}
                 >
-                  ＋新建
+                  ＋
                 </button>
               ) : null}
             </div>
@@ -1073,13 +1224,16 @@ export function HooksSection(props?: HooksSectionProps): Jsx {
         </div>
       ) : null}
 
-      {/* 诊断：所有"开发者要看的"东西都收在这里（默认收起） */}
+      {/* 诊断：所有"开发者要看的"东西都收在这里（默认收起）。
+          P0-2 删掉的那两条事实（项目根 / 写入会被沙箱判定）必须有落点 —— 前者本来就在，
+          后者是这一轮新增的 `写入权限` 一行。 */}
       {diagOpen ? (
         <div className="dsh-hooks__foldbody">
           <DiagRow label="作用域" value={help} />
           <DiagRow label="当前会话" value={sessionLine(snapshot)} />
           <DiagRow label="项目根" value={snapshot.projectRoot ?? '未知（没有会话上下文，不编造）'} />
           <DiagRow label="cwd 来源" value={snapshot.cwdSource} />
+          <DiagRow label="写入权限" value="按调用会话的沙箱策略判定；被拒绝时报 sandbox" />
           <DiagRow
             label="作用域回显"
             value={`kind=${snapshot.scope.kind} requested=${snapshot.scope.requested} workspaceId=${String(
@@ -1091,14 +1245,14 @@ export function HooksSection(props?: HooksSectionProps): Jsx {
               label="当前文件"
               value={`${primary.path} · ${stateToken(primary)} · 版本 ${String(primary.version)} · ${String(
                 primary.hookCount,
-              )} 条`}
+              )} 个`}
             />
           )}
           {others.map((file) => (
             <DiagRow
               key={file.kind}
               label={file.kind === 'user' ? '用户级文件' : '项目级文件'}
-              value={`${file.path} · ${stateToken(file)} · 版本 ${String(file.version)} · ${String(file.hookCount)} 条`}
+              value={`${file.path} · ${stateToken(file)} · 版本 ${String(file.version)} · ${String(file.hookCount)} 个`}
             />
           ))}
           {snapshot.scope.workspacePath !== null && snapshot.scope.workspacePath !== snapshot.scope.projectRoot ? (
@@ -1158,16 +1312,31 @@ function DiagRow(props: { label: string; value: string }): Jsx {
 }
 
 /**
- * 「当前会话实际会跑什么」那一行（AGENTS §2.6 + 三态）。
+ * 「当前会话实际会跑什么」的**完整口径**（AGENTS §2.6 + 三态）—— 只进诊断折叠。
  *
  * `session === null` 时**必须**说"不知道"：读不到会话上下文 ≠ 没有 hook（§2.8/§2.9）。
  * 显示"当前会话生效 0 条"就是把"不知道"说成"没有"，那正是本仓库最危险的那条失效路径。
+ *
+ * v3：主视图不再用它，改成下面那句短的（`（用户级 a + 项目级 b）` 是"同一条信息说五遍"的一半，
+ * 移到诊断里）。**三态语义一字不改**，只是换了渲染点。
  */
 function sessionLine(snapshot: HooksSnapshot): string {
   const session = snapshot.session
   if (session === null) return '当前会话未知，无法判断实际会跑什么'
-  const counts = `${String(session.hookCount)} 条（用户级 ${String(session.fromUser)} + 项目级 ${String(
+  const counts = `${String(session.hookCount)} 个（用户级 ${String(session.fromUser)} + 项目级 ${String(
     session.fromProject,
   )}）`
-  return session.staleInUse ? `当前会话生效 ${counts}· 正在沿用上一份可用配置` : `当前会话生效 ${counts}`
+  return session.staleInUse ? `当前会话生效 ${counts} · 正在沿用上一份可用配置` : `当前会话生效 ${counts}`
+}
+
+/**
+ * 第二行那句短的：「本会话生效 X 个」。
+ *
+ * **只在 `sessionLineNeeded` 为真时渲染**（作用域 ≠ 当前会话项目 / 会话未知）。
+ * 三态照旧：`session === null` ⇒ 说"不知道"，**绝不**说成 0 个。
+ */
+function sessionShortLine(snapshot: HooksSnapshot): string {
+  const session = snapshot.session
+  if (session === null) return '当前会话未知，无法判断实际会跑什么'
+  return `本会话生效 ${String(session.hookCount)} 个`
 }
