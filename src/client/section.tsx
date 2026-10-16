@@ -1,18 +1,20 @@
 /**
- * 设置页「Hooks」——**一行工具条 + 一句元信息 + 一条 hook 一张卡 + 两个折叠区**。
+ * 设置页「Hooks」——**一行工具条 + 一句元信息 + 一条 hook 一张卡 + 一个折叠区**。
  *
- * ## 这一层的布局契约（v3：用户拿真机截图说"太差了"之后收成的形态）
+ * ## 这一层的布局契约（v4：用户拿 ZCode 的钩子页做参照，说"非要使用一堆说明和检测"）
  * ```
  * 作用域 [ 当前会话项目（dsh-hooks） ▾ ]                [↻ 刷新]  [＋ 新建]
  * 1 个 hook · 其中 1 个已停用                              本会话生效 4 个
  * ─────────────────────────────────────────────────────────
- * ●  工具运行前 PreToolUse                                  [ ●—— ]
+ * ●  工具运行前 PreToolUse              未运行              [ ●—— ]  ⋯
  *    node -e const fs=require('node:fs')…
- *    未运行   匹配 pwsh|bash   默认 600 秒
- * ▸ 查看全部事件（7）   ▸ 诊断
+ * ▸ 更多
  * ```
- *   - **一张卡 = 一条 hook**（不是"一个事件一张卡"）：标题 = 中文名 + 英文枚举（mono 次要）、
- *     副标题 = 命令、右侧开关；第二行是**人话**（`未运行` / `匹配 X` / `默认 600 秒`）；
+ *   - **一张卡 = 一条 hook**，一屏只有两行：标题行（状态点 + 中文名主/英文枚举次要 + 一个
+ *     **状态词** + 开关 + `⋯`）与命令行；
+ *   - **`⋯` 里才是"详情"**：`匹配 X · 超时 Y` + 三个动作（试运行 / 编辑 / 删除）。v3 里那一行
+ *     常驻的 meta（`未运行  匹配 pwsh|bash   默认 600 秒`）整条删掉了 —— 状态词留在正文，
+ *     匹配范围与超时只在这块里；`exit N · 12ms` 这类技术串只在状态点的 `title` 里；
  *   - **工具条只有一行**：左边作用域、右边 `↻ 刷新` / `＋ 新建`。`钩子 N` chip 删掉了
  *     （它夹在下拉与搜索框之间破坏分组），搜索框**只在 `fileTotal >= 5` 时**渲染
  *     （1 条 hook 的页面上它是纯噪音）；
@@ -20,15 +22,16 @@
  *     筛选时换成 `匹配 K / 共 N`。「本会话生效 X 个」**只在**它和屏幕上这一份**不是同一件事**时
  *     出现（作用域 ≠ 当前会话项目，或会话未知）—— 选中当前会话项目时上面那句已经是答案。
  *     过去同一屏把条数说了 5 遍（`钩子 1` / `已安装 1` / `（用户级 0 + 项目级 1）` / `0 条` / `1 条`），
- *     现在 `（用户级 a + 项目级 b）` 与完整口径只留在**诊断折叠**里；
- *   - **0 条的事件不进主列表**，收进底部折叠 `查看全部事件（7）`；
- *   - **主列表为空时渲染空状态块**（真机那一屏就是它）：标题 + **分别说清**的副文案
- *     （文件不存在 = "这份 hooks.json 还不存在（这是空的，不是出错）"；存在但 0 条 =
- *     "文件里没有任何 hook"）+ 路径 + 主按钮 `＋ 新建第一条 hook` + **仅**文件不存在时的
- *     `新建配置文件` + **引导条**（`当前会话项目（dsh-hooks）里有 1 条 · [切换过去]`）。
- *     用户默认落在空空的**用户级**上，而真正有内容的是当前会话项目 —— 没有这条引导，
- *     他看到的就只有"这个作用域还没有 hook"。**文件读不出来是第三种情形**，如实说"无法判断"，
- *     绝不冒充"空的"（§2.9 那条最危险的失效路径）。
+ *     现在 `（用户级 a + 项目级 b）` 与完整口径只留在**详情折叠**里；
+ *   - **底部只有一个折叠区 `更多`**（v3 是 `查看全部事件（7）` + `诊断` 两个）：展开后先列
+ *     7 个事件（含 0 条，这是"空"的唯一可达路径），再列诊断（项目根 / cwd 来源 / 路径 / 状态 /
+ *     版本 / `写入权限` / 清单 / matcher 诊断…）。折叠收起时整页只多一行字；
+ *   - **主列表为空时渲染空状态块**（真机那一屏就是它）：标题 + **一句**副文案
+ *     （文件不存在 = "这份 hooks.json 还不存在 —— 这是空的，不是出错"；存在但 0 条 =
+ *     "文件里还没有任何 hook"）+ 一行按钮（主按钮 `＋ 新建第一条 hook` + 仅文件不存在时的
+ *     `新建配置文件` + 引导按钮 `切换过去`）。**路径不再上屏**（它进了 `更多` 与按钮的 `title`）：
+ *     v3 那块是"标题 + 副文案 + 路径 + 按钮 + 引导条"五行，用户读完还是不知道先点哪个。
+ *     **文件读不出来是第三种情形**，如实说"无法判断"，绝不冒充"空的"（§2.9 最危险的失效路径）。
  *   - **作用域的一切"当前是谁"都跟宿主回显**（`snapshot.scope`，见 `echoedScopeOf`）：
  *     触发器 label / popover 勾选 / 写与试运行的落点 / 底部摘要的引导句，全从回显推导；
  *     本地 `scope` state 只表示"我请求了什么"（宿主把 `current` 归一成 `user` 时页面必须跟着变）。
@@ -36,26 +39,31 @@
  *   - **描边按钮只允许出现在工具条**（`↻ 刷新` / `＋ 新建`）：内容区（卡片动作 / 折叠事件行 /
  *     空状态 / 新建表单）一律 ghost 文字按钮。折叠收起时全页 `__btn--outline` 计数必须是 **0**
  *     （D 区有断言；真机上"7 个事件行各一个描边小按钮"就是"乱"的来源）；
- *   - **诊断收进底部折叠**（项目根 / cwd 来源 / 路径 / 状态 / 版本 / `写入权限` / 清单 / matcher 诊断…）；
  *   - 页面级提示**最多一条**（页面错误 > 文件坏了 > 非当前工作区 > 只读），不再堆叠横幅。
  *
- * ## 三条"面向用户"的硬规则（v3 的 P0，都有机器断言）
+ * ## v4 的取舍（写下来，免得下一轮又往回长）
+ *   "砍掉可见的说明与检测"**不等于**"砍掉检测"：v4 删的全部是**渲染点**，一条判据都没删 ——
+ *   三态（`absent`/`ok`/`error`）、fail-open 的 last-good、定点写 + 保留性证明、版本锁、
+ *   状态色只来自执行台账、matcher 非法的例外标签，全部原样保留，只是**默认不占屏**。
+ *   判据：`tools/verify.ts` 里那些"事实必须可达"的断言一条都没减少（只是从"首屏"换成"`更多`里"）。
+ *
+ * ## 三条"面向用户"的硬规则（v3 的 P0，都有机器断言；v4 只改了渲染点）
  *   1. **非当前工作区**那条提醒是**一行信息**，不是黄底横幅，正文里**没有盘符路径**：
  *      `本会话不读这份配置 —— 改动只影响以后在 X 里打开的会话。` + ghost 动作
- *      `切回当前会话项目`（仅当目标 ≠ 当前作用域时）。被删掉的两条事实落进诊断折叠：
+ *      `切回当前会话项目`（仅当目标 ≠ 当前作用域时）。被删掉的两条事实落进 `更多` 折叠：
  *      `项目根` 一行仍在，另加 `写入权限` = 「按调用会话的沙箱策略判定；被拒绝时报 sandbox」。
  *      黄底（`state-warning-background`）**不再挂在 `__alert` 上** —— 样式里没有这个颜色，
  *      自检对样式字符串做字面断言（"警告底色"不许回来）。
  *   2. **另一个来源**（用户级 / 项目级里不是主文件的那一份）**只在"有东西"时出现**：
  *      `file.hookCount > 0 || file.state === 'error'`。有内容 → `用户级（全局）还有 2 个 hook`
- *      + ghost `切过去`；读不出来 → `用户级（全局）这份配置读不出来（详情见诊断）`。
- *      两种情形正文里都**不含盘符路径**（路径与状态都在诊断折叠里）。
+ *      + ghost `切过去`；读不出来 → `用户级（全局）这份配置读不出来（详情见「更多」）`。
+ *      两种情形正文里都**不含盘符路径**（路径与状态都在 `更多` 折叠里）。
  *   3. **折叠里的空事件行**右侧是 `＋` **字形按钮**（`title` = `在 X 下新建`，
  *      `aria-label` = 中文名 + 英文原文），不再是六个「＋新建」文字按钮 —— 行高仍固定 32px。
  *
  * ## ⚠️ 对 AGENTS §3.6 的有意偏离（写在明处）
  * §3.6 要求"7 个事件分组永远全部渲染（含 0 条）"。本轮按用户明确要求改成"主列表只显示有内容的
- * 事件，全部 7 个事件收进**默认折叠**的 `查看全部事件（7）`"。偏离的理由与代价：
+ * 事件，全部 7 个事件收进**默认折叠**的 `更多`"。偏离的理由与代价：
  *   - 理由：一屏 7 行里通常 5 行是"没有配置"，用户读到的全是噪音（原话"冗余内容很多"）；
  *   - 代价：**默认不动手就看不到"空"**。所以折叠里必须**永远**列全 7 个事件（含 0 条，并明说
  *     "没有配置"、并给出该事件的「＋新建」）——"空"没有变得**不可达**，只是不再默认占一屏。
@@ -74,7 +82,10 @@
  * `tools/verify.ts` 的假 React 按位置发 `useState` 的值，只支持无 hook 的子组件。
  * `useState` 顺序（改顺序要同步改自检的场景）：`phase`→`banner`→`busy`→`nonce`→`scope`→`query`
  * →`editingKey`→`draft`→`confirmKey`→`dryKey`→`dryText`→`newOpen`→`newEvent`→`newMatcher`
- * →`newCommand`→`newTimeout`→`formError`→`scopeOpen`→`scopeActive`→`allEventsOpen`→`diagOpen`。
+ * →`newCommand`→`newTimeout`→`formError`→`scopeOpen`→`scopeActive`→`moreOpen`→`menuKey`。
+ * ⚠️ `moreOpen`（底部 `更多`）与 `menuKey`（哪一条 hook 的 `⋯` 展开着）**占的是 v3 里
+ * `allEventsOpen` / `diagOpen` 那两个位置** —— 位置没变，含义变了：读测试里"点了折叠"这类
+ * 交互时按顺序数 useState 的地方会踩到，改这里必须一起看 tools/verify.ts 的 D 区。
  */
 
 import { Fragment, h, useEffect, useState } from './react.ts'
@@ -84,6 +95,7 @@ import { styles } from './styles.ts'
 import { HookCard } from './hook-card.tsx'
 import { eventLabel, eventTitle } from './labels.ts'
 import { NewHookForm } from './new-hook.tsx'
+import { HOOK_TEMPLATES } from './templates.ts'
 import { ScopePicker, type KeyLike, type ScopeOption } from './scope-picker.tsx'
 import {
   CURRENT_SCOPE,
@@ -373,11 +385,11 @@ function sessionLineNeeded(snapshot: HooksSnapshot): boolean {
  * "当前会话项目"。没有这条引导，他只能看到"这个作用域还没有 hook"然后自己猜。
  */
 interface EmptyBlock {
-  /** 文件不存在 / 文件在但 0 条 —— **两种情形分开说**（§2.9/§3.9：空 ≠ 不存在）。 */
+  /** 文件不存在 / 文件在但 0 条 —— **两种情形分开说**（§2.9/§3.9：空 ≠ 不存在）。一句话。 */
   body: string
   /**
-   * 当前文件路径。**这是"盘符路径只允许出现在两处"里的第一处**（另一处是诊断折叠）：
-   * 空状态里的路径是可操作信息（用户要拿它去建这个文件），不是泄漏。见 `EmptyState` 的注释。
+   * 当前文件路径。**v4 起不再上屏**：它只留在 `新建配置文件` 按钮的 `title` 与 `更多` 折叠里
+   * （"这份文件到底在哪"是可查的事实，但不是用户点按钮前必须先读的一行字）。
    */
   path: string
   /** 「新建配置文件」**只在文件不存在时**出现。 */
@@ -437,7 +449,8 @@ function rawEmptyGuideOf(snapshot: HooksSnapshot): { text: string; action: strin
 function emptyBlockOf(snapshot: HooksSnapshot, file: FileView): EmptyBlock {
   const absent = file.state === 'absent'
   return {
-    body: absent ? '这份 hooks.json 还不存在（这是“空的”，不是出错）。' : '文件里没有任何 hook。',
+    // v4：**一句**。v3 那两句各带一个括号解释（"(这是"空的"，不是出错)"），用户读完不知道先点哪个。
+    body: absent ? '这份 hooks.json 还不存在 —— 这是空的，不是出错。' : '文件里还没有任何 hook。',
     path: file.path,
     canCreateFile: absent,
     guide: emptyGuideOf(snapshot),
@@ -445,16 +458,14 @@ function emptyBlockOf(snapshot: HooksSnapshot, file: FileView): EmptyBlock {
 }
 
 /**
- * 空状态块：标题 + 分别说清的副文案 + 路径 + 主按钮（＋ 新建第一条 hook）+ 仅文件不存在时的
- * 次按钮（新建配置文件）+ 引导条。**纯 props、零 hook**（假 React 只支持无 hook 的子组件）。
+ * 空状态块：标题 + **一句**副文案 + **一行**按钮（主按钮 ＋ 新建第一条 hook；仅文件不存在时的
+ * 次按钮 新建配置文件；有引导时的 ghost 切换过去）。**纯 props、零 hook**（假 React 只支持无 hook 的子组件）。
  *
- * ★ **盘符路径的例外口径**（F3；写死在注释里，免得下一个人当成泄漏"顺手清理"）：
- *   盘符路径只允许出现在**两处** ——
- *     ① 这里（空状态块里的"当前文件路径"）：那正是用户要创建/编辑的那个文件，
- *        路径本身就是**可操作信息**（他要拿它去建文件、或者在资源管理器里找它）；
- *     ② 诊断折叠（开发者排查用）。
+ * ★ **盘符路径的口径**（v4；写死在注释里，免得下一个人当成泄漏"顺手清理"）：
+ *   盘符路径只允许出现在**一处** —— `更多` 折叠（开发者排查用）。v3 里空状态块也算一处，
+ *   现在不算了：它不再渲染成一行字，只进 `新建配置文件` 按钮的 `title`。
  *   正文其它地方（工具条 / 点击行 / 信息行 / 另一来源那一行 / 卡片 / 折叠事件行 / 表单）
- *   **一律不许出现**。D 区有一条断言守着"正常态（有 hook、非空状态）首屏可见文本不含盘符路径"。
+ *   **一律不许出现**。D 区有断言守着"正常态与空状态的首屏可见文本都不含盘符路径"。
  */
 function EmptyState(props: {
   block: EmptyBlock
@@ -471,7 +482,6 @@ function EmptyState(props: {
     <div className="dsh-hooks__empty">
       <span className="dsh-hooks__emptytitle">这个作用域还没有 hook</span>
       <span className="dsh-hooks__muted">{block.body}</span>
-      <span className="dsh-hooks__path">{block.path}</span>
       {writable ? (
         <span className="dsh-hooks__emptyactions">
           <button
@@ -484,34 +494,35 @@ function EmptyState(props: {
             ＋ 新建第一条 hook
           </button>
           {block.canCreateFile ? (
+            // 路径进 title（v4 起它不再单独占一行）：想手动建文件的人在这里能拿到它。
             <button
               type="button"
               className="dsh-hooks__btn dsh-hooks__btn--ghost"
-              title="新建配置文件"
+              title={`新建配置文件（${block.path}）`}
               disabled={busy}
               onClick={props.onCreateFile}
             >
               新建配置文件
             </button>
           ) : null}
+          {/* 引导动作与主按钮**同一行**（v3 是单独一行"引导条"）：`title` 里给证据（哪个作用域有几个）。
+              ⚠️ 它刻意带 `__guidebtn` 类：v3 那句证据文字是**可见的一行**、断言按文字找它；
+              v4 起它只进 `title`，所以断言改按类名找这个按钮（否则"证据有没有丢"就没法机器验证了）。 */}
+          {guide === null ? null : (
+            <button
+              type="button"
+              className="dsh-hooks__btn dsh-hooks__btn--ghost dsh-hooks__guidebtn"
+              title={guide.text}
+              disabled={busy}
+              onClick={() => {
+                props.onGuide(guide.target)
+              }}
+            >
+              {guide.action}
+            </button>
+          )}
         </span>
       ) : null}
-      {guide === null ? null : (
-        <div className="dsh-hooks__emptyguide">
-          <span className="dsh-hooks__muted">{guide.text}</span>
-          <button
-            type="button"
-            className="dsh-hooks__btn dsh-hooks__btn--ghost"
-            title={guide.action}
-            disabled={busy}
-            onClick={() => {
-              props.onGuide(guide.target)
-            }}
-          >
-            {guide.action}
-          </button>
-        </div>
-      )}
     </div>
   )
 }
@@ -577,9 +588,15 @@ export function HooksSection(props?: HooksSectionProps): Jsx {
   /** 作用域 popover 是否展开 + 键盘高亮的下标。 */
   const [scopeOpen, setScopeOpen] = useState(false)
   const [scopeActive, setScopeActive] = useState(0)
-  /** 底部两个折叠区：**默认都收起**（"空"与诊断收在折叠里，见文件头）。 */
-  const [allEventsOpen, setAllEventsOpen] = useState(false)
-  const [diagOpen, setDiagOpen] = useState(false)
+  /** 底部折叠区 `更多`（7 个事件 + 诊断）：**默认收起**（见文件头）。 */
+  const [moreOpen, setMoreOpen] = useState(false)
+  /**
+   * 哪一条 hook 的 `⋯` 展开着（键与 `editingKey` 同一个 `rowKey`）。
+   *
+   * ⚠️ 进入编辑 / 删除确认时**必须同时把它打开**：那两件事的按钮都在块里（保存 / 确认删除），
+   * 菜单收着的话用户点完"编辑"会找不到"保存"。
+   */
+  const [menuKey, setMenuKey] = useState('')
 
   useEffect(() => {
     const controller = new AbortController()
@@ -657,11 +674,16 @@ export function HooksSection(props?: HooksSectionProps): Jsx {
     })()
   }
 
-  /** 行内操作：失败进**页面级**通道（§3.7）。 */
+  /**
+   * 行内操作：失败进**页面级**通道（§3.7）。
+   *
+   * 成功之后把 `⋯` 也收起来：写盘的结果由重新取数后的快照显示，留着菜单只会让人以为还有待办。
+   */
   const runWrite = (op: WriteOp): void => {
     runRequest(op, 'page', () => {
       setEditingKey('')
       setConfirmKey('')
+      setMenuKey('')
     })
   }
 
@@ -675,8 +697,24 @@ export function HooksSection(props?: HooksSectionProps): Jsx {
     setConfirmKey('')
     setDryKey('')
     setDryText('')
+    setMenuKey('')
     setFormError(null)
     setNewOpen(false)
+  }
+
+  /**
+   * 套一条模板：**只填四个字段**，不提交、不写盘（用户还能看完再改）。
+   *
+   * 模板内容来自 `templates.ts`（与 P 区的真子进程断言同一份），这里不重复写命令字面量。
+   */
+  const applyTemplate = (id: string): void => {
+    const template = HOOK_TEMPLATES.find((one) => one.id === id)
+    if (template === undefined) return
+    setNewEvent(template.event)
+    setNewMatcher(template.matcher)
+    setNewCommand(template.command)
+    setNewTimeout(template.timeout)
+    setFormError(null)
   }
 
   const dryRun = (kind: string, event: string, groupRawIndex: number, hook: HookView): void => {
@@ -1004,6 +1042,7 @@ export function HooksSection(props?: HooksSectionProps): Jsx {
           errorDetail={formError === null ? '' : formError.detail}
           busy={busy}
           writable={writable}
+          onTemplate={applyTemplate}
           onEvent={setNewEvent}
           onMatcher={setNewMatcher}
           onCommand={setNewCommand}
@@ -1059,6 +1098,7 @@ export function HooksSection(props?: HooksSectionProps): Jsx {
                 editing={editingKey === key}
                 draft={draft}
                 confirming={confirmKey === key}
+                menuOpen={menuKey === key || editingKey === key || confirmKey === key}
                 dryText={dryKey === key ? dryText : ''}
                 onToggle={() => {
                   runWrite({
@@ -1068,6 +1108,19 @@ export function HooksSection(props?: HooksSectionProps): Jsx {
                     hookIndex: row.hook.rawIndex,
                     disabled: !row.hook.disabled,
                   })
+                }}
+                onToggleMenu={() => {
+                  // 收起 `⋯` = 放弃这一条上正在进行的事（编辑草稿 / 删除确认）。
+                  // 不这样做的话：编辑中 `menuOpen` 被 `editingKey` 强制撑开，点 `⋯` 什么都不会发生，
+                  // 而按钮上的 `aria-expanded` 还是 true —— 那就是按钮在骗人。
+                  if (menuKey === key) {
+                    setMenuKey('')
+                    setEditingKey('')
+                    setConfirmKey('')
+                    setDraft('')
+                    return
+                  }
+                  setMenuKey(key)
                 }}
                 onStartEdit={() => {
                   setEditingKey(key)
@@ -1080,6 +1133,7 @@ export function HooksSection(props?: HooksSectionProps): Jsx {
                 onCancelEdit={() => {
                   setEditingKey('')
                   setDraft('')
+                  setMenuKey('')
                 }}
                 onSave={() => {
                   // **只发定点操作**：命令是唯一被改的字段（§2.3/§2.4）。
@@ -1098,6 +1152,7 @@ export function HooksSection(props?: HooksSectionProps): Jsx {
                 }}
                 onCancelRemove={() => {
                   setConfirmKey('')
+                  setMenuKey('')
                 }}
                 onRemove={() => {
                   runWrite({
@@ -1130,7 +1185,7 @@ export function HooksSection(props?: HooksSectionProps): Jsx {
           return (
             <div className="dsh-hooks__other" key={file.kind}>
               {file.state === 'error' ? (
-                <span className="dsh-hooks__muted">{name}这份配置读不出来（详情见诊断）</span>
+                <span className="dsh-hooks__muted">{name}这份配置读不出来（详情见「更多」）</span>
               ) : (
                 <Fragment>
                   <span className="dsh-hooks__muted">
@@ -1155,34 +1210,25 @@ export function HooksSection(props?: HooksSectionProps): Jsx {
           )
         })}
 
-      {/* ── 底部两个折叠区：全部事件（含 0 条）+ 诊断 ── */}
+      {/* ── 底部**只有一个**折叠区 `更多`：7 个事件（含 0 条）+ 诊断 ──
+          v3 是两个并列开关（`查看全部事件（7）` / `诊断`），"诊断"两个字挂在每一屏上就是
+          用户说的"一堆说明和检测"。事实没删：一行字 + 一次点击之后全都在。 */}
       <div className="dsh-hooks__folds">
         <button
           type="button"
           className="dsh-hooks__disclosure"
-          title="查看全部事件"
-          aria-expanded={allEventsOpen}
+          title="更多"
+          aria-expanded={moreOpen}
           onClick={() => {
-            setAllEventsOpen(!allEventsOpen)
+            setMoreOpen(!moreOpen)
           }}
         >
-          {allEventsOpen ? '▾' : '▸'} 查看全部事件（{String(HOOK_EVENTS.length)}）
-        </button>
-        <button
-          type="button"
-          className="dsh-hooks__disclosure"
-          title="诊断"
-          aria-expanded={diagOpen}
-          onClick={() => {
-            setDiagOpen(!diagOpen)
-          }}
-        >
-          {diagOpen ? '▾' : '▸'} 诊断
+          {moreOpen ? '▾' : '▸'} 更多
         </button>
       </div>
 
       {/* 全部事件：**7 个永远都在这里**（含 0 条）——"空"没有变得不可达（见文件头的偏离说明） */}
-      {allEventsOpen ? (
+      {moreOpen ? (
         <div className="dsh-hooks__foldbody">
           {eventRows.map(({ event, file }) => (
             <div className="dsh-hooks__eventrow" key={event}>
@@ -1224,10 +1270,11 @@ export function HooksSection(props?: HooksSectionProps): Jsx {
         </div>
       ) : null}
 
-      {/* 诊断：所有"开发者要看的"东西都收在这里（默认收起）。
+      {/* 诊断：所有"开发者要看的"东西都收在这里（与事件行**同一个** `更多` 里，默认收起）。
           P0-2 删掉的那两条事实（项目根 / 写入会被沙箱判定）必须有落点 —— 前者本来就在，
-          后者是这一轮新增的 `写入权限` 一行。 */}
-      {diagOpen ? (
+          后者是这一轮新增的 `写入权限` 一行。
+          ⚠️ v4 起它与"7 个事件"共用一次点击：**没有任何事实被删掉**，只是不再各占一个开关。 */}
+      {moreOpen ? (
         <div className="dsh-hooks__foldbody">
           <DiagRow label="作用域" value={help} />
           <DiagRow label="当前会话" value={sessionLine(snapshot)} />

@@ -60,6 +60,8 @@ import { CURRENT_SCOPE, dryRunFor, intentFor, scopeQuery, scopeTargetOf } from '
 // 客户端**样式字符串**：注入的 CSS 没有 DOM 可量，所以 D 区对它做字面断言（popover 滚动 / 720px /
 // 事件行 32px / 内容区按钮无描边）。它同时是预览生成器"只许用这一份 CSS"的比对基准。
 import { styles } from '../src/client/styles.ts'
+// 新建模板：D 区断言三个标签进了产物，P 区用**真子进程**把三条命令各跑一遍（模板不许是装饰品）。
+import { HOOK_TEMPLATES } from '../src/client/templates.ts'
 
 const HERE = path.dirname(fileURLToPath(import.meta.url))
 const LIB = path.join(HERE, '..', 'lib', 'index.js')
@@ -183,8 +185,27 @@ test('C：客户端产物是 classic script + 恰好一个 factory + 恰好一�
     1,
     '产物里只能有**一处**真正的注册调用（wrapper 由构建脚本注入；注释里的提及不算）',
   )
-  const requires = source.match(/\brequire\s*\(/g) || []
-  assert.equal(requires.length, 1, '只允许一个 require（源码里手写第二个就会被这条抓住）')
+  // ⚠️ v4 起"只允许一个 require"必须**先去掉字符串字面量**再数：新建模板里的命令
+  //   （`node -e "…require('node:fs')…"`）本身是一段**数据**（要交给子进程的 shell 命令），
+  //   不是产物自己的模块依赖。不去掉字符串的话，这条断言会因为"模板里出现了 require 这个词"
+  //   而红 —— 那是**平凡误报**，会逼着下一个人去放宽真正的防护。
+  //   判据仍然精确：去掉字符串之后必须**只剩**那一个取 react 种子的 require。
+  const stripStrings = (text) => text.replace(/'(?:[^'\\\n]|\\.)*'/g, "''").replace(/"(?:[^"\\\n]|\\.)*"/g, '""')
+  const countRequires = (text) => (text.match(/\brequire\s*\(/g) || []).length
+  // ★ 这条判据本身必须双向验证过（§4.3），否则"去掉字符串"就是"把断言放宽到永远绿"：
+  //   ① 代码里的两个 require 都要数到；② 字符串里的那个一个都不许数到（但去掉字符串**之前**数得到）。
+  assert.equal(
+    countRequires(stripStrings('const a=require("react");const b=require("node:fs")')),
+    2,
+    '★ 去掉字符串之后，代码里的 require 一个都不许漏（否则这条断言会放宽成永远绿）',
+  )
+  const embedded = 'const cmd = "node -e \\"require(\'node:fs\')\\""'
+  assert.equal(countRequires(stripStrings(embedded)), 0, '★ 字符串字面量里的 require 不算产物依赖')
+  assert.equal(countRequires(embedded), 1, '前提：去掉之前确实数得到那一个（否则上一条是平凡断言）')
+
+  const codeOnly = stripStrings(source)
+  const requires = codeOnly.match(/\brequire\s*\(/g) || []
+  assert.equal(requires.length, 1, '只允许一个 require（源码里手写第二个就会被这条抓住；字符串里的 require 不算）')
   assert.ok(source.includes('require("react")'), '而且只能取平台种子模块 react')
   assert.ok(source.includes('id: "dsh-hooks"'), 'id 必须等于 package.json 的 name')
 })
@@ -777,7 +798,7 @@ await test('D：一张卡 = 一条 hook（中文名+英文枚举/命令/开关/�
   assert.ok(!joined.includes('没有配置'), '折叠收起时不该出现"没有配置"')
   // ③ 另一个来源 = **只在"有东西"时出现**的一行摘要（不再是第二张完整卡，正文里也不许有盘符路径）
   assert.ok(joined.includes('用户级（全局）'), '另一个来源有一行摘要（这一份读不出来 ⇒ 必须说）')
-  assert.ok(joined.includes('用户级（全局）这份配置读不出来'), '读不出来时如实说，并把人指向诊断区')
+  assert.ok(joined.includes('用户级（全局）这份配置读不出来（详情见「更多」）'), '读不出来时如实说，并把人指向「更多」')
   assert.ok(!joined.includes('C:/u/.dsh/hooks.json'), '★ 正文不许暴露盘符路径（路径只在诊断折叠里）')
   assert.equal(cards.length, 4, '用户级那份**不再**渲染成完整卡（否则卡片数会多出来）')
   // ④ 条数口径（v3 收成**一句人话**）：`钩子 N` / `已安装 N` 两个 chip 删掉了，同一个数不再说五遍
@@ -788,7 +809,7 @@ await test('D：一张卡 = 一条 hook（中文名+英文枚举/命令/开关/�
   // ⑤ 「本会话生效」只在"和屏幕上这一份不是同一件事"时出现：这里作用域**就是**当前会话的项目
   //    ⇒ 第二行不再重复；完整口径（用户级 a + 项目级 b）移进诊断折叠（D3 的落点没丢）。
   assert.ok(!joined.includes('本会话生效'), '作用域 = 当前会话项目时，不再把同一件事说两遍')
-  const diag5 = await expandFold(nodes, component, harness, '诊断')
+  const diag5 = await expandFold(nodes, component, harness, '更多')
   assert.ok(
     joinedText(diag5).includes('当前会话生效 4 个（用户级 0 + 项目级 4）'),
     '诊断折叠里仍有完整口径（页面依然能回答"当前会话实际会跑什么"）',
@@ -827,7 +848,7 @@ await test('D：一张卡 = 一条 hook（中文名+英文枚举/命令/开关/�
   )
 })
 
-await test('D：底部折叠「查看全部事件（7）」展开后 7 个事件都在（含 0 条）——"空"没有变得不可达', async () => {
+await test('D：底部折叠「更多」展开后 7 个事件都在（含 0 条）——"空"没有变得不可达', async () => {
   // §3.6 偏离的另一半保证：默认不占一屏，但**折叠里必须永远列全 7 个**（含 0 条 + ＋新建）。
   const hooks = [snapshotHook(0, 'echo only')]
   const snapshot = minimalSnapshot({
@@ -837,7 +858,9 @@ await test('D：底部折叠「查看全部事件（7）」展开后 7 个事件
   const component = componentFromArtifact(harness.React)
   const collapsed = await renderSection(component, harness, { ok: true, data: snapshot })
   const collapsedTexts = collapsed.filter((node) => node.text !== undefined).map((node) => node.text)
-  assert.ok(joinedText(collapsed).includes('查看全部事件（7）'), '底部必须有「查看全部事件（7）」')
+  // v4：底部**只有一个**开关，名字是「更多」（v3 是两个：查看全部事件（7） + 诊断）。
+  assert.ok(joinedText(collapsed).includes('更多'), '底部必须有「更多」这个折叠开关')
+  assert.ok(!joinedText(collapsed).includes('诊断'), '★ "诊断"两个字不再挂在首屏（v4：检测不占屏）')
   assert.equal(allByClass(collapsed, 'dsh-hooks__foldbody').length, 0, '默认是收起的')
   for (const event of HOOK_EVENTS) {
     if (event === 'PreToolUse') continue
@@ -848,7 +871,7 @@ await test('D：底部折叠「查看全部事件（7）」展开后 7 个事件
     )
   }
 
-  const opened = await expandFold(collapsed, component, harness, '查看全部事件')
+  const opened = await expandFold(collapsed, component, harness, '更多')
   const openedTexts = opened.filter((node) => node.text !== undefined).map((node) => node.text)
   const rows = allByClass(opened, 'dsh-hooks__eventrow')
   assert.equal(rows.length, HOOK_EVENTS.length, '展开后**恰好 7 行**（含 0 条）')
@@ -894,7 +917,7 @@ await test('D：诊断折叠（默认收起）里放项目根/路径/状态/版�
   const collapsedText = joinedText(collapsed)
   assert.ok(!collapsedText.includes('项目根'), '诊断默认收起：这些开发者台词不该出现在首屏')
 
-  const opened = await expandFold(collapsed, component, harness, '诊断')
+  const opened = await expandFold(collapsed, component, harness, '更多')
   const text = joinedText(opened)
   assert.ok(text.includes('项目根'), '展开后要有项目根')
   assert.ok(text.includes('D:/p'), '项目根的值来自快照')
@@ -1049,12 +1072,39 @@ function buttonByLabel(nodes, label) {
   return found
 }
 
+/** 空状态块里的「切换过去」（v4：证据在 `title` 里，所以按类名找 —— 见 section.tsx 的注释）。 */
+function guideButton(nodes) {
+  const found = firstByClass(nodes, 'dsh-hooks__guidebtn')
+  assert.equal(typeof found.onClick, 'function', '「切换过去」必须能点')
+  return found
+}
+
+/**
+ * 打开某一张卡右上角的 `⋯`（v4：试运行 / 编辑 / 删除都收在这块里）。
+ *
+ * 断言两件事：默认收起（`aria-expanded=false`）、点开之后**真的**能拿到那块内容。
+ * `⋯` 刻意不用 `__btn` 类 —— `writeButtons` 按 `__btn` 数"这一行有几个动作按钮"，
+ * 把 `⋯` 混进去那条计数就会测到一个不存在的界面。
+ */
+async function openCardMenu(nodes, component, harness, index = 0) {
+  const menus = allByClass(nodes, 'dsh-hooks__morebtn')
+  assert.ok(menus[index] !== undefined, `应当有第 ${index + 1} 个「⋯」按钮`)
+  assert.equal(menus[index].ariaExpanded, false, '「⋯」默认收起（aria-expanded=false）')
+  assert.equal(typeof menus[index].onClick, 'function', '「⋯」必须能点')
+  menus[index].onClick()
+  return advance(component, harness)
+}
+
 await test('D：点开关发的是定点写请求（file + workspaceId + 原始下标 + 目标值）', async () => {
   const harness = createFakeReact()
   const component = componentFromArtifact(harness.React)
   const nodes = await renderSection(component, harness, { ok: true, data: minimalSnapshot() })
   const buttons = writeButtons(nodes)
-  assert.equal(buttons.length, 3, '可写时一行三个动作按钮：试运行、编辑、删除（启停是右侧那个开关，不再是按钮）')
+  assert.equal(
+    buttons.length,
+    0,
+    '★ v4：三个动作按钮**默认不在 DOM 里**（它们在 `⋯` 里）—— 首屏每张卡只有状态点 + 一个状态词 + 开关 + `⋯`',
+  )
 
   const calls = []
   globalThis.fetch = async (_url: string, options: { method?: string; body?: string } = {}) => {
@@ -1119,10 +1169,14 @@ await test('D：行内编辑命令 —— 文本框里是当前命令，保存�
   const component = componentFromArtifact(harness.React)
   const first = await renderSection(component, harness, { ok: true, data: minimalSnapshot() })
 
-  // 没在编辑时：一行三个动作按钮（试运行、编辑、删除）
-  const idle = writeButtons(first)
-  assert.equal(idle.length, 3, '一行应当有"试运行"、"编辑"、"删除"三个按钮')
-  buttonByLabel(first, '编辑').onClick()
+  // 没在编辑时：`⋯` 里是三个动作按钮（试运行、编辑、删除）；首屏一个都没有（v4）。
+  assert.equal(writeButtons(first).length, 0, '首屏不该有动作按钮（它们全在 ⋯ 里）')
+  const opened = await openCardMenu(first, component, harness)
+  const idle = writeButtons(opened)
+  assert.equal(idle.length, 3, '「⋯」里应当有"试运行"、"编辑"、"删除"三个按钮')
+  assert.ok(joinedText(opened).includes('匹配 pwsh'), '★ 匹配范围进了「⋯」（v4 不再占卡片正文）')
+  assert.ok(joinedText(opened).includes('默认 600 秒'), '★ 超时也进了「⋯」')
+  buttonByLabel(opened, '编辑').onClick()
 
   // 点"编辑"后重新渲染（§4.5：事件闭包是当次渲染的）
   harness.begin()
@@ -1173,6 +1227,10 @@ await test('D：删除是两步 —— 第一步只改状态不发请求，第�
   const component = componentFromArtifact(harness.React)
   const first = await renderSection(component, harness, { ok: true, data: minimalSnapshot() })
 
+  // ⚠️ 打开 `⋯` **必须在换掉 fetch 之前**：`openCardMenu` 会推进一次渲染（跑 effect），
+  //   而 GET 会重新取数 —— 换过之后的假 fetch 对 GET 返回的是"写响应"，快照就变形了。
+  const opened = await openCardMenu(first, component, harness)
+
   const calls = []
   globalThis.fetch = async (_url: string, options: { method?: string; body?: string } = {}) => {
     const method = options.method ?? 'GET'
@@ -1180,8 +1238,8 @@ await test('D：删除是两步 —— 第一步只改状态不发请求，第�
     return { json: async () => ({ ok: true, data: { file: 'project', version: 'v2' } }) }
   }
 
-  // 第一步：点"删除"（索引 2）。**绝不能发请求**。
-  buttonByLabel(first, '删除').onClick()
+  // 第一步：点"删除"。**绝不能发请求**。
+  buttonByLabel(opened, '删除').onClick()
   await new Promise((resolve) => setTimeout(resolve, 0))
   assert.equal(calls.length, 0, '第一步绝不能发请求 —— 删除是唯一丢数据的操作，点错了没有 undo')
 
@@ -1212,6 +1270,8 @@ await test('D：点"试运行"发 dryRun 请求，结果贴在这一行，且那
   const harness = createFakeReact()
   const component = componentFromArtifact(harness.React)
   const first = await renderSection(component, harness, { ok: true, data: minimalSnapshot() })
+  // ⚠️ 先开 `⋯`（会推进渲染 → 重新取数），再换 fetch —— 理由同"删除是两步"那条。
+  const opened = await openCardMenu(first, component, harness)
 
   const calls = []
   globalThis.fetch = async (_url: string, options: { method?: string; body?: string } = {}) => {
@@ -1226,7 +1286,7 @@ await test('D：点"试运行"发 dryRun 请求，结果贴在这一行，且那
       }),
     }
   }
-  buttonByLabel(first, '试运行').onClick()
+  buttonByLabel(opened, '试运行').onClick()
   await new Promise((resolve) => setTimeout(resolve, 0))
   await new Promise((resolve) => setTimeout(resolve, 0))
 
@@ -1290,16 +1350,23 @@ await test('D：文件不存在时渲染空状态块 —— 说清"不存在"（
     joined.includes('这份 hooks.json 还不存在') && joined.includes('不是出错'),
     '"不存在"必须**明说**，并说清"这是空的、不是出错"（§2.9/§3.9）',
   )
-  assert.ok(joined.includes('D:/p/.dsh/hooks.json'), '空状态块里要带路径（用户得知道说的是哪个文件）')
+  // v4：路径**不再上屏**（它进了按钮的 title 与「更多」折叠）。原防护意图保留：路径必须**可达**
+  // —— 只是不再占空状态块的一行（用户读完那行还是不知道先点哪个，这正是 v4 要治的病）。
+  assert.ok(
+    !joined.includes('D:/p/.dsh/hooks.json'),
+    '★ v4：空状态块也不再把盘符路径摆上屏（路径在按钮 title 与「更多」里）',
+  )
   assert.ok(joined.includes('＋ 新建第一条 hook'), '主按钮是"新建第一条 hook"（打开新建表单）')
   assert.ok(joined.includes('新建配置文件'), '文件不存在时才有次按钮"新建配置文件"')
+  const createFileButton = buttonByLabel(nodes, '新建配置文件（D:/p/.dsh/hooks.json）')
+  assert.equal(typeof createFileButton.onClick, 'function', '路径在按钮 title 里可达，按钮本身仍然可用')
   assert.ok(
     !joined.includes('读不出来'),
     '不存在 ≠ 读不出来：绝不能说成"读不出来"（用户会去修一个没坏的文件，§2.9/§3.9）',
   )
   // 同一页里另一份文件是好的 —— v3 起那份**空的**来源不再占首屏一行（P0-5），它的状态在诊断
   // 折叠里如实说：三态一个都没丢，只是换了渲染点（原断言意图"两种状态必须同时说得清"保留）。
-  const diag = await expandFold(nodes, component, harness, '诊断')
+  const diag = await expandFold(nodes, component, harness, '更多')
   assert.ok(joinedText(diag).includes('用户级文件'), '诊断里有另一份文件那一行')
   assert.ok(
     joinedText(diag).includes('已读取'),
@@ -1312,7 +1379,7 @@ await test('D：文件不存在时渲染空状态块 —— 说清"不存在"（
     calls.push({ method, body: typeof options.body === 'string' ? JSON.parse(options.body) : null })
     return { json: async () => ({ ok: true, data: { file: 'project', version: 'v2' } }) }
   }
-  buttonByLabel(nodes, '新建配置文件').onClick()
+  createFileButton.onClick()
   await new Promise((resolve) => setTimeout(resolve, 0))
   await new Promise((resolve) => setTimeout(resolve, 0))
 
@@ -1362,7 +1429,7 @@ await test('D14：默认作用域 = 用户 —— 用户级横幅、只读那份
   assert.ok(!joined.includes('echo project-level'), '项目级那份的 hook 不许被渲染出来')
   assert.ok(!joined.includes('D:/p/.dsh/hooks.json'), '不许出现项目级文件卡/摘要')
   // 当前那份文件的**完整路径**在诊断折叠里（首屏只留作用域名，用户反馈"别堆路径"）
-  const diag = await expandFold(nodes, component, harness, '诊断')
+  const diag = await expandFold(nodes, component, harness, '更多')
   assert.ok(joinedText(diag).includes('C:/u/.dsh/hooks.json'), '诊断里能看到当前那份文件是谁')
   // ③ **没有堆叠横幅**：用户级作用域 + 文件正常 ⇒ 一条提示都没有（参考图的安静形态）
   assert.equal(allByClass(nodes, 'dsh-hooks__alert').length, 0, '正常情况下提示行 0 条')
@@ -1543,7 +1610,7 @@ await test('D17：选中非当前工作区 ⇒ **一行信息**（不是黄底�
     `那条提醒最多两句话（压到两行内）：${otherAlert}`,
   )
   // 被删掉的两条事实必须**仍然可达**：项目根一行还在，另加"写入权限"一行（含沙箱这件事）。
-  const otherDiag = await expandFold(otherNodes, otherComponent, other, '诊断')
+  const otherDiag = await expandFold(otherNodes, otherComponent, other, '更多')
   const otherDiagText = joinedText(otherDiag)
   assert.ok(otherDiagText.includes('写入权限'), '★ 诊断里必须新增"写入权限"一行（P0-2 要求落点）')
   assert.ok(otherDiagText.includes('沙箱'), '"写入权限"要说清它是按沙箱策略判定的')
@@ -1733,7 +1800,7 @@ await test('D20：workspacesAvailable:false ⇒ 明说"宿主没有提供工作�
     data: snapshotOf({ scope: 'user', workspaces: [], workspacesAvailable: false }),
   })
   // "宿主没有清单"在**诊断折叠**里明说（首屏不再为它占一行，但它必须可达）
-  const diag = await expandFold(nodes, component, harness, '诊断')
+  const diag = await expandFold(nodes, component, harness, '更多')
   assert.ok(
     joinedText(diag).includes('宿主没有提供工作区清单'),
     '"宿主没有清单"必须**明说**（不是渲染成空下拉，也不是沉默，§3.6/§3.9）',
@@ -1753,7 +1820,7 @@ await test('D20：workspacesAvailable:false ⇒ 明说"宿主没有提供工作�
     ok: true,
     data: snapshotOf({ scope: 'user', workspaces: [], workspacesAvailable: true }),
   })
-  const emptyDiag = await expandFold(emptyNodes, emptyComponent, emptyHarness, '诊断')
+  const emptyDiag = await expandFold(emptyNodes, emptyComponent, emptyHarness, '更多')
   const emptyJoined = joinedText(emptyDiag)
   assert.ok(emptyJoined.includes('0 项'), '清单为空时说"0 项"（有清单，只是空的）')
   assert.ok(!emptyJoined.includes('宿主没有提供工作区清单'), '"空清单"与"没有清单"必须长得不一样')
@@ -1790,7 +1857,7 @@ await test('D21：会话项目不在工作区清单里 ⇒ 下拉补「当前会
     'label 要带路径最后一段（用户一眼知道是哪个目录）',
   )
   // ② "当前会话项目不在清单里"那句提示在诊断折叠里，并**指向**这个选项（不是死提示）
-  const diag = await expandFold(first, component, harness, '诊断')
+  const diag = await expandFold(first, component, harness, '更多')
   const diagText = joinedText(diag)
   assert.ok(diagText.includes('当前会话项目'), '诊断里要说清这个项目不在清单里')
   assert.ok(diagText.includes('用作用域下拉的'), '并且要指向「当前会话项目」选项，而不是让人无路可走')
@@ -1917,8 +1984,10 @@ await test('D23：空状态块 —— "文件不存在"与"文件里 0 条"两�
   assert.equal(allByClass(absent, 'dsh-hooks__empty').length, 1, '空状态要成块渲染（不是一行小字）')
   assert.ok(absentJoined.includes('这个作用域还没有 hook'), '空状态块要有标题')
   assert.ok(absentJoined.includes('这份 hooks.json 还不存在'), '"文件不存在"的副文案')
-  assert.ok(absentJoined.includes('这是“空的”，不是出错'), '并且说清"这不是出错"（§2.9：空 ≠ 出错）')
-  assert.ok(absentJoined.includes('C:/u/.dsh/hooks.json'), '要带路径（用户得知道说的是哪个文件）')
+  assert.ok(absentJoined.includes('这是空的，不是出错'), '并且说清"这不是出错"（§2.9：空 ≠ 出错）')
+  // v4：路径不上屏（进按钮 title），但必须**可达**（"我到底在说哪个文件"仍然能查到）
+  assert.ok(!absentJoined.includes('C:/u/.dsh/hooks.json'), '★ v4：空状态块不再把盘符路径摆上屏')
+  buttonByLabel(absent, '新建配置文件（C:/u/.dsh/hooks.json）')
   assert.ok(absentJoined.includes('＋ 新建第一条 hook'), '主按钮存在')
   assert.ok(absentJoined.includes('新建配置文件'), '文件不存在时才有"新建配置文件"')
   assert.equal(allByClass(absent, 'dsh-hooks__btn--outline').length, 0, '空状态块不许用描边按钮')
@@ -1935,7 +2004,7 @@ await test('D23：空状态块 —— "文件不存在"与"文件里 0 条"两�
   })
   const zeroJoined = joinedText(zero)
   assert.equal(allByClass(zero, 'dsh-hooks__empty').length, 1, '0 条同样是空状态块')
-  assert.ok(zeroJoined.includes('文件里没有任何 hook'), '"存在但 0 条"必须换一种说法')
+  assert.ok(zeroJoined.includes('文件里还没有任何 hook'), '"存在但 0 条"必须换一种说法')
   assert.ok(!zeroJoined.includes('这份 hooks.json 还不存在'), '两种情形不许糊成一句')
   assert.ok(!zeroJoined.includes('新建配置文件'), '"新建配置文件"只在文件不存在时出现')
   assert.ok(zeroJoined.includes('＋ 新建第一条 hook'), '0 条时主按钮同样是"新建第一条 hook"')
@@ -1949,7 +2018,7 @@ await test('D23：空状态块 —— "文件不存在"与"文件里 0 条"两�
   const brokenJoined = joinedText(broken)
   assert.equal(allByClass(broken, 'dsh-hooks__empty').length, 0, '"读不出来"不是空状态')
   assert.ok(brokenJoined.includes('无法判断里面有没有 hook'), '读不出来时如实说"无法判断"')
-  assert.ok(!brokenJoined.includes('文件里没有任何 hook'), '绝不把"读不到"说成"没有"')
+  assert.ok(!brokenJoined.includes('文件里还没有任何 hook'), '绝不把"读不到"说成"没有"')
 })
 
 await test('D24：空状态引导条 —— 有内容的那一份出现「切换过去」，点击真的把页面换过去', async () => {
@@ -1980,16 +2049,20 @@ await test('D24：空状态引导条 —— 有内容的那一份出现「切换
   assert.ok(urls[0].includes('scope=user'), '默认落在用户（全局）—— 真机就是这一屏')
   const joined = joinedText(nodes)
   assert.equal(allByClass(nodes, 'dsh-hooks__empty').length, 1, '前提：这一屏确实是空状态')
+  // v4：证据（哪一份里有几个）从"单独一行字"挪进按钮的 `title` —— 按钮标签仍然是「切换过去」，
+  //     所以断言改成"按类名找到它 + 证据在它的 title 里"（原来的防护意图一字不差）。
+  const guide = guideButton(nodes)
   assert.ok(
-    joined.includes('当前会话项目（dsh-hooks）里有 1 个 hook。'),
-    `引导条要说清"哪一份里有几个"（不然用户只能看到"这里空"）：${joined.slice(0, 200)}`,
+    guide.title.includes('当前会话项目（dsh-hooks）里有 1 个 hook。'),
+    `引导按钮要说清"哪一份里有几个"（不然用户只能看到"这里空"）：${String(guide.title)}`,
   )
   assert.ok(joined.includes('切换过去'), '并且给出一条路')
+  assert.ok(!joined.includes('当前会话项目（dsh-hooks）里有 1 个 hook'), '★ v4：那句证据不再单独占一行（它进了 title）')
 
   // 点「切换过去」→ 真的重新取数，且 URL 是 scope=current（当前会话项目**不是**工作区，
   // 所以它不能伪装成 workspaceId —— 带了必然 404，见 write.ts 的 CURRENT_SCOPE 注释）。
   const before = urls.length
-  buttonByLabel(nodes, '切换过去').onClick()
+  guide.onClick()
   const after = await advance(component, harness)
   assert.ok(urls.length > before, '点了必须真的重新取数')
   assert.ok(
@@ -2022,12 +2095,13 @@ await test('D24：空状态引导条 —— 有内容的那一份出现「切换
     }
   })
   const atWorkspace = await pickScopeOption(initial, backComponent, backHarness, 'w-1')
+  const backGuide = guideButton(atWorkspace)
   assert.ok(
-    joinedText(atWorkspace).includes('用户级（全局）里有 2 个 hook。'),
-    '反方向同样要给引导（项目级空、用户级有内容）',
+    backGuide.title.includes('用户级（全局）里有 2 个 hook。'),
+    `反方向同样要给引导（项目级空、用户级有内容），证据在 title 里：${String(backGuide.title)}`,
   )
   const backBefore = backUrls.length
-  buttonByLabel(atWorkspace, '切换过去').onClick()
+  backGuide.onClick()
   const back = await advance(backComponent, backHarness)
   assert.ok(backUrls.length > backBefore, '点了必须真的重新取数')
   assert.ok(
@@ -2068,7 +2142,7 @@ await test('D25：折叠收起时全页 __btn--outline 计数 = 0；展开后事
   assert.ok(!toolButton(collapsed, '新建').className.includes('--outline'), '工具条也不该用那个保留类')
 
   // 展开后：7 个事件行、每行一个 ghost「＋新建」，依然零描边内容按钮
-  const opened = await expandFold(collapsed, component, harness, '查看全部事件')
+  const opened = await expandFold(collapsed, component, harness, '更多')
   assert.equal(allByClass(opened, 'dsh-hooks__eventrow').length, HOOK_EVENTS.length, '展开后恰好 7 行')
   const rowNew = opened.filter((node) => typeof node.title === 'string' && node.title.startsWith('在 '))
   assert.equal(rowNew.length, HOOK_EVENTS.length, '7 个事件行各一个「＋新建」')
@@ -2080,15 +2154,18 @@ await test('D25：折叠收起时全页 __btn--outline 计数 = 0；展开后事
   }
   assert.equal(allByClass(opened, 'dsh-hooks__btn--outline').length, 0, '展开后同样必须是 0')
 
-  // 有卡片时也一样（卡内动作按钮本轮一并改成 ghost）
+  // 有卡片时也一样（卡内动作按钮本轮一并改成 ghost）——v4 起它们在 `⋯` 里，所以先展开菜单再数。
   const normalHarness = createFakeReact()
-  const normal = await renderSection(componentFromArtifact(normalHarness.React), normalHarness, {
+  const normalComponent = componentFromArtifact(normalHarness.React)
+  const normal = await renderSection(normalComponent, normalHarness, {
     ok: true,
     data: minimalSnapshot(),
   })
   assert.ok(allByClass(normal, 'dsh-hooks__hookcard').length > 0, '前提：正常态确实有卡片')
-  assert.ok(allByClass(normal, 'dsh-hooks__btn--ghost').length >= 3, '卡内三个动作按钮是 ghost')
-  assert.equal(allByClass(normal, 'dsh-hooks__btn--outline').length, 0, '卡片动作按钮同样不许描边')
+  assert.equal(allByClass(normal, 'dsh-hooks__btn--ghost').length, 0, '★ v4：卡内动作按钮默认不渲染（在 ⋯ 里）')
+  const cardMenu = await openCardMenu(normal, normalComponent, normalHarness)
+  assert.ok(allByClass(cardMenu, 'dsh-hooks__btn--ghost').length >= 3, '展开 ⋯ 之后三个动作按钮是 ghost')
+  assert.equal(allByClass(cardMenu, 'dsh-hooks__btn--outline').length, 0, '卡片动作按钮同样不许描边')
 })
 
 await test('D26：样式字符串的硬指标（popover 可滚动 / 720px 上限 / 事件行 32px / 内容区按钮无描边）', () => {
@@ -2299,7 +2376,7 @@ await test('D29：工具条**只有一行** + 第二行一句人话 + 搜索框�
   assert.ok(oneJoined.includes('本会话生效 1 个'), '作用域 ≠ 当前会话项目时要显示本会话口径')
   // `（用户级 a + 项目级 b）` 从主视图删掉、移进诊断区（同一条信息不再说五遍）
   assert.ok(!oneJoined.includes('（用户级 0 + 项目级 1）'), '主视图不再重复"用户级 a + 项目级 b"')
-  const oneDiag = await expandFold(oneNodes, componentFromArtifact(one.React), one, '诊断')
+  const oneDiag = await expandFold(oneNodes, componentFromArtifact(one.React), one, '更多')
   assert.ok(
     joinedText(oneDiag).includes('（用户级 0 + 项目级 1）') || joinedText(oneDiag).includes('用户级 0 + 项目级 1'),
     '★ 但它必须在诊断折叠里可达（不是删掉事实）',
@@ -2435,7 +2512,7 @@ await test('D31：另一个来源**只在有东西时出现**（0 条不占行 /
     ok: true,
     data: snapshotOf({ scope: 'w-1', projectFile, userFile: snapshotFile('user', 'ok') }),
   })
-  const zeroDiag = await expandFold(zeroDiagNodes, componentFromArtifact(zeroHarness.React), zeroHarness, '诊断')
+  const zeroDiag = await expandFold(zeroDiagNodes, componentFromArtifact(zeroHarness.React), zeroHarness, '更多')
   assert.ok(joinedText(zeroDiag).includes('C:/u/.dsh/hooks.json'), '★ 路径仍在诊断里（不许把事实删掉）')
 
   // ② 另一份有 2 条 ⇒ 一行摘要 + ghost 动作（target ≠ 当前作用域）
@@ -2450,10 +2527,13 @@ await test('D31：另一个来源**只在有东西时出现**（0 条不占行 /
   assert.equal(twoSwitches.length, 1, '并且给一个 ghost「切过去」')
   assert.ok(!twoJoined.includes('C:/u/.dsh/hooks.json'), '★ 那一行的正文里没有盘符路径（路径在诊断里）')
 
-  // ③ 另一份**读不出来** ⇒ 如实说"读不出来（详情见诊断）"，**绝不**说成"0 条"或"没有"
+  // ③ 另一份**读不出来** ⇒ 如实说"读不出来（详情见「更多」）"，**绝不**说成"0 条"或"没有"
   const brokenNodes = await render(snapshotFile('user', 'error'))
   const brokenJoined = joinedText(brokenNodes)
-  assert.ok(brokenJoined.includes('用户级（全局）这份配置读不出来（详情见诊断）'), '★ 读不出来如实说，并指向诊断')
+  assert.ok(
+    brokenJoined.includes('用户级（全局）这份配置读不出来（详情见「更多」）'),
+    '★ 读不出来如实说，并指向「更多」',
+  )
   assert.ok(!brokenJoined.includes('还有 0 个 hook'), '★ 绝不把"读不到"说成"0 条"（§2.9）')
   assert.ok(!brokenJoined.includes('C:/u/.dsh/hooks.json'), '★ 那一行的正文里没有盘符路径')
 })
@@ -2473,7 +2553,7 @@ await test('D32：7 个事件的中文名真的渲染出来，英文枚举仍然
   assert.ok(cardTexts.includes('PreToolUse'), '★ 英文枚举仍然在 DOM 里（title 与次要 mono 都给人原文）')
 
   // 折叠展开后 7 个事件行：7 个中文名都在可见文本里，英文枚举也都在
-  const opened = await expandFold(collapsed, component, harness, '查看全部事件')
+  const opened = await expandFold(collapsed, component, harness, '更多')
   const openedTexts = opened.filter((node) => node.text !== undefined).map((node) => node.text)
   for (const [index, event] of HOOK_EVENTS.entries()) {
     assert.ok(openedTexts.includes(EXPECTED[index]), `★ ${event} 必须渲染出中文名「${EXPECTED[index]}」`)
@@ -2490,7 +2570,7 @@ await test('D32：7 个事件的中文名真的渲染出来，英文枚举仍然
   }
 })
 
-await test('D33：卡片第二行说人话（未运行 / 匹配 X / N 秒），原因与证据进 title', async () => {
+await test('D33：卡片只留一个状态词；匹配 / 超时进 ⋯；原因与证据进 title', async () => {
   const file = snapshotFile('user', 'ok', {
     PreToolUse: [
       {
@@ -2508,26 +2588,34 @@ await test('D33：卡片第二行说人话（未运行 / 匹配 X / N 秒），�
   const texts = nodes.filter((node) => node.text !== undefined).map((node) => node.text)
   const joined = texts.join('')
 
-  // ① `未运行（没有执行记录）` → `未运行`（**原因进 title**）
+  // ① 正文只说"未运行"（**一个词**）：v4 起连 `匹配 X` / `N 秒` 都不在正文里了（它们进 `⋯`）
   assert.ok(texts.includes('未运行'), '★ 正文只说"未运行"')
+  assert.equal(texts.filter((text) => text === '未运行').length, 2, '两条 hook 各一个状态词（不多不少）')
   assert.ok(!joined.includes('未运行（没有执行记录）'), '★ 正文里不再有那个括号说明（用户说它是字段 dump）')
+  assert.ok(!joined.includes('匹配'), '★ v4：匹配范围不进正文（在 ⋯ 里，见 ②）')
+  assert.ok(!joined.includes('默认 600 秒'), '★ v4：超时也不进正文（在 ⋯ 里）')
   const dot = nodes.find((node) => typeof node.className === 'string' && node.className.includes('dsh-hooks__dot'))
   assert.ok(dot.title.includes('未运行') && dot.title.includes('没有执行记录'), '★ 原因仍在 title 里（不丢证据）')
-  // ② `matcher: X` → `匹配 X`；`matcher === null` → `匹配全部`
-  assert.ok(texts.includes('匹配 pwsh|bash'), '★ 说人话：匹配 X')
-  assert.ok(texts.includes('匹配全部'), '★ matcher 为空时说"匹配全部"（过去这一格直接不渲染）')
-  assert.ok(!joined.includes('matcher:'), '★ 正文里不许再出现 `matcher:` 这种接口字段名')
-  // ③ `10s` → `10 秒`；默认 → `默认 600 秒`
-  assert.ok(texts.includes('10 秒'), '★ 显式超时说"10 秒"')
-  assert.ok(texts.includes('默认 600 秒'), '★ 未写超时时说"默认 600 秒"')
-  assert.ok(!joined.includes('10s') && !joined.includes('600s'), '★ 不许再出现裸的 `10s` / `600s`')
+
+  // ② `匹配 X` / `匹配全部` / `N 秒` 全部在 `⋯` 里，而且仍然是"说人话"的形态
+  const menu0 = await openCardMenu(nodes, component, harness, 0)
+  const menu0Texts = menu0.filter((node) => node.text !== undefined).map((node) => node.text)
+  assert.ok(menu0Texts.includes('匹配 pwsh|bash'), '★ ⋯ 里说人话：匹配 X')
+  assert.ok(menu0Texts.includes('默认 600 秒'), '★ 未写超时时说"默认 600 秒"')
+  assert.ok(!joinedText(menu0).includes('matcher:'), '★ 不许出现 `matcher:` 这种接口字段名')
+  assert.ok(!joinedText(menu0).includes('10s') && !joinedText(menu0).includes('600s'), '★ 不许出现裸的 `10s` / `600s`')
+
+  const menu1 = await openCardMenu(menu0, component, harness, 1)
+  const menu1Texts = menu1.filter((node) => node.text !== undefined).map((node) => node.text)
+  assert.ok(menu1Texts.includes('匹配全部'), '★ matcher 为空时说"匹配全部"（过去这一格直接不渲染）')
+  assert.ok(menu1Texts.includes('10 秒'), '★ 显式超时说"10 秒"')
 })
 
 await test('D34：折叠里的空事件行是「＋」字形按钮（可 Tab、有名字），有内容行仍是「N 个」', async () => {
   const harness = createFakeReact()
   const component = componentFromArtifact(harness.React)
   const collapsed = await renderSection(component, harness, { ok: true, data: minimalSnapshot() })
-  const opened = await expandFold(collapsed, component, harness, '查看全部事件')
+  const opened = await expandFold(collapsed, component, harness, '更多')
   const texts = opened.filter((node) => node.text !== undefined).map((node) => node.text)
 
   const glyphs = allByClass(opened, 'dsh-hooks__glyphbtn')
@@ -2880,7 +2968,7 @@ await test('D39：表单开着时工具条那个按钮写「收起」（带 aria
   assert.ok(joinedText(back).includes('＋ 新建'), '收起后回到「＋ 新建」')
 })
 
-await test('D40：盘符路径只允许出现在「空状态块」与「诊断折叠」两处（正常态首屏一个都不许有）', async () => {
+await test('D40：盘符路径只允许出现在「更多」折叠里（正常态与空状态的首屏一个都不许有）', async () => {
   const DRIVE = /[A-Za-z]:[\\/]/
 
   // ① 正常态（有 hook、不是空状态）：首屏可见文本**零**盘符路径，也没有 .dsh-hooks__path 元素
@@ -2890,19 +2978,149 @@ await test('D40：盘符路径只允许出现在「空状态块」与「诊断�
   const visible = joinedText(nodes)
   assert.ok(!DRIVE.test(visible), `★ 正常态首屏不许出现盘符路径，实际命中：${String(visible.match(DRIVE))}`)
   assert.equal(allByClass(nodes, 'dsh-hooks__path').length, 0, '正常态不许有路径元素')
-  // 反面证明这条不是平凡断言：**诊断折叠里确实有**路径（那是允许的第二处）
-  const diag = await expandFold(nodes, component, normal, '诊断')
-  assert.ok(DRIVE.test(joinedText(diag)), '前提：诊断折叠里确实有路径（否则"不许出现"是平凡断言）')
+  // 反面证明这条不是平凡断言：**「更多」折叠里确实有**路径（那是唯一允许出现盘符路径的地方）
+  const diag = await expandFold(nodes, component, normal, '更多')
+  assert.ok(DRIVE.test(joinedText(diag)), '前提：「更多」折叠里确实有路径（否则"不许出现"是平凡断言）')
 
-  // ② 第一处例外：空状态块里的路径是**有意保留**的（那是用户要创建/编辑的那个文件）
+  // ② v4 收紧：**空状态块也不再上屏路径**（它只进按钮 title 与「更多」折叠）。
+  //    v3 时它是"第二处例外"；现在例外只剩一处，判据更严了，不是放宽。
   const empty = createFakeReact()
   const emptyNodes = await renderSection(componentFromArtifact(empty.React), empty, {
     ok: true,
     data: snapshotOf({ scope: 'user', userFile: snapshotFile('user', 'absent') }),
   })
   const emptyVisible = joinedText(emptyNodes)
-  assert.ok(DRIVE.test(emptyVisible), '空状态块里的路径要保留（可操作信息）')
-  assert.equal(allByClass(emptyNodes, 'dsh-hooks__path').length, 1, '空状态块恰好一处路径元素')
+  assert.ok(
+    !DRIVE.test(emptyVisible),
+    `★ v4：空状态块首屏也不许出现盘符路径，实际命中：${String(emptyVisible.match(DRIVE))}`,
+  )
+  assert.equal(allByClass(emptyNodes, 'dsh-hooks__path').length, 0, '空状态块不再有路径元素（v4）')
+  // 但路径必须**可达**：空状态块里那个「新建配置文件」按钮的 title 里就有它（不丢事实，只换渲染点）
+  const createButton = buttonByLabel(emptyNodes, '新建配置文件（C:/u/.dsh/hooks.json）')
+  assert.ok(DRIVE.test(String(createButton.title)), '路径在按钮 title 里仍然可达')
+})
+
+await test('D41：v4 密度 —— 首屏只有"状态点 + 一个状态词 + 命令 + 开关 + ⋯"，检测不占屏但一键可达', async () => {
+  // 这条是 v4 的总闸：用户的原话是"非要使用一堆说明和检测"。所以断言分两半 ——
+  //   ① 首屏**不许出现**那些字（这是"简洁"的可机器验证定义）；
+  //   ② 一键之后**必须仍然可达**（这是"删渲染点 ≠ 删事实"的唯一证据）。
+  const run = (exitCode, decision) => ({ at: 1, exitCode, decision, durationMs: 12, stdout: '', stderr: 'out' })
+  const hooks = [
+    snapshotHook(0, 'echo never-run'),
+    snapshotHook(1, 'echo ok', { lastRun: run(0, 'pass') }),
+    snapshotHook(2, 'echo off', { disabled: true }),
+  ]
+  const snapshot = snapshotOf({
+    scope: 'w-1',
+    projectFile: snapshotFile('project', 'ok', { PreToolUse: [{ rawIndex: 0, matcher: 'pwsh', hooks }] }),
+    session: sessionEffect({ hookCount: 3, groupCount: 1, fromUser: 0, fromProject: 3 }),
+  })
+  const harness = createFakeReact()
+  const component = componentFromArtifact(harness.React)
+  const nodes = await renderSection(component, harness, { ok: true, data: snapshot })
+  const visible = joinedText(nodes)
+
+  // ① 首屏不许出现的东西（v3 里它们全都在首屏上）
+  for (const forbidden of ['匹配', '秒', 'exit ', 'ms', '诊断', '项目根', 'cwd 来源', '版本']) {
+    assert.ok(!visible.includes(forbidden), `★ v4 首屏不许出现「${forbidden}」：${visible}`)
+  }
+  // ② 每张卡只剩这几样：状态点 / （启用时）一个状态词 / 开关 / ⋯
+  assert.equal(allByClass(nodes, 'dsh-hooks__hookcard').length, 3, '前提：3 条 hook = 3 张卡')
+  assert.equal(allByClass(nodes, 'dsh-hooks__dot').length, 3, '每张卡一个状态点（颜色只来自台账 / disabled）')
+  assert.equal(allByClass(nodes, 'dsh-hooks__status').length, 2, '★ 停用的那张不写状态词（标题行已有「已停用」标签）')
+  assert.equal(allByClass(nodes, 'dsh-hooks__switch').length, 3, '每张卡一个开关')
+  assert.equal(allByClass(nodes, 'dsh-hooks__morebtn').length, 3, '每张卡一个 ⋯')
+  assert.equal(allByClass(nodes, 'dsh-hooks__cardmenu').length, 0, '★ ⋯ 默认收起：匹配 / 超时 / 动作一个字都不占屏')
+  assert.equal(allByClass(nodes, 'dsh-hooks__btn').length, 0, '★ 首屏一个动作按钮都没有（全在 ⋯ 里）')
+  assert.equal(allByClass(nodes, 'dsh-hooks__disclosure').length, 1, '★ 底部只有一个折叠开关（v3 是两个）')
+  assert.ok(visible.includes('未运行') && visible.includes('通过'), '状态词还在（颜色之外必须有一个词）')
+
+  // ③ 一键可达：点开 ⋯ → 详情真的在；再点一次 → 真的收回去
+  const opened = await openCardMenu(nodes, component, harness)
+  assert.equal(allByClass(opened, 'dsh-hooks__cardmenu').length, 1, '点开 ⋯ 只展开这一条')
+  assert.ok(joinedText(opened).includes('匹配 pwsh'), '匹配范围在 ⋯ 里')
+  assert.ok(joinedText(opened).includes('默认 600 秒'), '超时也在 ⋯ 里')
+  assert.equal(allByClass(opened, 'dsh-hooks__btn').length, 3, '⋯ 里三个动作（试运行 / 编辑 / 删除）')
+  const menus = allByClass(opened, 'dsh-hooks__morebtn')
+  assert.equal(menus[0].ariaExpanded, true, '⋯ 展开后 aria-expanded=true（按钮不许骗人）')
+  menus[0].onClick()
+  const shut = await advance(component, harness)
+  assert.equal(allByClass(shut, 'dsh-hooks__cardmenu').length, 0, '再点一次必须真的收回去')
+  assert.equal(allByClass(shut, 'dsh-hooks__morebtn')[0].ariaExpanded, false, '并且 aria-expanded 回到 false')
+
+  // ④ 「更多」展开后，事实**一条都没丢**（v4 的承诺：不占屏 ≠ 看不见）
+  const more = await expandFold(shut, component, harness, '更多')
+  const moreText = joinedText(more)
+  assert.ok(moreText.includes('项目根'), '项目根在「更多」里可达')
+  assert.ok(moreText.includes('写入权限'), '写入权限在「更多」里可达')
+  assert.equal(
+    allByClass(more, 'dsh-hooks__eventrow').length,
+    HOOK_EVENTS.length,
+    '7 个事件同样在「更多」里（含 0 条）',
+  )
+})
+
+await test('D42：新建表单的三个模板 —— 点一下填好字段，提交的就是那条命令（模板不是装饰品）', async () => {
+  const harness = createFakeReact()
+  const component = componentFromArtifact(harness.React)
+  const first = await renderSection(component, harness, { ok: true, data: minimalSnapshot() })
+  const form = await openNewForm(first, component, harness)
+
+  const templates = allByClass(form, 'dsh-hooks__tplbtn')
+  assert.equal(templates.length, 3, '★ 三个模板按钮（注入提醒 / 记到日志 / 直接拦住）')
+  assert.ok(joinedText(form).includes('模板'), '有「模板」这一行提示词（否则用户不知道这三个按钮是什么）')
+  assert.equal(allByClass(form, 'dsh-hooks__newfield').length, 4, '模板行**不是**字段容器（F1 的结构断言不受影响）')
+
+  // 静态纪律：模板命令必须是单行、且不许出现 `${`（会被 TS 插值 / 被当成 shell 变量）
+  for (const template of HOOK_TEMPLATES) {
+    assert.ok(!template.command.includes('\n'), `模板 ${template.id} 的命令必须是单行`)
+    assert.ok(!template.command.includes('${'), `模板 ${template.id} 的命令里不许出现 \${`)
+    assert.ok(template.command.startsWith('node -e "'), `模板 ${template.id} 必须用实测过的引号形态（外层双引号）`)
+  }
+
+  // 点「注入提醒」→ 事件 / 命令 / 超时被填好（用户还能改）
+  templates[0].onClick()
+  const filled = await advance(component, harness)
+  assert.equal(firstByClass(filled, 'dsh-hooks__newselect').value, 'SessionStart', '事件被填成 SessionStart')
+  const commandBox = allByClass(filled, 'dsh-hooks__editor')[0]
+  assert.ok(commandBox.value.includes('additionalContext'), '命令框里就是模板命令（明文可见，不做黑盒预设）')
+  assert.equal(allByClass(filled, 'dsh-hooks__input')[1].value, '10', '超时被填成 10 秒')
+
+  // 提交 → addGroup 的实体逐字段等于模板（点一下就能用，不用手写 node -e）
+  const calls = []
+  globalThis.fetch = async (_url, options = {}) => {
+    const method = options.method ?? 'GET'
+    calls.push({ method, body: typeof options.body === 'string' ? JSON.parse(options.body) : null })
+    return method === 'POST'
+      ? { json: async () => ({ ok: true, data: { file: 'user', version: 'v2' } }) }
+      : { json: async () => ({ ok: true, data: minimalSnapshot() }) }
+  }
+  // ⚠️ 先把 `advance` 那一次（会重跑取数 effect）走完，再清空记录、再点提交 ——
+  // 否则数到的第一条是 GET，断言会变成"提交发了两次"的假失败。
+  const ready = await advance(component, harness)
+  calls.length = 0
+  buttonByLabel(ready, '创建').onClick()
+  await new Promise((resolve) => setTimeout(resolve, 0))
+  await new Promise((resolve) => setTimeout(resolve, 0))
+  assert.equal(calls.length, 1, '提交只发一次请求')
+  assert.equal(calls[0].method, 'POST')
+  assert.deepEqual(calls[0].body, {
+    file: 'user',
+    op: 'addGroup',
+    event: 'SessionStart',
+    matcher: '',
+    command: HOOK_TEMPLATES[0].command,
+    timeoutSec: 10,
+  })
+
+  // ★ §4.8「源码存在 ≠ 已交付」：templates.ts 只能靠 import 进产物 —— 三个中文标签必须在**产物**里。
+  const artifact = fs.readFileSync(CLIENT, 'utf8')
+  for (const label of HOOK_TEMPLATES.map((template) => template.label)) {
+    assert.ok(
+      artifact.includes(label),
+      `产物 lib/client.js 里应当有模板标签「${label}」（templates.ts 是不是没被 import？）`,
+    )
+  }
 })
 
 //#endregion
@@ -5413,6 +5631,74 @@ await test('P：行级状态来自真实执行；命令一改就回落到"未运
       '命令改过 → 退回灰色：拿旧命令的结果给新命令上色就是"界面在撒谎"',
     )
     assert.equal(nextPre.runCount, 1, '该事件跑过几次仍如实报告（解释"为什么这行是灰的"）')
+  })
+})
+
+await test('P：三条新建模板的命令都**真能跑**（真子进程：注入 / deny / 落盘）', async () => {
+  // 模板是"面向用户"的那一层：用户点一下就会把它写进 hooks.json，所以它**必须真的能跑**。
+  // 这条走的是生产路径（`dryRun` 与真实运行共用 runSingleHook，§2.10），不是另写的演示执行器。
+  await withIsolatedHome(async () => {
+    const dir = await makeProject()
+    const byId = (id) => HOOK_TEMPLATES.find((template) => template.id === id)
+    const reminder = byId('session-reminder')
+    const logger = byId('log-calls')
+    const deny = byId('deny-calls')
+    assert.ok(reminder !== undefined && logger !== undefined && deny !== undefined, '三个模板都在')
+    await writeHooks(dir, {
+      hooks: {
+        SessionStart: [{ hooks: [{ type: 'command', timeout: 20, command: reminder.command }] }],
+        PostToolUse: [{ hooks: [{ type: 'command', timeout: 20, command: logger.command }] }],
+        PreToolUse: [{ matcher: 'pwsh', hooks: [{ type: 'command', timeout: 20, command: deny.command }] }],
+      },
+    })
+    const conn = makeConnection()
+    const { agent } = fakeAgent(dir)
+    await mount({ connection: conn.connection, fs: makeFs({ version: true }), initiator: agent })
+
+    // ① 注入提醒：stdout 必须是宿主能解析的结构化 JSON，且**不阻断**任何东西
+    const reminderRun = await postRoute(conn.routes[0], {
+      op: 'dryRun',
+      file: 'project',
+      event: 'SessionStart',
+      groupIndex: 0,
+      hookIndex: 0,
+    })
+    assert.equal(reminderRun.status, 200)
+    assert.equal(
+      reminderRun.data.run.exitCode,
+      0,
+      `注入提醒模板必须 exit 0：${JSON.stringify(reminderRun.data.run).slice(0, 240)}`,
+    )
+    assert.ok(reminderRun.data.run.stdout.includes('additionalContext'), 'stdout 是宿主要解析的结构化 JSON')
+    assert.equal(reminderRun.data.run.decision, 'pass', '注入提醒不该阻断任何东西')
+
+    // ② 直接拦住：必须是 deny，而且走 exit 0 + 结构化 JSON（exit 2 在 PowerShell 里会被折叠成 1，§6）
+    const denyRun = await postRoute(conn.routes[0], {
+      op: 'dryRun',
+      file: 'project',
+      event: 'PreToolUse',
+      groupIndex: 0,
+      hookIndex: 0,
+    })
+    assert.equal(denyRun.data.run.exitCode, 0, 'deny 模板也必须是 exit 0（不许依赖 exit 2）')
+    assert.equal(denyRun.data.run.decision, 'deny', '必须真的被判成 deny')
+
+    // ③ 记到日志：真跑一次之后项目里必须多出 .dsh/hook.log，内容就是这次的 stdin
+    const logPath = path.join(dir, '.dsh', 'hook.log')
+    assert.equal(fs.existsSync(logPath), false, '前提：跑之前没有日志文件')
+    const logRun = await postRoute(conn.routes[0], {
+      op: 'dryRun',
+      file: 'project',
+      event: 'PostToolUse',
+      groupIndex: 0,
+      hookIndex: 0,
+    })
+    assert.equal(logRun.data.run.exitCode, 0, `记日志模板必须 exit 0：${JSON.stringify(logRun.data.run).slice(0, 240)}`)
+    assert.ok(fs.existsSync(logPath), '★ 真的落盘了（模板里的 process.env.DSH_PROJECT_DIR 必须被注入）')
+    assert.ok(
+      fs.readFileSync(logPath, 'utf8').includes('dry_run'),
+      '写进去的就是这一次的 stdin（dry_run 标记能在里面看到）',
+    )
   })
 })
 

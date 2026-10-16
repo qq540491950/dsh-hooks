@@ -1,5 +1,10 @@
 /**
- * 「＋新建」表单：事件 / matcher / command / timeout → 一个 `addGroup` 定点操作。
+ * 「＋新建」表单：模板 / 事件 / matcher / command / timeout → 一个 `addGroup` 定点操作。
+ *
+ * ## v4：先给模板，再给字段
+ * 第一行是**三个模板**（`templates.ts`）：点一下把四个字段填好，用户只需要看一遍、改一改。
+ * 用户不该为了配一条 hook 去手写 `node -e "…"`（真机上那条 300 字符的命令就是这么来的）。
+ * 模板只**填**字段、不锁字段 —— 命令仍然明文可见可改（不做黑盒预设）。
  *
  * ## 三条纪律
  *   1. **纯 props，零 hook**（与 `hook-card.tsx` 同一条：假 React 只支持无 hook 的子组件）；
@@ -16,6 +21,7 @@ import { h } from './react.ts'
 import type { Jsx } from './react.ts'
 import { HOOK_EVENTS } from '../shared/constants.ts'
 import { eventHint, eventLabel } from './labels.ts'
+import { HOOK_TEMPLATES } from './templates.ts'
 
 /** 哪些事件没有 matcher（与宿主解析器的行为一致，不在这里另写一套判断规则）。 */
 const MATCHERLESS = new Set(['UserPromptSubmit', 'Stop'])
@@ -37,6 +43,7 @@ export function NewHookForm(props: {
   errorDetail: string
   busy: boolean
   writable: boolean
+  onTemplate: (id: string) => void
   onEvent: (value: string) => void
   onMatcher: (value: string) => void
   onCommand: (value: string) => void
@@ -47,6 +54,25 @@ export function NewHookForm(props: {
   const { draft, error, errorDetail, busy, writable } = props
   return (
     <div className="dsh-hooks__newform">
+      {/* 模板行：**不是字段容器**（没有 label + 控件的配对），所以用 `__tplrow` 而不是 `__newfield`
+          —— D37 的结构断言按"每个 __newfield 恰好一个 label + 一个控件"来守 F1，混进来会失真。 */}
+      <div className="dsh-hooks__tplrow">
+        <span className="dsh-hooks__hint">模板</span>
+        {HOOK_TEMPLATES.map((template) => (
+          <button
+            key={template.id}
+            type="button"
+            className="dsh-hooks__tplbtn"
+            title={`${template.hint}（会覆盖当前四个字段）`}
+            disabled={busy}
+            onClick={() => {
+              props.onTemplate(template.id)
+            }}
+          >
+            {template.label}
+          </button>
+        ))}
+      </div>
       {/* ⚠️ F1（审查者在放大图上抓到的真布局缺陷）：**每个字段自己是一个容器**，
           label + 控件同进同出（容器内部 `flex-wrap:nowrap`），只有容器**之间**才允许换行。
           过去 5 个兄弟节点平铺在同一个 `flex-wrap:wrap` 行里，564px 下换行时

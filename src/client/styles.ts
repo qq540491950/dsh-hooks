@@ -109,11 +109,18 @@ export const styles = `
    __btn--outline（收起态必须是 0），加一个上去就当场红。工具条的描边走 __toolbtn。 */
 .dsh-hooks__btn--outline { border:.5px solid var(--dsw-alias-border-l3, rgba(127,127,127,.35)); }
 .dsh-hooks__btn:disabled, .dsh-hooks__toolbtn:disabled { opacity:.5; cursor:default; }
-/* 卡内动作按钮（hover/聚焦才显形；DOM 里始终在 —— 键盘用户靠 :focus-within 也能到达）。
-   它们**不参与** 28px 的行高：卡内用 24px，视觉更轻。 */
-.dsh-hooks__actions .dsh-hooks__btn { height:24px; padding:0 8px; opacity:0; }
-.dsh-hooks__hookcard:hover .dsh-hooks__actions .dsh-hooks__btn,
-.dsh-hooks__hookcard:focus-within .dsh-hooks__actions .dsh-hooks__btn { opacity:1; }
+/* 卡内动作按钮（v4：它们只在「⋯」展开的块里）。**不再靠 hover 显形** —— 菜单是用户主动点开的，
+   里面的按钮就必须立刻看得见（v3 是 opacity:0 + :hover 才显形，因为那时它们常驻一行）。
+   卡内用 24px，比工具条的 28px 轻一档。 */
+.dsh-hooks__cardmenu .dsh-hooks__btn { height:24px; padding:0 8px; }
+/* 「⋯」（每张卡右上角）：24×24 的字形按钮，安静但不隐形。刻意**不用** __btn 类 ——
+   D 区按 __btn 数"这一行有几个动作按钮"，把「⋯」混进去那条计数就测错了对象。 */
+.dsh-hooks__morebtn { flex:none; width:24px; height:24px; padding:0; border:0; border-radius:6px; cursor:pointer;
+  display:inline-flex; align-items:center; justify-content:center; font:inherit; font-size:14px; line-height:1;
+  background:transparent; color:var(--dsw-alias-label-secondary, inherit); }
+.dsh-hooks__morebtn:hover:not(:disabled) { color:var(--dsw-alias-label-primary, inherit);
+  background:var(--dsw-alias-interactive-bg-hover, rgba(127,127,127,.12)); }
+.dsh-hooks__morebtn:disabled { opacity:.5; cursor:default; }
 /* 「突出显示」的那一个（失败态里"该按哪个"）：填充 + 前景色成对取自官方 Button 的 primary 变体
    （button-primary-fill + label-primary-foreground）——只用 brand-primary 当背景会在深色主题下
    变成"近白底 + 近白字"（§3.1 记的正是这个坑）。 */
@@ -127,13 +134,10 @@ export const styles = `
 .dsh-hooks__input::placeholder, .dsh-hooks__search::placeholder {
   color:var(--dsw-alias-label-tertiary, var(--dsw-alias-label-secondary, inherit)); }
 .dsh-hooks__muted { font-size:12px; color:var(--dsw-alias-label-secondary, inherit); }
-/* 文件路径（mono + 可断行）。★ **盘符路径的例外口径**（F3）：.dsh-hooks__path 只允许出现在
-   **空状态块**里（"当前文件路径"＝用户要创建/编辑的那个文件，路径是可操作信息）；
-   另一处允许出现盘符路径的地方是**诊断折叠**。正文其它地方（点击行 / 信息行 / 另一来源那一行 /
-   卡片 / 折叠事件行 / 表单）一律不许用这个类，也不许把路径拼进可见文本。
-   D 区有断言守着"正常态首屏可见文本不含盘符路径"。 */
-.dsh-hooks__path { font-family:ui-monospace, monospace; font-size:12px; overflow-wrap:anywhere; min-width:0;
-  color:var(--dsw-alias-label-secondary, inherit); }
+/* ★ **盘符路径的口径**（v4 收紧）：盘符路径只允许出现在**一处** —— 「更多」折叠里的诊断行
+   （用 __diagval）。v3 里空状态块也算一处（.dsh-hooks__path 一行字），现在不算了：
+   它只进「新建配置文件」按钮的 title。正文其它地方一律不许出现。
+   D 区有断言守着"正常态**与空状态**的首屏可见文本都不含盘符路径"。 */
 
 /* ── 作用域 popover（自绘；分组 + 当前项打勾 + 键盘 + 点外部关闭） ── */
 .dsh-hooks__popoverwrap { position:relative; min-width:0; flex:none; }
@@ -190,6 +194,14 @@ export const styles = `
   white-space:nowrap; overflow:hidden; text-overflow:ellipsis; color:var(--dsw-alias-label-secondary, inherit); }
 .dsh-hooks__tag { flex:none; font-size:11px; padding:1px 6px; border-radius:999px;
   background:var(--dsw-alias-bg-module-platform, rgba(127,127,127,.12)); color:var(--dsw-alias-label-secondary, inherit); }
+/* 「不会运行」标签（matcher 非法）：**例外态**才出现，所以它允许在这一屏多占一点位置。
+   颜色走官方 state-warn-primary（token 名以官方 theme 表为准，见本文件开头的核对名单）。 */
+.dsh-hooks__tag--warn { color:var(--dsw-alias-state-warn-primary, #c93); }
+/* 正文里那**一个**状态词（未运行 / 通过 / 失败 / 已阻断）。它旁边就是状态点，
+   所以这里的颜色不承担语义（颜色在点上；词是给色觉障碍与纯文本渲染的答案）。 */
+.dsh-hooks__status { flex:none; font-size:12px; color:var(--dsw-alias-label-secondary, inherit); }
+/* 「⋯」展开出来的那一块：左边一句"匹配 X · 超时 Y"，右边三个动作。 */
+.dsh-hooks__cardmenu { display:flex; align-items:center; gap:8px; min-width:0; min-height:24px; flex-wrap:wrap; }
 .dsh-hooks__meta { flex:none; font-size:12px; color:var(--dsw-alias-label-secondary, inherit); }
 .dsh-hooks__detailRow { display:flex; align-items:center; gap:8px; min-width:0; flex-wrap:wrap; }
 .dsh-hooks__editor { font-family:ui-monospace, monospace; font-size:12px; line-height:16px; min-width:0; flex:1 1 240px;
@@ -251,7 +263,6 @@ export const styles = `
   border:.5px solid var(--dsw-alias-settings-card-stroke, rgba(127,127,127,.35)); }
 .dsh-hooks__emptytitle { font-size:13px; font-weight:500; line-height:18px; min-width:0; }
 .dsh-hooks__emptyactions { display:flex; align-items:center; gap:8px; min-width:0; flex-wrap:wrap; }
-.dsh-hooks__emptyguide { display:flex; align-items:center; gap:8px; min-width:0; flex-wrap:wrap; }
 
 /* ── 折叠区（全部事件 / 诊断）：默认收起，一行一个开关 ──
    这里是**官方"只画分隔线"那套语言**（settings-general 的 .row：border-bottom:.5px solid
@@ -287,6 +298,16 @@ export const styles = `
   background:var(--dsw-alias-settings-card-fill, rgba(127,127,127,.06));
   border:.5px solid var(--dsw-alias-settings-card-stroke, rgba(127,127,127,.35)); }
 .dsh-hooks__newrow { display:flex; align-items:center; gap:16px; min-width:0; flex-wrap:wrap; }
+/* 模板行（v4）：**不是字段容器** —— 它没有 label + 控件的配对，所以既不是 __newfield
+   也不是 __newrow（D37 按"每个 __newfield 恰好一个 label + 一个控件"守 F1，混进去会失真）。 */
+.dsh-hooks__tplrow { display:flex; align-items:center; gap:8px; min-width:0; flex-wrap:wrap; }
+/* 模板按钮：ghost 文字按钮（内容区不许描边）。刻意**不用** __btn 类 ——
+   断言按 __btn 数"这一屏有几个动作按钮"，模板按钮不是动作按钮。 */
+.dsh-hooks__tplbtn { font:inherit; font-size:12px; line-height:1; height:24px; padding:0 8px; border:0; border-radius:6px;
+  cursor:pointer; flex:none; background:transparent; color:var(--dsw-alias-label-secondary, inherit); }
+.dsh-hooks__tplbtn:hover:not(:disabled) { color:var(--dsw-alias-label-primary, inherit);
+  background:var(--dsw-alias-interactive-bg-hover, rgba(127,127,127,.12)); }
+.dsh-hooks__tplbtn:disabled { opacity:.5; cursor:default; }
 .dsh-hooks__newfield { display:flex; align-items:center; gap:8px; min-width:0; flex-wrap:nowrap; }
 .dsh-hooks__newfield > .dsh-hooks__editor { flex:1 1 240px; }
 .dsh-hooks__newlabel { flex:none; min-width:56px; font-size:12px; color:var(--dsw-alias-label-secondary, inherit); }
