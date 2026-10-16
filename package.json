@@ -9,6 +9,7 @@
   "files": [
     "lib/**",
     "!lib/.types/**",
+    "cordis.patch.yml",
     "icon.svg",
     "locale/*.json",
     "README.md"
@@ -16,11 +17,15 @@
   "exports": {
     ".": "./lib/index.js",
     "./client": "./lib/client.js",
+    "./cordis.patch.yml": "./cordis.patch.yml",
     "./package.json": "./package.json",
     "./locale/*.json": "./locale/*.json"
   },
   "dsh": {
     "manifestVersion": 1,
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
     "client": {
       "platform": "web"
     }

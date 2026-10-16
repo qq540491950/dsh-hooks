@@ -150,6 +150,27 @@ test('A：发布元数据（icon / locale / exports / files）—— 每一条�
   // `lib/**` 会把 `lib/.types/**`（tsc 的中间产物）一起带进包 —— 它们既不在 exports 里（拿不到）、
   // 又会随手过期。`npm pack --dry-run` 实测抓到的就是这个。
   assert.ok(pkg.files.includes('!lib/.types/**'), 'files 必须排除 lib/.types/**（tsc 中间产物不该发布）')
+
+  // ④ 「路线 2：bundle」装载所需的声明（`plugin_manager install_bundle` 读的就是这三处）。
+  //    判据来自**可工作的兄弟包** `@qq540491950/dsh-mcp-manager`（它的 patch 由 profile 的
+  //    `dsh.profile.bundles` 装载）：`dsh.bundle.patch` → 包内补丁层；补丁层的插件行必须在 `insert:`
+  //    下；`name` **必须等于 package.json 的 name**（写错就是"装上了但加载不到"，而界面不报错）。
+  assert.equal(pkg.dsh.bundle?.patch, './cordis.patch.yml', 'dsh.bundle.patch 必须指向包内的补丁层')
+  const patchPath = path.join(root, 'cordis.patch.yml')
+  assert.ok(fs.existsSync(patchPath), '缺 cordis.patch.yml：install_bundle 会装上一个没有插件行的 bundle')
+  const patch = fs.readFileSync(patchPath, 'utf8')
+  assert.ok(/^- insert:\s*$/m.test(patch), '插件行必须写在 `insert:` 下（顶层 `- id:` 是覆写，会被丢弃）')
+  assert.ok(new RegExp(`^\\s*- id: ${pkg.name}\\s*$`, 'm').test(patch), `补丁层必须有 Loader 条目 id：${pkg.name}`)
+  assert.ok(
+    new RegExp(`^\\s*name: '${pkg.name}'\\s*$`, 'm').test(patch),
+    `补丁层的 name 必须等于 package.json 的 name（${pkg.name}）`,
+  )
+  assert.equal(
+    pkg.exports['./cordis.patch.yml'],
+    './cordis.patch.yml',
+    '补丁层必须进 exports：有 exports 时未声明的 subpath 会被挡住（拿不到 patch 文件）',
+  )
+  assert.ok(pkg.files.includes('cordis.patch.yml'), 'files 必须包含 cordis.patch.yml，否则发出去的包里没有它')
 })
 
 test('A：编码纪律（src/** + tools/** + lib/** 无 BOM、无 U+FFFD、LF、结尾换行）', () => {

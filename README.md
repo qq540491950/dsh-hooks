@@ -63,6 +63,12 @@ node tools/verify.ts   # 唯一必跑的自检
 
 ## 安装
 
+两条路线**替代关系**（见 `AGENTS.md` §7），同一时间只应生效一条。本包**两条都备好了**：
+profile 的路径行是**当前在本机生效**的那一条，`dsh.bundle.patch` 是给 `plugin_manager install_bundle`
+用的那一层（`cordis.patch.yml`，自检 A 区钉住它的形状）。
+
+### 路线 1「路径行」（当前生效）
+
 追加到 `%DSH_HOME%\profiles\<profile>\cordis.patch.yml`（本机是
 `C:\Users\admin\.dsh\profiles\desktop\cordis.patch.yml`）：
 
@@ -73,11 +79,24 @@ node tools/verify.ts   # 唯一必跑的自检
       name: 'file:///D:/project/dsh-plugins/dsh-hooks/lib/index.js'
 ```
 
-无 `config:` 段 —— 这是**路线 1「路径行」**装载：profile 直接指向 `lib/index.js` 的 `file://`
-绝对路径，**不需要 pnpm install，不需要联网，也不需要 `dsh.bundle.patch`**。
-（同目录的 `dsh-continue` 也用这条路；但 **`dsh-mcp-manager` 不是** —— 它走的是路线 2「bundle」，
-即 `package.json` 里的 `dsh.bundle.patch` + 一个 `cordis.patch.yml`，由 `plugin_manager
-install_bundle` 安装。两条路是**替代关系**，别把它们的字段混着抄。）
+无 `config:` 段 —— profile 直接指向 `lib/index.js` 的 `file://` 绝对路径，
+**不需要 pnpm install，不需要联网**。（同目录的 `dsh-continue` 也用这条路。）
+
+### 路线 2「bundle」（`package.json` 里已声明）
+
+`package.json` 的 `dsh.bundle.patch` → `./cordis.patch.yml`（包内那一层只声明插件自己这一行，
+`name` 必须等于包名）。`plugin_manager install_bundle` 用它挂载，并把
+`dependencies` / `dsh.profile.bundles` 写进 profile —— 这两处**由它写，不要手改**。
+
+切换时必须**二选一**，否则同一个 id 会出现两行，Loader 只保留一行（后应用的层覆盖先应用的层），
+"到底加载的是哪个文件"就不可读了：
+
+1. 在「设置 → 插件」里安装/更新本包（或让有 `plugin_manager` 工具、且审批放行的会话执行
+   `install_bundle`）—— 它会写好 profile 的依赖与 bundles 列表；
+2. **把 profile 里那条 `- id: dsh-hooks / name: 'file:///…/lib/index.js'` 删掉**
+   （改 `~/.dsh/profiles/**` 前先备份成带时间戳的 `.bak`，只做最小行级改动，改完用真实 YAML
+   解析器验一遍 —— `AGENTS.md` §1.4）；
+3. 宿主半边**必须重启**才会加载新的 JS 模块代（§1.2：`disable→enable` 不重新 import 模块）。
 
 ### ⚠️ 必须重启 DSH
 
@@ -807,14 +826,16 @@ cwd → 最近 `.git` 祖先解析，用户级永远参与合并（用户级在�
 
 ## 发布（`npm pack` 会打进去什么）
 
-**装载路线：路线 1「路径行」** —— profile 直接指向 `lib/index.js` 的绝对路径。本包**没有**声明
-`dsh.bundle.patch`，也不走 `install_bundle`（两条路是替代关系，见上文「安装」）。
+**装载路线：路线 1「路径行」当前生效**（profile 直接指向 `lib/index.js` 的绝对路径）；
+本包**同时**声明了路线 2 所需的 `dsh.bundle.patch`（→ `cordis.patch.yml`）供
+`plugin_manager install_bundle` 使用。两条路是替代关系，切换步骤见上文「安装」——
+**同一个 id 不许有两行**。
 
 `files` 白名单是刻意收窄的。`npm pack --dry-run` 实测（`node .tmp/pack-scan.mjs`）打出来的是：
 
 ```
-README.md   icon.svg   lib/.build-manifest.json   lib/client.js   lib/index.js
-locale/en.json   locale/zh.json   package.json            # 8 个文件 / ~128 KiB
+README.md   cordis.patch.yml   icon.svg   lib/.build-manifest.json   lib/client.js
+lib/index.js   locale/en.json   locale/zh.json   package.json      # 9 个文件 / ~75 KiB（压缩后）
 ```
 
 - **`lib/.types/**` 必须排除**：`lib/**` 会把 tsc 的中间产物一起带进包，它们既不在 `exports` 里

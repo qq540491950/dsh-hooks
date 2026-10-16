@@ -1,0 +1,24 @@
+# dsh-hooks bundle 自带的补丁层（`package.json` 的 `dsh.bundle.patch` 指向本文件）。
+#
+# 「路线 2：bundle」用这一层声明**插件自己那一行**，由 `plugin_manager install_bundle` 应用
+# （profile 的 `dsh.profile.bundles` + `dependencies` 也由它写入，本文件不碰用户的 profile）。
+#
+# 本文件里**只有插件自己这一行**，理由：
+#   · hooks 的配置是**插件自己拥有的 JSON 文件**（`<projectRoot>/.dsh/hooks.json` 与
+#     `$DSH_HOME/hooks.json`），根本不经过 cordis 配置面 —— 所以这里没有容器条目；
+#   · 也**没有**任何 `- id: <别的插件>` 覆写行：覆写层会压平用户在 profile 里手写的东西
+#     （`dsh-mcp-manager` 的教训）。
+#
+# ⚠️ 必须写在 `insert:` 下，**不能**写成顶层 `- id: dsh-hooks`：顶层 `- id: X` 是"覆写已存在条目"，
+#    目标不存在时 `applyEntryPatches` 会直接 warn 并丢弃 —— 表现是"bundle 装上了，但设置里没有
+#    Hooks 页"，而 profile 里看不到任何错误。
+#
+# ⚠️ 与「路线 1：profile 里的路径行」是**替代关系**，不是互补字段：profile 与 bundle 同时给同一个 id
+#    两行时，Loader 只保留一行（后应用的层覆盖先应用的层），"到底加载的是哪个文件"就不可读了。
+#    切换路线时必须把 profile 里那条 `name: 'file:///…/lib/index.js'` 删掉（见 README「装载路线」）。
+#
+# 自检（tools/verify.ts 的 A 区）钉住三件事：文件存在、这一行在 `insert:` 下、且
+# `name` 等于 `package.json` 的 `name`（写错就是"装上了但加载不到"）。
+- insert:
+    - id: dsh-hooks
+      name: 'dsh-hooks'
