@@ -41,7 +41,7 @@
 
 **1.3 [硬] 不要重启 DSH。** 当前会话就跑在它里面。需要宿主侧生效时**告知用户**，由用户决定。
 
-**1.4 [硬] 不擅自改 `~/.dsh/profiles/**`。** 本插件的接线是 `desktop/cordis.patch.yml` 末尾的 `- insert: - id: dsh-hooks / name: 'file:///D:/project/dsh-plugins/dsh-hooks/lib/index.js'`（"路径行"装载）。该文件是**活配置**，应用会并发写入。确需改动：① 备份到带时间戳 `.bak`；② 只用 `edit` 做**最小行级**改动；③ 用真实 YAML 解析器验证；④ 告知备份路径与回滚方式。**profile 原文（含明文凭据 / 真实网关地址）不得粘进仓库文件**（本 profile 里就有明文 token 与内网地址）。
+**1.4 [硬] 不擅自改 `~/.dsh/profiles/**`。** 本插件的接线在 2026-10-16 前是 `desktop/cordis.patch.yml` 末尾的路径行（`- insert: - id: dsh-hooks / name: 'file:///…/lib/index.js'`）；**该行已随"路线 2：bundle"删除**（备份 `cordis.patch.yml.bak-20261016142901`），现在 Loader 行由包自带的 `cordis.patch.yml` 提供。无论走哪条路，改 profile 的规矩不变：该文件是**活配置**，应用会并发写入。确需改动：① 备份到带时间戳 `.bak`；② 只用 `edit` 做**最小行级**改动；③ 用真实 YAML 解析器验证（可复用 `.tmp/extract-jsyaml.mjs` + `.tmp/yaml-check.mjs`：从 `app.asar` 取 `js-yaml`，只打印结构不打印 config）；④ 告知备份路径与回滚方式。**profile 原文（含明文凭据 / 真实网关地址）不得粘进仓库文件**（本 profile 里就有明文 token 与内网地址）。
 
 **1.5 [硬] 并发编辑按护栏重做。** `edit` 报 `file changed since it was read`、或写入报 `FS_STALE_VERSION` → **重新读取、基于新内容重做**；不要用整文件写入绕过护栏。
 
@@ -211,9 +211,9 @@
 - `.gitattributes` 强制 LF；不要引入 CRLF，也不要依赖 `core.autocrlf`（本机为 `true`，方向相反）。
 - `git push` 的 stderr 进度会被 PowerShell 记成错误并给出 `[exit code: 1]`——**假警报**，以 `git ls-remote origin refs/heads/main` 与 `git status -sb` 为准。
 - **装载路线二选一（必须在 README 里写明本包用哪条）**：
-  - **路线 1「路径行」（当前）**：profile 的 `- insert:` 直接指向 `lib/index.js` 的 `file://` 绝对路径；不需要 `dsh.bundle.patch`、不需要 pnpm / node_modules。客户端 bundle 仍由 `dsh-client-modules` 从本包 `package.json` 的 `exports["./client"]` 定位，由 Host 在 `/plugins` 下发布。
+  - **路线 1「路径行」**：profile 的 `- insert:` 直接指向 `lib/index.js` 的 `file://` 绝对路径；不需要 `dsh.bundle.patch`、不需要 pnpm / node_modules。客户端 bundle 仍由 `dsh-client-modules` 从本包 `package.json` 的 `exports["./client"]` 定位，由 Host 在 `/plugins` 下发布。
   - **路线 2「bundle」**：`package.json` 声明 `dsh.bundle.patch: './cordis.patch.yml'`，由该 YAML 的 `- insert:` 行声明插件条目，走 `plugin_manager install_bundle`（官方要求：**不要**用 shell 命令复刻安装流程）。**两条路线是替代关系，不是互补字段**。走这条路要额外提交补丁文件与 `lib/**`（git 路线要求），且**替换已安装的包必须重启**才加载新的 JS 模块代。
-  - **本包状态**：路线 1 是**当前生效**的那条（profile 的路径行）；同时已声明路线 2 所需的两处（`dsh.bundle.patch` + `cordis.patch.yml`，自检 A 区钉住"插件行在 `insert:` 下、`name` 等于 `package.json` 的 `name`"）。**切换时必须把 profile 里那条路径行删掉** —— 同 id 两行会让 Loader 只保留一行，"到底加载的是哪个文件"就不可读了（改 profile 走 §1.4 的流程）。
+  - **本包状态（2026-10-16 更新）**：**路线 2「bundle」是本机当前生效的那条** —— 已装 `v0.2.2`（profile lockfile 钉在 `a41f3f8`），profile 里那条手写路径行**已删**（备份 `cordis.patch.yml.bak-20261016142901`，用真实 YAML 解析器验过、diff 恰好一个 hunk）。包内两处声明（`dsh.bundle.patch` + `cordis.patch.yml`）由自检 A 区钉住形状：插件行必须在 `insert:` 下、`name` 等于 `package.json` 的 `name`。**装了 bundle 之后改本地源码不再影响运行中的插件**（要边改边看就切回路线 1）；切换时**必须先装新的、再删 profile 里那条路径行** —— 反过来会让插件在两次操作之间**没有**任何 Loader 行。
 - **`dsh.client` 的确切 schema（官方运行时校验器为准）**：`{platform, inject?, external?, immediately?}`。
   - `platform` **必填且必须是字符串**；只有 `platform === "web"` 才会发布客户端半边（其他值等同"没有客户端半边"）。
   - `inject: string[]` 只用于**排序激活**（不是模块依赖）；`external: string[]` 声明**非基线**运行时 import（答案来自动态包行或静态表，且某一行不得声明自己的包）；`immediately: boolean`。

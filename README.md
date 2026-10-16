@@ -63,11 +63,14 @@ node tools/verify.ts   # 唯一必跑的自检
 
 ## 安装
 
-两条路线**替代关系**（见 `AGENTS.md` §7），同一时间只应生效一条。本包**两条都备好了**：
-profile 的路径行是**当前在本机生效**的那一条，`dsh.bundle.patch` 是给 `plugin_manager install_bundle`
-用的那一层（`cordis.patch.yml`，自检 A 区钉住它的形状）。
+两条路线**替代关系**（见 `AGENTS.md` §7），同一时间只应生效一条。
 
-### 路线 1「路径行」（当前生效）
+> **本机现状（2026-10-16）**：已切到**路线 2「bundle」** —— 装的是 `v0.2.2`（lockfile 钉在
+> `a41f3f8`），profile 里那条手写路径行**已删**（备份 `cordis.patch.yml.bak-20261016142901`）。
+> 宿主半边要**重启 DSH** 才会改从 `<profile>/node_modules/dsh-hooks/lib/index.js` 加载。
+> **装了 bundle 之后，改本地源码 + `pnpm build` 不再影响运行中的插件** —— 要边改边看就切回路线 1。
+
+### 路线 1「路径行」
 
 追加到 `%DSH_HOME%\profiles\<profile>\cordis.patch.yml`（本机是
 `C:\Users\admin\.dsh\profiles\desktop\cordis.patch.yml`）：
@@ -80,9 +83,10 @@ profile 的路径行是**当前在本机生效**的那一条，`dsh.bundle.patch
 ```
 
 无 `config:` 段 —— profile 直接指向 `lib/index.js` 的 `file://` 绝对路径，
-**不需要 pnpm install，不需要联网**。（同目录的 `dsh-continue` 也用这条路。）
+**不需要 pnpm install，不需要联网**，改完源码 `pnpm build` 重启即生效。（同目录的 `dsh-continue`
+也用这条路。）代价：Loader 行是**机器绝对路径**，换机器 / 换目录要改这一行。
 
-### 路线 2「bundle」（`package.json` 里已声明）
+### 路线 2「bundle」（本机当前生效）
 
 `package.json` 的 `dsh.bundle.patch` → `./cordis.patch.yml`（包内那一层只声明插件自己这一行，
 `name` 必须等于包名）。`plugin_manager install_bundle` 用它挂载，并把
