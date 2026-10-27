@@ -6,7 +6,7 @@
  * 所以自检可以直接 `import` 它跑单测，不必挂载插件。
  */
 
-import { HOOK_EVENTS, LITERAL_ALTERNATIVES, type HookEvent } from './constants.ts'
+import { HOOK_EVENTS, LITERAL_ALTERNATIVES, eventHasMatcher, type HookEvent } from './constants.ts'
 import { isObject, strField, boolField } from './guards.ts'
 import type {
   CommandVars,
@@ -19,6 +19,7 @@ import type {
   ParsedGroups,
   ParsedHook,
   ParseResult,
+  RejectedGroup,
   SkippedHandler,
 } from './types.ts'
 
@@ -118,8 +119,11 @@ export function matchesMatcher(matcher: string | undefined, query: string): bool
 export function parseHookConfig(raw: unknown, vars: CommandVars = {}): ParseResult {
   const groups: ParsedGroups = {}
   const skipped: SkippedHandler[] = []
+  // 结构在、但一条都跑不了的组。**只记录、不执行**：`groups` 里永远不会出现它们
+  // （执行语义一字不改），页面靠这份记录说清"文件里有内容，只是我跑不了"。
+  const rejected: RejectedGroup[] = []
   const errors: string[] = []
-  if (!isObject(raw)) return { groups, skipped, errors }
+  if (!isObject(raw)) return { groups, skipped, rejected, errors }
   const hooksMap = hooksMapOf(raw)
 
   for (const event of HOOK_EVENTS) {
@@ -129,18 +133,26 @@ export function parseHookConfig(raw: unknown, vars: CommandVars = {}): ParseResu
     // 用**文件下标**遍历：解析会跳过若干条目，而 rawIndex 必须指向文件里的真实位置。
     for (let groupIndex = 0; groupIndex < rawGroups.length; groupIndex++) {
       const rawGroup: unknown = rawGroups[groupIndex]
-      if (!isObject(rawGroup) || !Array.isArray(rawGroup.hooks)) continue
+      if (!isObject(rawGroup) || !Array.isArray(rawGroup.hooks)) {
+        rejected.push({ event, groupIndex, reason: 'malformed-group', hookCount: 0 })
+        continue
+      }
+      const skippedBefore = skipped.length
       const commands: ParsedHook[] = []
       for (let hookIndex = 0; hookIndex < rawGroup.hooks.length; hookIndex++) {
         const rawHook: unknown = rawGroup.hooks[hookIndex]
         if (!isObject(rawHook)) continue
         const type = typeof rawHook.type === 'string' ? rawHook.type : 'command'
         if (type !== 'command') {
-          skipped.push({ event, type })
+          skipped.push({ event, type, groupIndex, hookIndex, reason: 'unsupported-type' })
           continue
         }
         const command = rawHook.command
-        if (typeof command !== 'string' || command.length === 0) continue
+        if (typeof command !== 'string' || command.length === 0) {
+          // 它是 command，但没有命令 —— 也是"跑不了的一条"，必须计数（否则页面说小了）。
+          skipped.push({ event, type, groupIndex, hookIndex, reason: 'empty-command' })
+          continue
+        }
         const timeoutSec = typeof rawHook.timeout === 'number' && rawHook.timeout > 0 ? rawHook.timeout : undefined
         // `disabled` 由**解析层保留**、由**执行层跳过**：页面需要看见停用的 hook（用户才能重新启用），
         // 而 runner 不能跑它。在解析层就丢掉的话，页面只能显示"这条不存在"。
@@ -152,24 +164,53 @@ export function parseHookConfig(raw: unknown, vars: CommandVars = {}): ParseResu
           rawIndex: hookIndex,
         })
       }
-      if (commands.length === 0) continue
+      if (commands.length === 0) {
+        // 这一组一条都跑不了。分两种情形记**一条** rejected（不重复计数）：
+        //   ① 里面全是"不支持的类型"→ `unsupported-type`，条数已经在 `skipped` 里（hookCount 记 0）；
+        //   ② 结构在但空（空数组 / 只有空 command）→ `no-command`，条数就是这一组的长度。
+        rejected.push(
+          skipped.length > skippedBefore
+            ? {
+                event,
+                groupIndex,
+                reason: 'unsupported-type',
+                hookCount: 0,
+                ...(typeof rawGroup.matcher === 'string' ? { matcher: rawGroup.matcher } : {}),
+              }
+            : {
+                event,
+                groupIndex,
+                reason: 'no-command',
+                hookCount: rawGroup.hooks.length,
+                ...(typeof rawGroup.matcher === 'string' ? { matcher: rawGroup.matcher } : {}),
+              },
+        )
+        continue
+      }
       // UserPromptSubmit / Stop 没有 matcher 主语，这两个事件的 matcher 一律丢弃。
-      const matcher =
-        event === 'UserPromptSubmit' || event === 'Stop'
-          ? undefined
-          : typeof rawGroup.matcher === 'string'
-            ? rawGroup.matcher
-            : undefined
+      // 判据来自 constants 的**单一来源**（表单与卡片上的入口用的是同一份）。
+      const matcher = eventHasMatcher(event)
+        ? typeof rawGroup.matcher === 'string'
+          ? rawGroup.matcher
+          : undefined
+        : undefined
       const diagnostic = matcherDiagnostic(matcher)
       if (diagnostic !== undefined) {
         errors.push(`${diagnostic} on event ${JSON.stringify(event)}`)
+        rejected.push({
+          event,
+          groupIndex,
+          reason: 'invalid-matcher',
+          hookCount: commands.length,
+          ...(matcher !== undefined ? { matcher } : {}),
+        })
         continue
       }
       parsedGroups.push({ ...(matcher !== undefined ? { matcher } : {}), hooks: commands, rawIndex: groupIndex })
     }
     if (parsedGroups.length > 0) groups[event] = parsedGroups
   }
-  return { groups, skipped, errors }
+  return { groups, skipped, rejected, errors }
 }
 
 /**

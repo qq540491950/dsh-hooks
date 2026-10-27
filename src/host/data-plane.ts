@@ -13,9 +13,11 @@
  */
 
 import { HOOKS_ROUTE, HOOK_EVENTS, DEFAULT_TIMEOUT_MS, type HookEvent } from '../shared/constants.ts'
+import { hostErrorCodeOf } from '../shared/errors.ts'
+import type { HostErrorCode } from '../shared/errors.ts'
 import { messageOf, isObject } from '../shared/guards.ts'
 import { matcherDiagnostic } from '../shared/protocol.ts'
-import type { ParsedGroup, ParsedGroups, SkippedHandler } from '../shared/types.ts'
+import type { ParsedGroup, ParsedGroups, RejectedGroup, RejectedReason, SkippedHandler } from '../shared/types.ts'
 import { latestRunFor, type LedgerEntry } from './ledger.ts'
 import { isHookEvent, parseHooksRequest, type FileKind, type HooksRequest } from './write.ts'
 
@@ -39,6 +41,8 @@ export interface SourceInspection {
   groups: ParsedGroups
   /** 被跳过的非 command handler。 */
   skipped: SkippedHandler[]
+  /** 结构在、但一条都不会跑的组（matcher 非法 / 结构坏了 / 没有 command）。 */
+  rejected: RejectedGroup[]
   /** matcher 诊断（非法 matcher 只跳过该 group，不整份拒绝）。 */
   matcherErrors: string[]
 }
@@ -184,6 +188,23 @@ export interface HookView {
   lastRun: RunView | null
 }
 
+/**
+ * 一组**跑不了**的配置在快照里的形状（06 票）。
+ *
+ * 与 `GroupView` 分开是刻意的：`GroupView` 是"会运行的东西"，而这一份是"文件里有、但一条都不会跑"。
+ * 页面用它们在主列表里画一行灰化的「不会运行」，而不是让这些内容凭空消失。
+ */
+export interface RejectedGroupView {
+  event: HookEvent
+  /** **文件里的真实下标**（页面要能原样回传给"改匹配范围 / 删这一组"）。 */
+  groupIndex: number
+  /** 该组写的 matcher（非法时原样保留，用户要看到自己写错成了什么）。 */
+  matcher: string | null
+  reason: RejectedReason
+  /** 这一组里有几条（用于"文件里有 N 条，其中 M 条跑不了"）。 */
+  hookCount: number
+}
+
 /** 一个 group 的呈现。matcher 属于 group，command/timeout 属于 hook。 */
 export interface GroupView {
   /**
@@ -234,6 +255,19 @@ export interface FileView {
   version: string | null
   /** 该文件里的 hook 条数（含 disabled）。 */
   hookCount: number
+  /**
+   * 文件里有、但**一条都跑不了**的组（matcher 非法 / 结构坏了 / 没有 command）。
+   *
+   * 这是"空"与"跑不了"分开说的唯一依据：以前它们被解析器静默丢掉，页面于是把
+   * "有 4 条、全跑不了"说成"文件里还没有任何 hook"。
+   */
+  rejected: RejectedGroupView[]
+  /**
+   * 这个文件里跑不了的**条数**（= rejected 的 hookCount 之和 + 被跳过的 handler 条数）。
+   *
+   * 页面用它说"文件里有 N 条，其中 M 条跑不了"。`hookCount + unrunnable` = 文件里真实条目数。
+   */
+  unrunnable: number
   skipped: SkippedHandler[]
   matcherErrors: string[]
   /**
@@ -263,7 +297,7 @@ export interface HooksSnapshot {
   files: FileView[]
   /** **固定 7 项**，顺序即事件表顺序，含 0 条的事件（AGENTS §3.6）。 */
   events: EventView[]
-  total: { hookCount: number; disabledCount: number; groupCount: number }
+  total: { hookCount: number; disabledCount: number; groupCount: number; unrunnable: number }
   /** 生效配置是否为"沿用上一份可用配置"（磁盘坏了但运行中的 hook 还在）。 */
   staleInUse: boolean
   /** 页面据此决定要不要显示"只读"横幅与禁用写入控件。 */
@@ -360,6 +394,14 @@ export function buildSnapshot(inspection: HooksInspection): HooksSnapshot {
 
   const files: FileView[] = inspection.sources.map((source) => {
     let hookCount = 0
+    const rejected: RejectedGroupView[] = source.rejected.map((one) => ({
+      event: one.event,
+      groupIndex: one.groupIndex,
+      matcher: one.matcher ?? null,
+      reason: one.reason,
+      hookCount: one.hookCount,
+    }))
+    const unrunnable = rejected.reduce((sum, one) => sum + one.hookCount, 0) + source.skipped.length
     const events: FileEventView[] = HOOK_EVENTS.map((event) => {
       const parsed = source.groups[event] ?? []
       const count = countsFor(source.groups, event)
@@ -379,6 +421,8 @@ export function buildSnapshot(inspection: HooksInspection): HooksSnapshot {
       message: source.message,
       version: source.version,
       hookCount,
+      rejected,
+      unrunnable,
       skipped: source.skipped,
       matcherErrors: source.matcherErrors,
       events,
@@ -388,6 +432,8 @@ export function buildSnapshot(inspection: HooksInspection): HooksSnapshot {
   let totalHooks = 0
   let totalDisabled = 0
   let totalGroups = 0
+  let totalUnrunnable = 0
+  for (const file of files) totalUnrunnable += file.unrunnable
   const events: EventView[] = HOOK_EVENTS.map((event) => {
     const count = countsFor(inspection.effective, event)
     // 来源条数取自**参与合并的两份**（与 `hookCount` 同源）：`fromUser + fromProject === hookCount`
@@ -433,7 +479,12 @@ export function buildSnapshot(inspection: HooksInspection): HooksSnapshot {
     session: inspection.session,
     files,
     events,
-    total: { hookCount: totalHooks, disabledCount: totalDisabled, groupCount: totalGroups },
+    total: {
+      hookCount: totalHooks,
+      disabledCount: totalDisabled,
+      groupCount: totalGroups,
+      unrunnable: totalUnrunnable,
+    },
     staleInUse: inspection.staleInUse,
     // 由宿主的 inspection 决定（路由注册了 POST 才为 true）。
     capabilities: { writable: inspection.writable },
@@ -618,34 +669,40 @@ export interface RouteDeps {
 /**
  * 错误码 → HTTP 状态码。
  *
+ * 写成 `Record<HostErrorCode, number>`：**漏一个码就是编译错误**（以前是个 switch，新增的
+ * `rejected` / `malformed-event` 会静默掉进 500，而页面会显示"插件内部出错了"）。
  * 页面据此把失败**分别**说清（AGENTS §3.9）：`stale` = "文件被别处改过了，请刷新"，
  * `sandbox` = "当前会话权限不允许写"，`invalid-json` = "文件读不出来，为避免覆盖所以没写"。
  * 全用 4xx 表达"你的请求/环境的问题"，5xx 只留给真正的插件内部错误。
  */
-function statusFor(error: string | undefined): number {
-  switch (error) {
-    case 'stale':
-    case 'exists':
-    case 'not-preservable':
-    case 'invalid-json':
-    case 'no-project':
-    case 'no-version':
-    // 宿主没有工作区清单：不是"你的请求错了"，而是"这个宿主给不了那个能力"。
-    case 'no-workspace-registry':
-      return 409
-    case 'absent':
-    case 'not-found':
-    // 工作区已经不在清单里（可能被删过）—— 当成"目标不存在"，与 not-found 同档。
-    case 'unknown-workspace':
-      return 404
-    case 'sandbox':
-      return 403
-    case 'bad-op':
-    case 'bad-json':
-      return 400
-    default:
-      return 500
-  }
+const STATUS_OF: Readonly<Record<HostErrorCode, number>> = {
+  stale: 409,
+  exists: 409,
+  'not-preservable': 409,
+  'invalid-json': 409,
+  'no-project': 409,
+  'no-version': 409,
+  // 目标组在文件里，但它不会运行（matcher 非法 / 结构坏了）—— 与"真的不在了"分开。
+  rejected: 409,
+  // 事件键存在但不是数组：文件结构坏了，先修文件再改。
+  'malformed-event': 409,
+  // 宿主没有工作区清单：不是"你的请求错了"，而是"这个宿主给不了那个能力"。
+  'no-workspace-registry': 409,
+  absent: 404,
+  'not-found': 404,
+  // 工作区已经不在清单里（可能被删过）—— 当成"目标不存在"，与 not-found 同档。
+  'unknown-workspace': 404,
+  sandbox: 403,
+  'bad-op': 400,
+  'bad-json': 400,
+  'out-of-range': 400,
+  'resolve-failed': 500,
+  'write-failed': 500,
+  internal: 500,
+}
+
+function statusFor(error: HostErrorCode): number {
+  return STATUS_OF[error]
 }
 
 /**
@@ -677,9 +734,11 @@ export function registerHooksRoute(connection: ConnectionFetchBridge, deps: Rout
             if (!parsedDryRun.ok) return jsonResponse(400, { ok: false, error: 'bad-op', detail: parsedDryRun.reason })
             const outcome = await deps.dryRun(parsedDryRun.request, parsedDryRun.target, sessionId, request.signal)
             if (!outcome.ok) {
-              return jsonResponse(statusFor(outcome.error), {
+              // 目录之外的码一律归成 `internal`：这样"客户端一定有文案"是结构性的，不靠两边手工同步。
+              const code = hostErrorCodeOf(outcome.error)
+              return jsonResponse(statusFor(code), {
                 ok: false,
-                error: outcome.error ?? 'dry-run-failed',
+                error: code,
                 ...(outcome.detail !== undefined ? { detail: outcome.detail } : {}),
               })
             }
@@ -695,9 +754,10 @@ export function registerHooksRoute(connection: ConnectionFetchBridge, deps: Rout
             request.signal,
           )
           if (!outcome.ok) {
-            return jsonResponse(statusFor(outcome.error), {
+            const code = hostErrorCodeOf(outcome.error)
+            return jsonResponse(statusFor(code), {
               ok: false,
-              error: outcome.error ?? 'write-failed',
+              error: code,
               ...(outcome.detail !== undefined ? { detail: outcome.detail } : {}),
             })
           }
@@ -713,7 +773,8 @@ export function registerHooksRoute(connection: ConnectionFetchBridge, deps: Rout
       } catch (error) {
         // 作用域解析失败要**精确**说清（404 工作区不在清单 / 409 宿主没有清单），不许糊成 500。
         if (error instanceof ScopeError) {
-          return jsonResponse(statusFor(error.code), { ok: false, error: error.code, detail: error.message })
+          const code = hostErrorCodeOf(error.code)
+          return jsonResponse(statusFor(code), { ok: false, error: code, detail: error.message })
         }
         // 技术原文留在 detail 里，页面自己决定怎么措辞 —— 绝不把 FsError 原文当主文案。
         return jsonResponse(500, { ok: false, error: 'internal', detail: messageOf(error) })

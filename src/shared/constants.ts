@@ -65,6 +65,19 @@ export const HOOKS_ROUTE = '/api/hooks'
 export type HookEvent = (typeof HOOK_EVENTS)[number]
 
 /**
+ * 这两个事件**没有 matcher 主语**：协议层（以及我们的解析器）一律丢弃它们的 matcher。
+ *
+ * 单一来源：解析器、新建表单、卡片上的"改匹配范围"入口都从这里取 —— 三处各写一份必然漂移，
+ * 而漂移的表现是"表单让我填了，存进去却不生效"（那是界面的错，不是用户的错）。
+ */
+export const MATCHERLESS_EVENTS = ['UserPromptSubmit', 'Stop'] as const
+
+/** 这个事件是否**看** matcher。 */
+export function eventHasMatcher(event: string): boolean {
+  return !(MATCHERLESS_EVENTS as readonly string[]).includes(event)
+}
+
+/**
  * 注入上下文的 message source。
  *
  * 用 `dsh-hooks` 作为 kind：这只是一个来源标记，实测没有任何消费方对 `source.kind` 做穷举

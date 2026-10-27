@@ -50,16 +50,65 @@ export interface ParsedGroup {
 /** 一个 projectRoot 的解析结果（按事件分组）。 */
 export type ParsedGroups = Partial<Record<HookEvent, ParsedGroup[]>>
 
-/** 被跳过的非 command handler（只做诊断用）。 */
+/** 被跳过的条目（只做诊断与"跑不了"计数用）。 */
 export interface SkippedHandler {
   event: HookEvent
+  /** 条目上写的 handler 类型（`command` 也可能是"空命令"那条路）。 */
   type: string
+  /** **在文件里的真实下标**（哪个组的第几条）—— 页面要能说清"哪一条跑不了"。 */
+  groupIndex: number
+  hookIndex: number
+  /**
+   * 为什么跳过。
+   *
+   * `empty-command` 这条是 06 复查时补的：一个 `type:"command"` 但 `command` 为空串的条目
+   * 以前**不留任何记录**，于是 `hookCount + unrunnable` 比文件里真实条目数少 —— 页面那个
+   * "文件里有 N 条"因此会说小。
+   */
+  reason: 'unsupported-type' | 'empty-command'
 }
+
+/**
+ * 一组**不会运行**的配置：它在文件里存在，但一条都跑不了。
+ *
+ * 为什么必须记下来（06 票）：这三类东西以前被解析器**静默丢掉** —— 于是页面上什么都没有，
+ * 用户合理地得出"我没有配置"（其实是"有 4 条，全跑不了"）。空 vs 不存在 vs 跑不了，是三件事。
+ */
+export interface RejectedGroup {
+  event: HookEvent
+  /** **文件里的真实下标**（该事件数组中的位置）。 */
+  groupIndex: number
+  /** 该组写的 matcher（非法时原样保留，页面要能把它显示出来让人改）。 */
+  matcher?: string
+  reason: RejectedReason
+  /** 这一组里有几条跑不了（用于"文件里有 N 条，其中 M 条跑不了"）。 */
+  hookCount: number
+}
+
+/** 跑不了的原因（机器可读；人话由页面自己写，见 `rejectedReasonText`）。 */
+export type RejectedReason =
+  /** matcher 不是合法正则（该组被跳过，与 AGENTS §2.7 的取舍一致）。 */
+  | 'invalid-matcher'
+  /** 这一组的结构不合法（不是对象，或缺 `hooks` 数组）。 */
+  | 'malformed-group'
+  /** 这一组里没有任何可运行的 command（空数组 / 只有空 command）。 */
+  | 'no-command'
+  /**
+   * 这一组里**全是本插件不支持的处理器类型**（`prompt` / `http` / `mcp_tool` …）。
+   *
+   * 与 `no-command` 分开：它们**有内容**，只是我们只跑 `command`。以前这类组一条记录都不留，
+   * 于是页面把它算进"空"，同时又在条数里说"另有 N 条跑不了" —— 用户看到的是自相矛盾的两句话。
+   * 这条记录的 `hookCount` 恒为 0：那些条目已经在 `skipped` 里计过数，不许重复计。
+   */
+  | 'unsupported-type'
 
 /** `parseHookConfig` 的结果。 */
 export interface ParseResult {
+  /** **只含可运行的组**（执行语义的唯一来源）。 */
   groups: ParsedGroups
   skipped: SkippedHandler[]
+  /** 结构在、但一条都跑不了的组（**不参与执行**，只用于让页面说真话）。 */
+  rejected: RejectedGroup[]
   errors: string[]
 }
 

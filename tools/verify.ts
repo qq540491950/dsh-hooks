@@ -56,7 +56,19 @@ import {
 } from '../src/host/write.ts'
 
 // 客户端**写请求层**：唯一的"作用域 → 请求体"构造函数（§2.2）。纯函数，不需要浏览器 / react。
-import { CURRENT_SCOPE, dryRunFor, intentFor, scopeQuery, scopeTargetOf } from '../src/client/write.ts'
+import {
+  CURRENT_SCOPE,
+  dryRunFor,
+  intentFor,
+  requestDryRun,
+  requestWrite,
+  scopeQuery,
+  scopeTargetOf,
+  writeErrorSentence,
+} from '../src/client/write.ts'
+// 错误码目录：宿主能返回的码 + 只在浏览器半边产生的码。两半共用**同一份**，并由 F 区做表驱动断言
+// （02 票：以前客户端的文案表漏了 no-version 这类码，页面会把内部码当主文案显示）。
+import { HOST_ERROR_CODES, SENTENCE_ERROR_CODES } from '../src/shared/errors.ts'
 // 客户端**样式字符串**：注入的 CSS 没有 DOM 可量，所以 D 区对它做字面断言（popover 滚动 / 720px /
 // 事件行 32px / 内容区按钮无描边）。它同时是预览生成器"只许用这一份 CSS"的比对基准。
 import { styles } from '../src/client/styles.ts'
@@ -171,6 +183,28 @@ test('A：发布元数据（icon / locale / exports / files）—— 每一条�
     '补丁层必须进 exports：有 exports 时未声明的 subpath 会被挡住（拿不到 patch 文件）',
   )
   assert.ok(pkg.files.includes('cordis.patch.yml'), 'files 必须包含 cordis.patch.yml，否则发出去的包里没有它')
+})
+
+test('A：引擎声明与描述（不许被过期的 prerelease 钉死；描述不暴露内部座位号）', () => {
+  const pkg = JSON.parse(fs.readFileSync(path.join(HERE, '..', 'package.json'), 'utf8'))
+
+  // ① 判据：npm 的 semver 规则下，**任何**含 prerelease 元组的范围（"0.2.0-rc.2" /
+  //    "^0.2.0-rc.2" / ">=0.2.0-rc.2"）都**不**匹配"另一个元组"的 prerelease（例如 0.2.1-rc.3）——
+  //    钉 rc 等于把自己锁死在那一台机器上。线上实测：运行时升到 0.2.1-rc.3 之后本包装不上
+  //    （unmet engines 会阻断安装与激活），而 profile 里那条 loader 行也随之消失。
+  const dshEngine = pkg.engines === undefined ? undefined : pkg.engines.dsh
+  if (dshEngine !== undefined) {
+    assert.equal(typeof dshEngine, 'string', 'engines.dsh 必须是字符串（semver 范围）')
+    assert.ok(
+      !/-(?:rc|beta|alpha|next|canary)\./i.test(dshEngine),
+      `engines.dsh 不许出现 prerelease 元组（它只匹配同一个版本元组，换一个 rc 就装不上）：${dshEngine}`,
+    )
+  }
+  assert.equal(typeof pkg.engines?.node, 'string', 'node 引擎要求必须保留 —— 它是真可判定的')
+
+  // ② `description` 是 Plugin Manager 卡片上的**用户文案**：内部座位号（order 920）不该上屏。
+  assert.equal(typeof pkg.description, 'string')
+  assert.ok(!/order\s*\d+/i.test(pkg.description), `描述里不许出现座位顺序号：${pkg.description}`)
 })
 
 test('A：编码纪律（src/** + tools/** + lib/** 无 BOM、无 U+FFFD、LF、结尾换行）', () => {
@@ -436,8 +470,16 @@ function createFakeReact() {
       // `aria-label` 是"只有字形、没有文字"的按钮唯一的可读名字（v3 的折叠行 `＋` 按钮靠它），
       // 没被采集的话"无障碍名字对不对"就只能靠读代码。
       ariaLabel: typeof props['aria-label'] === 'string' ? props['aria-label'] : undefined,
+      // 17 票的三件套：播报（aria-live）、listbox 的高亮指认（aria-activedescendant）、以及被指认的 id。
+      ariaLive: typeof props['aria-live'] === 'string' ? props['aria-live'] : undefined,
+      ariaActiveDescendant:
+        typeof props['aria-activedescendant'] === 'string' ? props['aria-activedescendant'] : undefined,
+      id: typeof props.id === 'string' ? props.id : undefined,
       type: typeof props.type === 'string' ? props.type : undefined,
       disabled: props.disabled === true,
+      // `autoFocus` 也要采集：17 票要求"打开表单/进入编辑态时焦点落在第一个可编辑字段"，
+      // 而这在假 React 里唯一的可观察形态就是它（没有真实 DOM，也没有 ref）。
+      autoFocus: props.autoFocus === true,
     })
     flatten(node.children, out, className === '' ? parentClass : className)
     return out
@@ -610,6 +652,19 @@ function keyEvent(key) {
   return { key, preventDefault() {}, stopPropagation() {} }
 }
 
+/**
+ * 请求体去掉**乐观锁字段**（`expectedVersion`）。
+ *
+ * 为什么单拎出来：D 区各用例关心的是"落在**哪一份文件**的**哪一处**"，而"锁到底有没有发、
+ * 发的是不是页面看到的那一版"由 `D43` 一条断言统一守。不这么做的话，每加一个信封字段都要改
+ * 十条互不相干的断言 —— 改着改着就会有人顺手把真正的防护一起放宽掉。
+ */
+function withoutLock(body) {
+  const rest = { ...body }
+  delete rest.expectedVersion
+  return rest
+}
+
 /** 作用域选择器的触发器。 */
 function scopeTrigger(nodes) {
   const found = firstByClass(nodes, 'dsh-hooks__trigger')
@@ -695,6 +750,9 @@ function snapshotFile(kind, state, groupsByEvent = {}, overrides = {}) {
     message: state === 'error' ? 'FsError: cannot read text: Unexpected token {' : null,
     version: state === 'absent' ? null : 'v1',
     hookCount,
+    // 06 票：文件里"跑不了"的东西。缺省为空（大多数用例不关心），需要时用 overrides 注入。
+    rejected: [],
+    unrunnable: 0,
     skipped: [],
     matcherErrors: [],
     events,
@@ -763,7 +821,7 @@ function snapshotOf(options = {}) {
         fromProject: 0,
         runCount: 0,
       })),
-    total: options.total ?? { hookCount: 1, disabledCount: 0, groupCount: 1 },
+    total: options.total ?? { hookCount: 1, disabledCount: 0, groupCount: 1, unrunnable: 0 },
     staleInUse: options.staleInUse ?? false,
     capabilities: { writable: options.writable ?? true },
   }
@@ -942,7 +1000,7 @@ await test('D：诊断折叠（默认收起）里放项目根/路径/状态/版�
   const text = joinedText(opened)
   assert.ok(text.includes('项目根'), '展开后要有项目根')
   assert.ok(text.includes('D:/p'), '项目根的值来自快照')
-  assert.ok(text.includes('cwd 来源'), '展开后要有 cwd 来源（不编造来源）')
+  assert.ok(text.includes('工作目录来源'), '展开后要有工作目录来源（不编造来源；18 票把它翻成人话）')
   assert.ok(text.includes('C:/u/.dsh/hooks.json'), '展开后要有**当前那份**文件的路径（scope=user 时是用户级）')
   assert.ok(text.includes('已读取'), '展开后要有文件状态')
   assert.ok(text.includes('版本'), '展开后要有版本（排查乐观锁冲突要看）')
@@ -1101,6 +1159,21 @@ function guideButton(nodes) {
 }
 
 /**
+ * 「⋯」里那一排**可点开的字段**（匹配范围 / 超时 / 上移 / 下移）。
+ *
+ * 它们刻意不带 `__btn` 类（D 区按 `__btn` 数"这一排有几个动作按钮"），所以按 `title` 找。
+ */
+function menuFieldButton(nodes, label) {
+  const found = nodes.find(
+    (node) =>
+      typeof node.className === 'string' && node.className.includes('dsh-hooks__fieldbtn') && node.title === label,
+  )
+  assert.ok(found !== undefined, `「⋯」里应当有一个字段按钮「${label}」`)
+  assert.equal(typeof found.onClick, 'function', `「${label}」必须能点`)
+  return found
+}
+
+/**
  * 打开某一张卡右上角的 `⋯`（v4：试运行 / 编辑 / 删除都收在这块里）。
  *
  * 断言两件事：默认收起（`aria-expanded=false`）、点开之后**真的**能拿到那块内容。
@@ -1144,7 +1217,7 @@ await test('D：点开关发的是定点写请求（file + workspaceId + 原始�
 
   assert.equal(calls[0].method, 'POST', '切开关是一次写请求，不是又一次取数')
   assert.deepEqual(
-    calls[0].body,
+    withoutLock(calls[0].body),
     // 页面默认作用域 = 用户 ⇒ `file:'user'`，且**不带** workspaceId（用户级不属于任何工作区）。
     { file: 'user', op: 'setHookDisabled', event: 'PreToolUse', groupIndex: 0, hookIndex: 0, disabled: true },
     '请求体只能是定点操作（绝不回传整份文件），且下标必须是**文件里的**下标',
@@ -1190,11 +1263,16 @@ await test('D：行内编辑命令 —— 文本框里是当前命令，保存�
   const component = componentFromArtifact(harness.React)
   const first = await renderSection(component, harness, { ok: true, data: minimalSnapshot() })
 
-  // 没在编辑时：`⋯` 里是三个动作按钮（试运行、编辑、删除）；首屏一个都没有（v4）。
+  // 没在编辑时：`⋯` 里是四个动作按钮（试运行、编辑、删除、删除整组）；首屏一个都没有（v4）。
   assert.equal(writeButtons(first).length, 0, '首屏不该有动作按钮（它们全在 ⋯ 里）')
   const opened = await openCardMenu(first, component, harness)
   const idle = writeButtons(opened)
-  assert.equal(idle.length, 3, '「⋯」里应当有"试运行"、"编辑"、"删除"三个按钮')
+  assert.equal(idle.length, 4, '「⋯」里应当有"试运行"、"编辑"、"删除"、"删除整组"四个按钮（整组删除 = 09 票）')
+  assert.deepEqual(
+    idle.map((node) => node.title),
+    ['试运行', '编辑', '删除', '删除整组'],
+    '顺序稳定：先这条、再整组（破坏性动作排最后）',
+  )
   assert.ok(joinedText(opened).includes('匹配 pwsh'), '★ 匹配范围进了「⋯」（v4 不再占卡片正文）')
   assert.ok(joinedText(opened).includes('默认 600 秒'), '★ 超时也进了「⋯」')
   buttonByLabel(opened, '编辑').onClick()
@@ -1230,7 +1308,7 @@ await test('D：行内编辑命令 —— 文本框里是当前命令，保存�
 
   assert.equal(calls[0].method, 'POST')
   assert.deepEqual(
-    calls[0].body,
+    withoutLock(calls[0].body),
     {
       file: 'user',
       op: 'setHookCommand',
@@ -1281,7 +1359,7 @@ await test('D：删除是两步 —— 第一步只改状态不发请求，第�
   assert.equal(calls.length, 1, '两步之后恰好一次写请求')
   assert.equal(calls[0].method, 'POST')
   assert.deepEqual(
-    calls[0].body,
+    withoutLock(calls[0].body),
     { file: 'user', op: 'removeHook', event: 'PreToolUse', groupIndex: 0, hookIndex: 0 },
     '删除也是定点操作：宿主拿这两个**文件下标**定位要删的那一条',
   )
@@ -1313,7 +1391,7 @@ await test('D：点"试运行"发 dryRun 请求，结果贴在这一行，且那
 
   assert.equal(calls.length, 1, '试运行只发一次请求')
   assert.deepEqual(
-    calls[0].body,
+    withoutLock(calls[0].body),
     { op: 'dryRun', file: 'user', event: 'PreToolUse', groupIndex: 0, hookIndex: 0 },
     '试运行也是定点寻址（文件 + 事件 + 两个文件下标）；换到工作区作用域时同一构造函数会带上 workspaceId',
   )
@@ -1406,7 +1484,7 @@ await test('D：文件不存在时渲染空状态块 —— 说清"不存在"（
 
   assert.equal(calls.length, 1, '"新建配置文件"是一次写请求')
   assert.deepEqual(
-    calls[0].body,
+    withoutLock(calls[0].body),
     { file: 'project', workspaceId: 'w-1', op: 'createFile' },
     '新建的必须是**当前作用域**那一份（选中的工作区的项目级文件），且带 workspaceId',
   )
@@ -1571,7 +1649,7 @@ await test('D16：选中工作区后点开关 ⇒ 请求体带 workspaceId（开
 
   assert.equal(calls[0].method, 'POST', '点开关是一次写请求')
   assert.equal('workspaceId' in calls[0].body, true, '★ 选中工作区时请求体**必须**带 workspaceId（§2.2）')
-  assert.deepEqual(calls[0].body, {
+  assert.deepEqual(withoutLock(calls[0].body), {
     file: 'project',
     workspaceId: 'w-1',
     op: 'setHookDisabled',
@@ -1701,7 +1779,7 @@ await test('D18：搜索是纯前端过滤 —— 卡片变少、原始下标不
   await new Promise((resolve) => setTimeout(resolve, 0))
   await new Promise((resolve) => setTimeout(resolve, 0))
   assert.deepEqual(
-    calls[0].body,
+    withoutLock(calls[0].body),
     {
       file: 'user',
       op: 'setHookDisabled',
@@ -1769,7 +1847,7 @@ await test('D19：「＋新建」提交 ⇒ addGroup（event/matcher/command 正
   assert.equal(calls.length, 1, '提交只发一次请求')
   assert.equal(calls[0].method, 'POST')
   assert.deepEqual(
-    calls[0].body,
+    withoutLock(calls[0].body),
     {
       file: 'user',
       op: 'addGroup',
@@ -1914,7 +1992,7 @@ await test('D21：会话项目不在工作区清单里 ⇒ 下拉补「当前会
   await new Promise((resolve) => setTimeout(resolve, 0))
   assert.equal(calls[0].method, 'POST')
   assert.equal('workspaceId' in calls[0].body, false, '当前会话项目**不许**带 workspaceId（带=404）')
-  assert.deepEqual(calls[0].body, {
+  assert.deepEqual(withoutLock(calls[0].body), {
     file: 'project',
     op: 'setHookDisabled',
     event: 'PreToolUse',
@@ -2297,7 +2375,7 @@ await test('D27：触发器的 label 与勾选都跟**宿主回显**（不是本
   await new Promise((resolve) => setTimeout(resolve, 0))
   assert.equal(calls[0].method, 'POST', '点开关是一次写请求')
   assert.deepEqual(
-    calls[0].body,
+    withoutLock(calls[0].body),
     { file: 'user', op: 'setHookDisabled', event: 'PreToolUse', groupIndex: 0, hookIndex: 0, disabled: true },
     '★ 写请求也必须落在**屏幕上这一份**（回显推导），否则就是"看着 A 改到 B"',
   )
@@ -2659,8 +2737,21 @@ await test('D34：折叠里的空事件行是「＋」字形按钮（可 Tab、�
     glyphs.some((node) => node.title === '在 SessionStart 下新建'),
     '空事件行也有新建入口（"空"不是死路）',
   )
-  // 有内容的那一行保持 `N 个`（按类名取那一格：整页拼起来查会被第二行的 `1 个 hook` 蒙混过去）
-  assert.equal(textOfClass(opened, 'dsh-hooks__count'), '1 个', '有内容的事件行说"1 个"')
+  // 有内容的那一行保持 `N 个`。按**行**取文本：整页拼起来查会被第二行的 `1 个 hook` 蒙混过去；
+  // 而直接取"第一个 `__count`"也不行 —— 「生效配置」那一节在更上面（13 票起有三节）。
+  const rowTextOf = (row) => {
+    const at = opened.indexOf(row)
+    const parts = []
+    for (let i = at + 1; i < opened.length; i++) {
+      const node = opened[i]
+      if (typeof node.className === 'string' && node.className.split(' ').includes('dsh-hooks__eventrow')) break
+      if (node.text !== undefined) parts.push(node.text)
+    }
+    return parts.join('')
+  }
+  const preRow = allByClass(opened, 'dsh-hooks__eventrow').find((row) => rowTextOf(row).includes('PreToolUse'))
+  assert.ok(preRow !== undefined, '应当有一行是 PreToolUse')
+  assert.ok(rowTextOf(preRow).includes('1 个'), `有内容的事件行说"1 个"：${rowTextOf(preRow)}`)
 
   // 它仍然真的工作：点 SessionStart 那一行的 `＋` ⇒ 表单出现且事件预选为 SessionStart
   const sessionStartButton = glyphs.find((node) => node.title === '在 SessionStart 下新建')
@@ -2687,6 +2778,10 @@ await test('D35：样式与源码的静态纪律（hex 只作 var() fallback / �
   const strayHex = stripped.match(/#[0-9a-fA-F]{3,8}\b/g) ?? []
   assert.deepEqual(strayHex, [], `★ 这些十六进制不在 var() 的 fallback 里（硬编码颜色）：${strayHex.join(', ')}`)
 
+  // ⓪ 样式串里**不许出现反引号**：它会把 styles.ts 的模板字符串提前结束 —— 报错点在离现场很远
+  //    的地方（esbuild 报 CSS 语法错 / node 报 TS 语法错），本仓库已经踩过两次。
+  assert.ok(!styles.includes('`'), '★ 注入的 CSS 里出现了反引号：它会把模板字符串提前结束（注释里也不行，用「」代替）')
+
   // ② 不写 inline 样式（§3.2）：源码里不许出现 `style=` / `style={{`
   const clientDir = path.join(HERE, '..', 'src', 'client')
   const walk = (dir, out = []) => {
@@ -2699,7 +2794,12 @@ await test('D35：样式与源码的静态纪律（hex 只作 var() fallback / �
   }
   const clientFiles = walk(clientDir)
   assert.ok(clientFiles.length >= 5, `应当扫到客户端源码（否则这条断言是空的）：${clientFiles.length}`)
-  const inline = clientFiles.filter((file) => /style\s*[=:]/.test(fs.readFileSync(file, 'utf8')))
+  // ⚠️ `styles.ts` **本身就是样式表**：CSS 里天然有 `border-style:` 这种属性名，它不是"组件"。
+  // 把它纳入扫描会让这条断言在**正确**的代码上变红（06 票加虚线边框时就是这么被假阳性抓到的）。
+  // 防护意图不变：任何**组件**文件里出现 `style=` / `style:` 一律红。
+  const componentFiles = clientFiles.filter((file) => path.basename(file) !== 'styles.ts')
+  assert.ok(componentFiles.length >= 4, `应当扫到组件源码（否则这条断言是空的）：${componentFiles.length}`)
+  const inline = componentFiles.filter((file) => /style\s*[=:]/.test(fs.readFileSync(file, 'utf8')))
   assert.deepEqual(
     inline.map((file) => path.basename(file)),
     [],
@@ -2887,14 +2987,19 @@ await test('D37：新建表单**每个字段是一个容器**（label 与它的�
   const isLabel = (node) => typeof node.className === 'string' && node.className.includes('dsh-hooks__newlabel')
   const isField = (node) => typeof node.className === 'string' && node.className.includes('dsh-hooks__newfield')
   const labels = form.filter(isLabel)
-  assert.equal(labels.length, 4, `表单有四个字段标签：事件 / 匹配 / 命令 / 超时（实际 ${labels.length}）`)
+  // 5 个字段：事件 / 加到（该事件已有分组时才出现）/ 匹配 / 命令 / 超时。
+  assert.equal(
+    labels.length,
+    5,
+    `这份 fixture 的事件已经有一组，所以表单是五个字段：事件 / 加到 / 匹配 / 命令 / 超时（实际 ${labels.length}）`,
+  )
 
-  // ① 每个字段一个**独立**容器：label 的父容器必须是 __newfield，而且四个标签分属四个容器
+  // ① 每个字段一个**独立**容器：label 的父容器必须是 __newfield，而且五个标签分属五个容器
   const containers = [...new Set(labels.map((node) => node.parentClass))]
   assert.equal(
     containers.length,
-    4,
-    `★ 四个标签必须分属四个容器（过去它们全在一个容器里 ⇒ 换行时 label 与控件被拆散）：${containers.join(' | ')}`,
+    5,
+    `★ 五个标签必须分属五个容器（过去它们全在一个容器里 ⇒ 换行时 label 与控件被拆散）：${containers.join(' | ')}`,
   )
   for (const container of containers) {
     assert.ok(
@@ -2936,8 +3041,8 @@ await test('D37：新建表单**每个字段是一个容器**（label 与它的�
   assert.ok(row !== undefined, '短字段外面有一层 __newrow（只在这一层换行）')
   assert.equal(
     form.filter((node) => node.parentClass === row.className && isField(node)).length,
-    2,
-    '事件 + 匹配两个字段在同一个行容器里（宽度够时同行，不够时**整块**换行）',
+    3,
+    '事件 + 加到 + 匹配三个字段在同一个行容器里（宽度够时同行，不够时**整块**换行）',
   )
   const fieldRule = ruleBodyOf('.dsh-hooks__newfield {')
   assert.ok(fieldRule.includes('flex-wrap:nowrap'), `★ 字段容器内部不许换行：${fieldRule}`)
@@ -3058,10 +3163,12 @@ await test('D41：v4 密度 —— 首屏只有"状态点 + 一个状态词 + �
 
   // ③ 一键可达：点开 ⋯ → 详情真的在；再点一次 → 真的收回去
   const opened = await openCardMenu(nodes, component, harness)
-  assert.equal(allByClass(opened, 'dsh-hooks__cardmenu').length, 1, '点开 ⋯ 只展开这一条')
+  // 07 起「⋯」是**两条排**（字段排 + 动作排），所以按"展开的那一块"数（`__cardmenuwrap`），
+  // 而不是按单排容器数 —— 判据仍是"只展开这一条"。
+  assert.equal(allByClass(opened, 'dsh-hooks__cardmenuwrap').length, 1, '点开 ⋯ 只展开这一条')
   assert.ok(joinedText(opened).includes('匹配 pwsh'), '匹配范围在 ⋯ 里')
   assert.ok(joinedText(opened).includes('默认 600 秒'), '超时也在 ⋯ 里')
-  assert.equal(allByClass(opened, 'dsh-hooks__btn').length, 3, '⋯ 里三个动作（试运行 / 编辑 / 删除）')
+  assert.equal(allByClass(opened, 'dsh-hooks__btn').length, 4, '⋯ 里四个动作（试运行 / 编辑 / 删除 / 删除整组）')
   const menus = allByClass(opened, 'dsh-hooks__morebtn')
   assert.equal(menus[0].ariaExpanded, true, '⋯ 展开后 aria-expanded=true（按钮不许骗人）')
   menus[0].onClick()
@@ -3090,7 +3197,11 @@ await test('D42：新建表单的三个模板 —— 点一下填好字段，提
   const templates = allByClass(form, 'dsh-hooks__tplbtn')
   assert.equal(templates.length, 3, '★ 三个模板按钮（注入提醒 / 记到日志 / 直接拦住）')
   assert.ok(joinedText(form).includes('模板'), '有「模板」这一行提示词（否则用户不知道这三个按钮是什么）')
-  assert.equal(allByClass(form, 'dsh-hooks__newfield').length, 4, '模板行**不是**字段容器（F1 的结构断言不受影响）')
+  assert.equal(
+    allByClass(form, 'dsh-hooks__newfield').length,
+    5,
+    '模板行**不是**字段容器；字段容器是 事件 / 加到 / 匹配 / 命令 / 超时这五个（F1 的结构断言不受影响）',
+  )
 
   // 静态纪律：模板命令必须是单行、且不许出现 `${`（会被 TS 插值 / 被当成 shell 变量）
   for (const template of HOOK_TEMPLATES) {
@@ -3125,7 +3236,7 @@ await test('D42：新建表单的三个模板 —— 点一下填好字段，提
   await new Promise((resolve) => setTimeout(resolve, 0))
   assert.equal(calls.length, 1, '提交只发一次请求')
   assert.equal(calls[0].method, 'POST')
-  assert.deepEqual(calls[0].body, {
+  assert.deepEqual(withoutLock(calls[0].body), {
     file: 'user',
     op: 'addGroup',
     event: 'SessionStart',
@@ -3142,6 +3253,672 @@ await test('D42：新建表单的三个模板 —— 点一下填好字段，提
       `产物 lib/client.js 里应当有模板标签「${label}」（templates.ts 是不是没被 import？）`,
     )
   }
+})
+
+//#endregion
+
+//#region D43. 乐观锁：每个写请求都必须带"页面看到的那一份文件"的版本
+
+await test('D43：写请求带的是**目标文件**的版本（不是屏幕上另一份的），文件不存在时为 null', async () => {
+  const harness = createFakeReact()
+  const component = componentFromArtifact(harness.React)
+  // 两份文件故意给**不同**的版本号：取错了立刻能看出来（用同一个 'v1' 就测不出"取错文件"）。
+  const snapshot = snapshotOf({
+    scope: 'user',
+    userFile: snapshotFile(
+      'user',
+      'ok',
+      { PreToolUse: [{ rawIndex: 0, matcher: 'pwsh', hooks: [snapshotHook(0, 'echo u')] }] },
+      {
+        version: 'u-v9',
+      },
+    ),
+  })
+  const nodes = await renderSection(component, harness, { ok: true, data: snapshot })
+
+  const calls = []
+  globalThis.fetch = async (_url, options = {}) => {
+    const method = options.method ?? 'GET'
+    calls.push({ method, body: typeof options.body === 'string' ? JSON.parse(options.body) : null })
+    return {
+      json: async () =>
+        method === 'POST' ? { ok: true, data: { file: 'user', version: 'u-v10' } } : { ok: true, data: snapshot },
+    }
+  }
+
+  // ① 默认作用域 = 用户级 ⇒ 锁必须是**用户级文件**的版本。
+  switchNode(nodes).onClick()
+  await new Promise((resolve) => setTimeout(resolve, 0))
+  await new Promise((resolve) => setTimeout(resolve, 0))
+  assert.equal(calls[0].method, 'POST')
+  assert.equal(
+    calls[0].body.expectedVersion,
+    'u-v9',
+    '★ 写用户级文件就必须用用户级文件的版本做锁（这是"页面看到的那一版"的唯一来源）',
+  )
+})
+
+await test('D43：切换到工作区后，锁换成**项目级文件**的版本（同一页面两份文件不许串）', async () => {
+  const harness = createFakeReact()
+  const component = componentFromArtifact(harness.React)
+  const snapshotFor = (scope) =>
+    snapshotOf({
+      scope,
+      projectFile: snapshotFile(
+        'project',
+        'ok',
+        { PreToolUse: [{ rawIndex: 0, matcher: 'pwsh', hooks: [snapshotHook(0, 'echo p')] }] },
+        { version: 'p-v3' },
+      ),
+      userFile: snapshotFile('user', 'ok', {}, { version: 'u-v9' }),
+    })
+  const first = await renderSection(component, harness, (url) => ({
+    ok: true,
+    data: snapshotFor(String(url).includes('scope=workspace') ? 'w-1' : 'user'),
+  }))
+
+  const atWs = await pickScopeOption(first, component, harness, 'w-1')
+  const calls = []
+  globalThis.fetch = async (_url, options = {}) => {
+    const method = options.method ?? 'GET'
+    calls.push({ method, body: typeof options.body === 'string' ? JSON.parse(options.body) : null })
+    return {
+      json: async () =>
+        method === 'POST'
+          ? { ok: true, data: { file: 'project', version: 'p-v4' } }
+          : { ok: true, data: snapshotFor('w-1') },
+    }
+  }
+  switchNode(atWs).onClick()
+  await new Promise((resolve) => setTimeout(resolve, 0))
+  await new Promise((resolve) => setTimeout(resolve, 0))
+  assert.equal(calls[0].body.file, 'project', '前提：切换后写的是项目级那一份')
+  assert.equal(calls[0].body.expectedVersion, 'p-v3', '★ 锁必须跟着**目标文件**换，不能还是 u-v9')
+})
+
+//#endregion
+
+//#region D44–D45. 跑不了的东西必须有归属（不许说成"我没有配置"）
+
+/**
+ * 从**文件内容**造一份快照：真解析器 → 真快照（06 复查时补的）。
+ *
+ * 为什么必须这样：D44/D45 原先把 `rejected` 直接塞进 fixture，于是"解析器不给被拒组留记录"
+ * 这个**真 bug** 在渲染断言里完全看不见 —— 页面显示"文件里还没有任何 hook"，断言照样绿。
+ * 现在这条路是 `parseHookConfig(文件内容)` → `buildSnapshot(...)`，与宿主侧同一条。
+ */
+function snapshotFromRaw(raw) {
+  const parsed = parseHookConfig(raw)
+  return buildSnapshot(
+    emptyInspection({
+      writable: true,
+      projectRoot: 'D:/p',
+      scope: scopeView({ projectRoot: 'D:/p' }),
+      sources: [sourceInspection('project', parsed.groups, { rejected: parsed.rejected, skipped: parsed.skipped })],
+    }),
+  )
+}
+
+await test('D44：被拒的组渲染成灰化的「不会运行」行（带原因），且不提供试运行', async () => {
+  const harness = createFakeReact()
+  const component = componentFromArtifact(harness.React)
+  // ★ 走真解析器：matcher 少一个右括号 —— 这一组照样**记下来**、但一条都不跑。
+  const snapshot = snapshotFromRaw({
+    hooks: {
+      PreToolUse: [
+        {
+          matcher: '(',
+          hooks: [
+            { type: 'command', command: 'echo a' },
+            { type: 'command', command: 'echo b' },
+          ],
+        },
+      ],
+    },
+  })
+  const nodes = await renderSection(component, harness, { ok: true, data: snapshot })
+
+  assert.equal(allByClass(nodes, 'dsh-hooks__hookcard').length, 1, '跑不了的那一组也要占一行（不许凭空消失）')
+  const joined = joinedText(nodes)
+  assert.ok(joined.includes('不会运行'), '例外态要看得见')
+  assert.ok(joined.includes('匹配范围'), `要说清原因（匹配范围不合法）：${joined}`)
+  assert.ok(!joined.includes('还没有任何 hook'), '★ 文件里有内容，绝不许可说成"还没有任何 hook"')
+
+  // 那一行**不给试运行**：它根本不会运行，跑它只会得到一句假话。
+  const menu = await openCardMenu(nodes, component, harness)
+  const titles = allByClass(menu, 'dsh-hooks__btn').map((node) => node.title)
+  assert.ok(!titles.includes('试运行'), `被拒的组不许提供试运行（现有动作：${titles.join('/')}）`)
+  // 但它必须**能被修好**：改匹配范围是让这一组活过来的唯一入口（07 票）。
+  assert.ok(
+    menu.some((node) => typeof node.title === 'string' && node.title === '改匹配范围'),
+    '被拒的组必须能就地改匹配范围（否则用户只能去手改 JSON）',
+  )
+})
+
+await test('D45：全都跑不了（全是不支持的类型）时给出条数，而不是"文件里还没有任何 hook"', async () => {
+  const harness = createFakeReact()
+  const component = componentFromArtifact(harness.React)
+  // ★ 06 复查抓到的真形态：三行 `type:"prompt"` —— 以前这种文件一条记录都不留，
+  //   于是条数说"另有 3 条跑不了"，正文却说"文件里还没有任何 hook"（自相矛盾）。
+  const snapshot = snapshotFromRaw({
+    hooks: {
+      Stop: [
+        {
+          hooks: [
+            { type: 'prompt', prompt: 'a' },
+            { type: 'prompt', prompt: 'b' },
+            { type: 'prompt', prompt: 'c' },
+          ],
+        },
+      ],
+    },
+  })
+  const nodes = await renderSection(component, harness, { ok: true, data: snapshot })
+  const joined = joinedText(nodes)
+  assert.ok(joined.includes('3'), `要说得出"文件里有 3 条"：${joined}`)
+  assert.ok(joined.includes('跑不了'), '要说得出它们跑不了')
+  assert.ok(joined.includes('不会运行'), '并且它们必须各有一行灰化的归属（不是只剩一句话）')
+  assert.ok(!joined.includes('文件里还没有任何 hook'), '★ 这里正是 v4 的撒谎点：文件里有 3 条，只是我们跑不了')
+  assert.ok(!joined.includes('这个作用域还没有 hook'), '空状态块整块都不该出现（它不是"空"）')
+})
+
+//#endregion
+
+//#region D46–D50. 能改的东西：匹配范围 / 超时 / 顺序 / 整组
+
+await test('D46：⋯ 里能改匹配范围与超时（就地编辑 → 发 setGroupMatcher / setHookTimeout）', async () => {
+  const harness = createFakeReact()
+  const component = componentFromArtifact(harness.React)
+  const snapshot = snapshotOf({
+    scope: 'user',
+    userFile: snapshotFile('user', 'ok', {
+      PreToolUse: [{ rawIndex: 0, matcher: 'pwsh', hooks: [snapshotHook(0, 'echo a')] }],
+    }),
+  })
+  const nodes = await renderSection(component, harness, { ok: true, data: snapshot })
+  const calls = []
+  /** 只数 POST：advance() 会重跑 effect，GET 也会进 calls。 */
+  const posts = () => calls.filter((call) => call.method === 'POST')
+  globalThis.fetch = async (_url, options = {}) => {
+    const method = options.method ?? 'GET'
+    calls.push({ method, body: typeof options.body === 'string' ? JSON.parse(options.body) : null })
+    return {
+      json: async () =>
+        method === 'POST' ? { ok: true, data: { file: 'user', version: 'v2' } } : { ok: true, data: snapshot },
+    }
+  }
+
+  // ① 匹配范围：点开 → 输入框里是当前值 → 改 → 保存
+  const opened = await openCardMenu(nodes, component, harness)
+  menuFieldButton(opened, '改匹配范围').onClick()
+  const editing = await advance(component, harness)
+  const input = firstByClass(editing, 'dsh-hooks__input')
+  assert.equal(input.value, 'pwsh', '就地编辑要预填当前值（不然等于让人重打一遍）')
+  assert.equal(input.autoFocus, true, '★ 进入编辑态焦点要落在输入框（17 票）')
+  input.onChange({ target: { value: 'bash' } })
+  const typed = await advance(component, harness)
+  buttonByLabel(typed, '保存').onClick()
+  await new Promise((resolve) => setTimeout(resolve, 0))
+  await new Promise((resolve) => setTimeout(resolve, 0))
+  assert.deepEqual(
+    withoutLock(posts()[0].body),
+    { file: 'user', op: 'setGroupMatcher', event: 'PreToolUse', groupIndex: 0, matcher: 'bash' },
+    '改匹配范围 = 一次定点写（matcher 属于 group）',
+  )
+
+  // ② 超时：同一套编辑，落点是 hook 上的 timeout
+  calls.length = 0
+  const re2 = createFakeReact()
+  const c2 = componentFromArtifact(re2.React)
+  const nodes2 = await renderSection(c2, re2, { ok: true, data: snapshot })
+  globalThis.fetch = async (_url, options = {}) => {
+    const method = options.method ?? 'GET'
+    calls.push({ method, body: typeof options.body === 'string' ? JSON.parse(options.body) : null })
+    return {
+      json: async () =>
+        method === 'POST' ? { ok: true, data: { file: 'user', version: 'v3' } } : { ok: true, data: snapshot },
+    }
+  }
+  const opened2 = await openCardMenu(nodes2, c2, re2)
+  menuFieldButton(opened2, '改超时秒数').onClick()
+  const editing2 = await advance(c2, re2)
+  const input2 = firstByClass(editing2, 'dsh-hooks__input')
+  assert.equal(input2.value, '', '没写 timeout 时输入框是空的（留空 = 默认）')
+  input2.onChange({ target: { value: '30' } })
+  const typed2 = await advance(c2, re2)
+  buttonByLabel(typed2, '保存').onClick()
+  await new Promise((resolve) => setTimeout(resolve, 0))
+  await new Promise((resolve) => setTimeout(resolve, 0))
+  assert.deepEqual(withoutLock(posts()[0].body), {
+    file: 'user',
+    op: 'setHookTimeout',
+    event: 'PreToolUse',
+    groupIndex: 0,
+    hookIndex: 0,
+    timeoutSec: 30,
+  })
+})
+
+await test('D47：匹配范围写错时就地拦住（保存禁用 + 说明），不发请求', async () => {
+  const harness = createFakeReact()
+  const component = componentFromArtifact(harness.React)
+  const snapshot = snapshotOf({
+    scope: 'user',
+    userFile: snapshotFile('user', 'ok', {
+      PreToolUse: [{ rawIndex: 0, matcher: 'pwsh', hooks: [snapshotHook(0, 'echo a')] }],
+    }),
+  })
+  const nodes = await renderSection(component, harness, { ok: true, data: snapshot })
+  const calls = []
+  /** 只数 POST：advance() 会重跑 effect，GET 也会进 calls。 */
+  const posts = () => calls.filter((call) => call.method === 'POST')
+  globalThis.fetch = async (_url, options = {}) => {
+    const method = options.method ?? 'GET'
+    calls.push({ method })
+    return { json: async () => (method === 'POST' ? { ok: true, data: {} } : { ok: true, data: snapshot }) }
+  }
+  const opened = await openCardMenu(nodes, component, harness)
+  menuFieldButton(opened, '改匹配范围').onClick()
+  const editing = await advance(component, harness)
+  firstByClass(editing, 'dsh-hooks__input').onChange({ target: { value: '(' } })
+  const broken = await advance(component, harness)
+  assert.equal(buttonByLabel(broken, '保存').disabled, true, '★ 非法 matcher 时保存必须禁用')
+  assert.ok(joinedText(broken).includes('invalid regex'), '要就地说明哪里不合法（与宿主同一份判定）')
+  assert.equal(posts().length, 0, '非法时一个请求都不许发')
+})
+
+await test('D48：不看匹配范围的事件（提示词提交 / 停止）不给"改匹配范围"入口', async () => {
+  const harness = createFakeReact()
+  const component = componentFromArtifact(harness.React)
+  const snapshot = snapshotOf({
+    scope: 'user',
+    userFile: snapshotFile('user', 'ok', {
+      Stop: [{ rawIndex: 0, matcher: null, hooks: [snapshotHook(0, 'echo s')] }],
+    }),
+  })
+  const nodes = await renderSection(component, harness, { ok: true, data: snapshot })
+  const opened = await openCardMenu(nodes, component, harness)
+  assert.ok(
+    !opened.some((node) => typeof node.title === 'string' && node.title === '改匹配范围'),
+    '★ Stop 的 matcher 会被协议丢弃 —— 给它编辑入口就是让用户白改',
+  )
+  assert.equal(
+    opened.some((node) => typeof node.title === 'string' && node.title === '改超时秒数'),
+    true,
+    '超时仍然可改（它与 matcher 无关）',
+  )
+})
+
+await test('D49：上移 / 下移 —— 边界禁用，点击带的是**文件里的**目标下标', async () => {
+  const harness = createFakeReact()
+  const component = componentFromArtifact(harness.React)
+  const snapshot = snapshotOf({
+    scope: 'user',
+    userFile: snapshotFile('user', 'ok', {
+      PreToolUse: [
+        {
+          rawIndex: 0,
+          matcher: 'pwsh',
+          hooks: [snapshotHook(0, 'echo a'), snapshotHook(3, 'echo b'), snapshotHook(4, 'echo c')],
+        },
+      ],
+    }),
+  })
+  const nodes = await renderSection(component, harness, { ok: true, data: snapshot })
+  // 第二条（b）的 rawIndex 是 3 —— 上移的目标必须是 0（a 的文件下标），不是 2。
+  const second = await openCardMenu(nodes, component, harness, 1)
+  const up = menuFieldButton(second, '上移')
+  const down = menuFieldButton(second, '下移')
+  assert.equal(up.disabled, false, '中间那条两个方向都可用')
+  assert.equal(down.disabled, false)
+
+  const calls = []
+  /** 只数 POST：advance() 会重跑 effect，GET 也会进 calls。 */
+  const posts = () => calls.filter((call) => call.method === 'POST')
+  globalThis.fetch = async (_url, options = {}) => {
+    const method = options.method ?? 'GET'
+    calls.push({ method, body: typeof options.body === 'string' ? JSON.parse(options.body) : null })
+    return { json: async () => (method === 'POST' ? { ok: true, data: {} } : { ok: true, data: snapshot }) }
+  }
+  up.onClick()
+  await new Promise((resolve) => setTimeout(resolve, 0))
+  await new Promise((resolve) => setTimeout(resolve, 0))
+  assert.deepEqual(withoutLock(posts()[0].body), {
+    file: 'user',
+    op: 'moveHook',
+    event: 'PreToolUse',
+    groupIndex: 0,
+    hookIndex: 3,
+    direction: -1,
+    toIndex: 0,
+  })
+
+  // 第一条的上移、最后一条的下移都禁用（不发请求）
+  const firstRow = await openCardMenu(nodes, component, harness, 0)
+  assert.equal(menuFieldButton(firstRow, '上移').disabled, true, '第一条不能再往上')
+})
+
+await test('D50：删除整组走两步确认；新建时可**追加到已有组**（addHook，不新开组）', async () => {
+  const harness = createFakeReact()
+  const component = componentFromArtifact(harness.React)
+  const snapshot = snapshotOf({
+    scope: 'user',
+    userFile: snapshotFile('user', 'ok', {
+      PreToolUse: [{ rawIndex: 0, matcher: 'pwsh', hooks: [snapshotHook(0, 'echo a')] }],
+    }),
+  })
+  const nodes = await renderSection(component, harness, { ok: true, data: snapshot })
+  const calls = []
+  /** 只数 POST：advance() 会重跑 effect，GET 也会进 calls。 */
+  const posts = () => calls.filter((call) => call.method === 'POST')
+  globalThis.fetch = async (_url, options = {}) => {
+    const method = options.method ?? 'GET'
+    calls.push({ method, body: typeof options.body === 'string' ? JSON.parse(options.body) : null })
+    return { json: async () => (method === 'POST' ? { ok: true, data: {} } : { ok: true, data: snapshot }) }
+  }
+
+  // ① 删除整组：第一步只改状态，第二步才发请求
+  const opened = await openCardMenu(nodes, component, harness)
+  buttonByLabel(opened, '删除整组').onClick()
+  const asked = await advance(component, harness)
+  assert.equal(posts().length, 0, '★ 第一步不许发请求（删除是唯一丢数据的操作）')
+  assert.ok(joinedText(asked).includes('删除这一组'), '要问一次')
+  buttonByLabel(asked, '确认删除整组').onClick()
+  await new Promise((resolve) => setTimeout(resolve, 0))
+  await new Promise((resolve) => setTimeout(resolve, 0))
+  assert.deepEqual(withoutLock(posts()[0].body), {
+    file: 'user',
+    op: 'removeGroup',
+    event: 'PreToolUse',
+    groupIndex: 0,
+  })
+
+  // ② 新建表单的落点选"已有组" → 发 addHook（带 groupIndex），而不是 addGroup
+  calls.length = 0
+  const h2 = createFakeReact()
+  const c2 = componentFromArtifact(h2.React)
+  const nodes2 = await renderSection(c2, h2, { ok: true, data: snapshot })
+  globalThis.fetch = async (_url, options = {}) => {
+    const method = options.method ?? 'GET'
+    calls.push({ method, body: typeof options.body === 'string' ? JSON.parse(options.body) : null })
+    return { json: async () => (method === 'POST' ? { ok: true, data: {} } : { ok: true, data: snapshot }) }
+  }
+  const form = await openNewForm(nodes2, c2, h2)
+  /** 从当前节点里找"加到"那个下拉（它挂在 `__newfield--group` 容器下，与事件下拉是两个控件）。 */
+  const groupSelectOf = (nodes) => {
+    const field = firstByClass(nodes, 'dsh-hooks__newfield--group')
+    const select = nodes.find((node) => node.parentClass === field.className && node.tag === 'select')
+    assert.ok(select !== undefined, '表单里应当有一个"加到"下拉（与事件下拉分开）')
+    return select
+  }
+  assert.equal(groupSelectOf(form).value, '', '缺省是"新开一组"')
+  // 命令是**多行编辑器**（`__editor`），不是 `__input`（那是匹配范围 / 超时那种单行框）。
+  firstByClass(form, 'dsh-hooks__editor').onChange({ target: { value: 'echo new' } })
+  const filled = await advance(c2, h2)
+  // 输入之后必须**重新查节点**（§4.5：事件闭包是当次渲染的）
+  groupSelectOf(filled).onChange({ target: { value: '0' } })
+  const chosen = await advance(c2, h2)
+  buttonByLabel(chosen, '创建').onClick()
+  await new Promise((resolve) => setTimeout(resolve, 0))
+  await new Promise((resolve) => setTimeout(resolve, 0))
+  assert.equal(posts()[0].body.op, 'addHook', '★ 选了已有组就必须追加，不许新开一组')
+  assert.equal(posts()[0].body.groupIndex, 0)
+  assert.equal(posts()[0].body.command, 'echo new')
+})
+
+//#endregion
+
+//#region D51–D57. 时间证据 / 生效视图 / 输出可读 / 预算 / 搜索 / 可达性 / 分节
+
+await test('D51：状态带"多久之前"；诊断里写明状态只记本次进程', async () => {
+  const harness = createFakeReact()
+  const component = componentFromArtifact(harness.React)
+  const threeMinutesAgo = Date.now() - 3 * 60_000
+  const snapshot = snapshotOf({
+    scope: 'user',
+    userFile: snapshotFile('user', 'ok', {
+      PreToolUse: [
+        {
+          rawIndex: 0,
+          matcher: 'pwsh',
+          hooks: [
+            snapshotHook(0, 'echo a', {
+              lastRun: { at: threeMinutesAgo, exitCode: 0, decision: 'pass', durationMs: 12, stdout: '', stderr: '' },
+            }),
+          ],
+        },
+      ],
+    }),
+  })
+  const nodes = await renderSection(component, harness, { ok: true, data: snapshot })
+  assert.ok(!joinedText(nodes).includes('分钟前'), '首屏仍然只有一个状态词（时间证据进 ⋯）')
+
+  const opened = await openCardMenu(nodes, component, harness)
+  const text = joinedText(opened)
+  assert.ok(text.includes('3 分钟前'), `★ 要看得出"这是三分钟前的通过"：${text}`)
+  assert.ok(text.includes('exit 0'), '与退出码放在同一处')
+  assert.ok(text.includes('12ms'), '与耗时放在同一处')
+
+  const more = await expandFold(opened, component, harness, '更多')
+  assert.ok(joinedText(more).includes('只记录本次进程'), '★ 必须说明台账是进程级记忆（重启后回到「未运行」）')
+})
+
+await test('D52：生效视图 —— 按执行顺序列出用户级 / 项目级，条数口径两侧之和等于总数', async () => {
+  const harness = createFakeReact()
+  const component = componentFromArtifact(harness.React)
+  const group = (file, matcher, hooks) => ({
+    file,
+    rawIndex: 0,
+    matcher,
+    matcherOk: true,
+    matcherProblem: null,
+    hooks,
+  })
+  const events = HOOK_EVENTS.map((event) =>
+    event === 'PreToolUse'
+      ? {
+          event,
+          groups: [
+            group('user', 'pwsh', [snapshotHook(0, 'echo u')]),
+            group('project', null, [snapshotHook(0, 'echo p1'), snapshotHook(1, 'echo p2')]),
+          ],
+          hookCount: 3,
+          disabledCount: 0,
+          fromUser: 1,
+          fromProject: 2,
+          runCount: 0,
+        }
+      : { event, groups: [], hookCount: 0, disabledCount: 0, fromUser: 0, fromProject: 0, runCount: 0 },
+  )
+  const snapshot = snapshotOf({ scope: 'user', events })
+  const nodes = await renderSection(component, harness, { ok: true, data: snapshot })
+  const more = await expandFold(nodes, component, harness, '更多')
+  const text = joinedText(more)
+
+  assert.ok(text.includes('生效配置'), '有一节叫「生效配置」')
+  assert.ok(text.includes('3 条（用户级 1 + 项目级 2）'), `★ 两侧之和必须等于总数：${text}`)
+  assert.ok(text.includes('用户级 · 匹配 pwsh · 1 条'), '用户级那组要说出来源 / 匹配范围 / 条数')
+  assert.ok(text.includes('项目级 · 匹配全部 · 2 条'), '项目级那组同样')
+  // 顺序即执行顺序：用户级在前（宿主合并语义）
+  assert.ok(
+    text.indexOf('用户级 · 匹配 pwsh') < text.indexOf('项目级 · 匹配全部'),
+    '★ 顺序必须是用户级在前、项目级在后（那就是实际执行顺序）',
+  )
+})
+
+await test('D53：试运行的长输出被截断并可展开（不再把整张卡撑成一片糊字）', async () => {
+  const harness = createFakeReact()
+  const component = componentFromArtifact(harness.React)
+  const snapshot = snapshotOf({
+    scope: 'user',
+    userFile: snapshotFile('user', 'ok', {
+      PreToolUse: [{ rawIndex: 0, matcher: 'pwsh', hooks: [snapshotHook(0, 'echo a')] }],
+    }),
+  })
+  const first = await renderSection(component, harness, { ok: true, data: snapshot })
+  const opened = await openCardMenu(first, component, harness)
+  const long = `HEAD-${'x'.repeat(1200)}-TAIL`
+  const drySnapshot = { ok: true, data: snapshot }
+  globalThis.fetch = async (_url, options = {}) => ({
+    json: async () =>
+      (options.method ?? 'GET') === 'POST'
+        ? {
+            ok: true,
+            data: {
+              run: { command: 'echo a', exitCode: 0, decision: 'pass', durationMs: 3, stdout: long, stderr: '' },
+            },
+          }
+        : drySnapshot,
+  })
+  buttonByLabel(opened, '试运行').onClick()
+  await new Promise((resolve) => setTimeout(resolve, 0))
+  await new Promise((resolve) => setTimeout(resolve, 0))
+  const after = await advance(component, harness)
+  const dry = firstByClass(after, 'dsh-hooks__dry')
+  const summary = textOfClass(after, 'dsh-hooks__drysummary')
+  assert.ok(summary.includes('已截断'), `★ 超长输出要留"已截断"标记：${summary.slice(0, 80)}`)
+  assert.ok(summary.length < 600, `摘要必须有上限（实际 ${summary.length} 字符）`)
+  assert.ok(joinedText(after).includes('查看全文'), '被截断时给得到全文的入口')
+  assert.equal(allByClass(after, 'dsh-hooks__drytext').length, 1, '全文用 pre 块呈现')
+  assert.equal(dry.role, 'status', '异步结论要播报（role=status）')
+})
+
+await test('D54：写失败之后页面还能继续操作（时间预算不会把整页永久冻住）', async () => {
+  const harness = createFakeReact()
+  const component = componentFromArtifact(harness.React)
+  const snapshot = snapshotOf({
+    scope: 'user',
+    userFile: snapshotFile('user', 'ok', {
+      PreToolUse: [{ rawIndex: 0, matcher: 'pwsh', hooks: [snapshotHook(0, 'echo a')] }],
+    }),
+  })
+  const nodes = await renderSection(component, harness, { ok: true, data: snapshot })
+  globalThis.fetch = async (_url, options = {}) => {
+    if ((options.method ?? 'GET') === 'POST') {
+      const aborted = new Error('The operation was aborted')
+      aborted.name = 'AbortError'
+      throw aborted
+    }
+    return { json: async () => ({ ok: true, data: snapshot }) }
+  }
+  switchNode(nodes).onClick()
+  await new Promise((resolve) => setTimeout(resolve, 0))
+  await new Promise((resolve) => setTimeout(resolve, 0))
+  const after = await advance(component, harness)
+  assert.ok(joinedText(after).includes('太久没有回应'), `★ 超时要有一句自己的话：${joinedText(after)}`)
+  assert.equal(switchNode(after).disabled, false, '★ 失败之后开关必须重新可用（否则整页永久冻住）')
+  assert.equal(toolButton(after, '刷新').disabled, false, '工具条也要恢复可用')
+})
+
+await test('D55：搜索匹配"页面上的字"（中文事件名 / 状态词 / 已停用）', async () => {
+  const harness = createFakeReact()
+  const component = componentFromArtifact(harness.React)
+  const snapshot = snapshotOf({
+    scope: 'user',
+    userFile: snapshotFile('user', 'ok', {
+      PreToolUse: [
+        {
+          rawIndex: 0,
+          matcher: 'pwsh',
+          hooks: [
+            snapshotHook(0, 'echo ok', {
+              lastRun: { at: 1, exitCode: 0, decision: 'pass', durationMs: 1, stdout: '', stderr: '' },
+            }),
+            snapshotHook(1, 'echo bad', {
+              lastRun: { at: 2, exitCode: 1, decision: 'pass', durationMs: 1, stdout: '', stderr: 'boom' },
+            }),
+            snapshotHook(2, 'echo off', { disabled: true }),
+            snapshotHook(3, 'echo x'),
+            snapshotHook(4, 'echo y'),
+          ],
+        },
+      ],
+    }),
+  })
+  const nodes = await renderSection(component, harness, { ok: true, data: snapshot })
+  const search = firstByClass(nodes, 'dsh-hooks__search')
+
+  const byLabel = async (word) => {
+    const fresh = await renderSection(component, harness, { ok: true, data: snapshot })
+    firstByClass(fresh, 'dsh-hooks__search').onChange({ target: { value: word } })
+    const filtered = await advance(component, harness)
+    return allByClass(filtered, 'dsh-hooks__hookcard').length
+  }
+
+  assert.ok(joinedText(nodes).includes('工具运行前'), '前提：页面上的事件名是中文')
+  assert.equal(await byLabel('工具运行前'), 5, '★ 按中文事件名能搜到全部 5 条')
+  assert.equal(await byLabel('已停用'), 1, '★ 按"已停用"能搜到那一条')
+  assert.equal(await byLabel('失败'), 1, '★ 按状态词"失败"能搜到那一条')
+  assert.equal(await byLabel('没有这个词'), 0, '反向：不存在的词得到 0 条')
+  assert.ok(search !== undefined)
+})
+
+await test('D56：可达性 —— 播报、开关的名字、listbox 的高亮指认、表单首个字段的焦点', async () => {
+  const harness = createFakeReact()
+  const component = componentFromArtifact(harness.React)
+  const snapshot = snapshotOf({
+    scope: 'user',
+    userFile: snapshotFile('user', 'ok', {
+      PreToolUse: [{ rawIndex: 0, matcher: 'pwsh', hooks: [snapshotHook(0, 'echo alpha')] }],
+    }),
+  })
+  const nodes = await renderSection(component, harness, { ok: true, data: snapshot })
+
+  // ① 开关的可访问名能分辨"是哪一条"
+  const sw = switchNode(nodes)
+  assert.ok(
+    typeof sw.ariaLabel === 'string' && sw.ariaLabel.includes('工具运行前') && sw.ariaLabel.includes('echo alpha'),
+    `开关必须有能分辨身份的名字：${String(sw.ariaLabel)}`,
+  )
+
+  // ② 作用域 popover：listbox 必须指认高亮项，且那一项真的有 id
+  const opened = await openScopePicker(nodes, component, harness)
+  const listbox = firstByClass(opened, 'dsh-hooks__popover')
+  assert.equal(listbox.role, 'listbox')
+  assert.equal(listbox.ariaActiveDescendant, 'dsh-hooks-scope-0', '★ aria-activedescendant 必须指到高亮项')
+  assert.ok(
+    opened.some((node) => node.id === 'dsh-hooks-scope-0'),
+    '被指认的 id 必须真的存在（否则读屏指到空处）',
+  )
+
+  // ③ 新建表单：焦点落在第一个可编辑字段（没有真实 DOM，唯一可观察形态就是 autoFocus）
+  const form = await openNewForm(nodes, component, harness)
+  assert.equal(firstByClass(form, 'dsh-hooks__newselect').autoFocus, true, '★ 打开表单时焦点要落在事件下拉')
+})
+
+await test('D57：读取失败走 role="alert"（异步结论要播报）', async () => {
+  const harness = createFakeReact()
+  const component = componentFromArtifact(harness.React)
+  const nodes = await renderSection(component, harness, async () => ({
+    ok: false,
+    error: 'unknown-workspace',
+    detail: '工作区 w-gone 不在宿主的清单里（可能被删过）',
+  }))
+  const alert = firstByClass(nodes, 'dsh-hooks__alert')
+  assert.equal(alert.role, 'alert', '★ 页面级错误必须能播报')
+})
+
+await test('D58：「更多」分成三节（生效配置 / 全部事件 / 诊断），诊断值是人话不是字段名', async () => {
+  const harness = createFakeReact()
+  const component = componentFromArtifact(harness.React)
+  const nodes = await renderSection(component, harness, { ok: true, data: minimalSnapshot() })
+  const more = await expandFold(nodes, component, harness, '更多')
+  const text = joinedText(more)
+
+  const heads = more.filter(
+    (node) => typeof node.className === 'string' && node.className.includes('dsh-hooks__foldhead'),
+  )
+  assert.equal(heads.length, 3, '★ 三节各有一个标题')
+  for (const label of ['生效配置', '全部事件', '诊断']) {
+    assert.ok(text.includes(label), `缺少分节标题「${label}」`)
+  }
+  for (const jargon of ['kind=', 'requested=', 'staleInUse', 'isCurrentSession=']) {
+    assert.ok(!text.includes(jargon), `★ 诊断值不许直出内部字段名「${jargon}」：${text}`)
+  }
+  assert.ok(text.includes('沿用旧配置'), '原先那行内部字段改成了一句人话')
+  assert.ok(text.includes('工作目录来源'), 'cwd 来源也翻成了人话')
+  // 既有的两条可达性断言：7 个事件仍然全在
+  assert.equal(allByClass(more, 'dsh-hooks__eventrow').length, HOOK_EVENTS.length, '7 个事件（含 0 条）仍在')
 })
 
 //#endregion
@@ -3404,8 +4181,9 @@ test('parseHookConfig：非 command handler 跳过并记录', () => {
     },
   })
   assert.deepEqual(r.skipped, [
-    { event: 'PreToolUse', type: 'http' },
-    { event: 'Stop', type: 'prompt' },
+    // 06 票起带**文件下标**与**原因**：页面要能说清"第几组的第几条、为什么跑不了"。
+    { event: 'PreToolUse', type: 'http', groupIndex: 0, hookIndex: 0, reason: 'unsupported-type' },
+    { event: 'Stop', type: 'prompt', groupIndex: 0, hookIndex: 0, reason: 'unsupported-type' },
   ])
   assert.equal(r.groups.PreToolUse[0].hooks.length, 1)
   assert.equal(r.groups.Stop, undefined)
@@ -3715,6 +4493,267 @@ test('F：parseHooksRequest 校验 workspaceId（非字符串 / 空串 / file:us
   const none = parseHooksRequest(base)
   assert.equal(none.ok, true)
   assert.equal('workspaceId' in none.request, false)
+})
+
+test('F：错误码目录 ↔ 用户文案表（每个码都要有自己的一句；缺一即红）', () => {
+  // 前提：未知码确实走兜底分支。不做这一步，"每个码都有专属文案"可以靠"都走兜底"平凡通过。
+  const fallback = writeErrorSentence('__not_a_code__')
+  assert.ok(fallback.includes('__not_a_code__'), '前提：未知码必须走兜底分支')
+
+  // 目录本身必须非空，且两半都在（否则空数组也能让下面的循环空转通过）。
+  assert.ok(HOST_ERROR_CODES.length >= 15, '宿主错误码目录不许缩水（少一个码就等于少一条排查路径）')
+  assert.ok(SENTENCE_ERROR_CODES.includes('network'), '只在浏览器半边产生的码也必须在目录里')
+  assert.ok(SENTENCE_ERROR_CODES.includes('bad-timeout'), '纯前端校验的码也必须在目录里')
+
+  const seen = new Map()
+  for (const code of SENTENCE_ERROR_CODES) {
+    const sentence = writeErrorSentence(code)
+    assert.ok(sentence.length >= 8, `${code} 的文案太短，等于没说：${sentence}`)
+    assert.notEqual(sentence, fallback, `错误码 ${code} 没有专属文案（页面会显示「写入失败（${code}）」这种内部码）`)
+    assert.ok(!sentence.includes(code), `${code} 的文案里不许出现机器码本身：${sentence}`)
+    assert.ok(
+      !seen.has(sentence),
+      `${code} 与 ${seen.get(sentence)} 用了同一句话 —— 页面据此分不清这两种情形：${sentence}`,
+    )
+    seen.set(sentence, code)
+  }
+})
+
+test('F：请求被中止时折成 timeout（永不抛），调用方只需判 ok', async () => {
+  // 15 票的客户端半边：写与试运行都带时间预算，预算用完就 abort —— 这条断言守的是
+  // "abort 不以异常形态冒到调用点"，且被翻译成 `timeout` 而不是 `network`（两者文案与用户
+  // 该做的事不同：前者可重试，后者多半是宿主没起）。
+  const controller = new AbortController()
+  controller.abort()
+  const prevFetch = globalThis.fetch
+  globalThis.fetch = async (_url, options = {}) => {
+    if (options.signal !== undefined && options.signal.aborted) {
+      const aborted = new Error('The operation was aborted')
+      aborted.name = 'AbortError'
+      throw aborted
+    }
+    return { json: async () => ({ ok: true }) }
+  }
+  try {
+    const write = await requestWrite(
+      { file: 'user', op: 'createFile', expectedVersion: null },
+      undefined,
+      controller.signal,
+    )
+    assert.equal(write.ok, false, '被中止不许抛，要折成结果形状')
+    assert.equal(write.error, 'timeout')
+
+    const dry = await requestDryRun(
+      { file: 'user', event: 'PreToolUse', groupIndex: 0, hookIndex: 0 },
+      undefined,
+      controller.signal,
+    )
+    assert.equal(dry.ok, false)
+    assert.equal(dry.error, 'timeout')
+  } finally {
+    globalThis.fetch = prevFetch
+  }
+})
+
+test('F：删掉组里最后一条 hook ⇒ 整组回收（不留空壳），且仍过保留性证明', () => {
+  const doc = {
+    _comment: 'keep me',
+    hooks: {
+      PreToolUse: [
+        { matcher: 'pwsh', hooks: [{ type: 'command', command: 'a' }] },
+        { matcher: 'bash', hooks: [{ type: 'command', command: 'b' }] },
+      ],
+    },
+  }
+  const { doc: next, changes } = applied(doc, {
+    op: 'removeHook',
+    file: 'project',
+    event: 'PreToolUse',
+    groupIndex: 0,
+    hookIndex: 0,
+  })
+  assert.equal(next.hooks.PreToolUse.length, 1, '被删空的那一组必须整组回收 —— 否则文件里留下一个看不见也删不掉的空壳')
+  assert.deepEqual(next.hooks.PreToolUse[0], doc.hooks.PreToolUse[1], '另一组一个字都不许动')
+  assert.equal(next._comment, 'keep me', '未知键原样保留')
+  assert.equal(preservationProblem(doc, next, changes), undefined, '回收空组也必须过保留性证明（两处下标删除）')
+
+  // 反向：组里还有别的 hook ⇒ **不许**顺手回收
+  const two = { hooks: { PreToolUse: [{ hooks: [{ command: 'a' }, { command: 'b' }] }] } }
+  const kept = applied(two, { op: 'removeHook', file: 'project', event: 'PreToolUse', groupIndex: 0, hookIndex: 0 })
+  assert.equal(kept.doc.hooks.PreToolUse.length, 1, '还有内容的组不许被回收')
+  assert.equal(kept.doc.hooks.PreToolUse[0].hooks.length, 1)
+  assert.equal(kept.doc.hooks.PreToolUse[0].hooks[0].command, 'b', '删的是第一条')
+  assert.equal(preservationProblem(two, kept.doc, kept.changes), undefined)
+})
+
+test('F：事件键存在但不是数组 ⇒ 新增类操作拒写 malformed-event（绝不静默覆盖）', () => {
+  const doc = { hooks: { PreToolUse: { oops: 'not an array' } } }
+  const group = applyOp(doc, {
+    file: 'project',
+    op: 'addGroup',
+    event: 'PreToolUse',
+    matcher: null,
+    command: 'echo x',
+    timeoutSec: null,
+  })
+  assert.equal(group.ok, false, '结构坏了就拒写')
+  assert.equal(group.reason, 'malformed-event')
+
+  const hook = applyOp(doc, {
+    file: 'project',
+    op: 'addHook',
+    event: 'PreToolUse',
+    groupIndex: 0,
+    command: 'echo x',
+    timeoutSec: null,
+  })
+  assert.equal(hook.ok, false)
+  assert.equal(hook.reason, 'malformed-event')
+
+  // 反向：事件键**不存在**仍然是合法的"新建"（不许把正常路径也判成畸形）
+  const fresh = applyOp(
+    {},
+    { file: 'project', op: 'addGroup', event: 'Stop', matcher: null, command: 'echo ok', timeoutSec: null },
+  )
+  assert.equal(fresh.ok, true)
+  assert.equal(preservationProblem({}, fresh.applied.doc, fresh.applied.changes), undefined)
+})
+
+test('F：setGroupMatcher / setHookTimeout 只动目标那一个键（其余逐字段相等）', () => {
+  const doc = {
+    _comment: 'keep me',
+    hooks: { PreToolUse: [{ matcher: 'pwsh', hooks: [{ type: 'command', command: 'a', timeout: 30 }] }] },
+  }
+  const setMatcher = applied(doc, {
+    op: 'setGroupMatcher',
+    file: 'project',
+    event: 'PreToolUse',
+    groupIndex: 0,
+    matcher: 'bash',
+  })
+  assert.equal(setMatcher.doc.hooks.PreToolUse[0].matcher, 'bash')
+  assert.equal(setMatcher.doc.hooks.PreToolUse[0].hooks[0].command, 'a', '改 matcher 不许碰命令')
+  assert.equal(setMatcher.doc._comment, 'keep me')
+  assert.equal(preservationProblem(doc, setMatcher.doc, setMatcher.changes), undefined)
+
+  // 清空 = **删键**（回到全匹配），不是写一个空字符串
+  const cleared = applied(doc, {
+    op: 'setGroupMatcher',
+    file: 'project',
+    event: 'PreToolUse',
+    groupIndex: 0,
+    matcher: null,
+  })
+  assert.equal('matcher' in cleared.doc.hooks.PreToolUse[0], false, 'null = 删掉这个键')
+  assert.equal(preservationProblem(doc, cleared.doc, cleared.changes), undefined)
+
+  const setTimeout2 = applied(doc, {
+    op: 'setHookTimeout',
+    file: 'project',
+    event: 'PreToolUse',
+    groupIndex: 0,
+    hookIndex: 0,
+    timeoutSec: 5,
+  })
+  assert.equal(setTimeout2.doc.hooks.PreToolUse[0].hooks[0].timeout, 5)
+  assert.equal(preservationProblem(doc, setTimeout2.doc, setTimeout2.changes), undefined)
+
+  const backToDefault = applied(setTimeout2.doc, {
+    op: 'setHookTimeout',
+    file: 'project',
+    event: 'PreToolUse',
+    groupIndex: 0,
+    hookIndex: 0,
+    timeoutSec: null,
+  })
+  assert.equal('timeout' in backToDefault.doc.hooks.PreToolUse[0].hooks[0], false, 'null = 删键回默认')
+  assert.equal(preservationProblem(setTimeout2.doc, backToDefault.doc, backToDefault.changes), undefined)
+})
+
+test('F：moveHook 用 toIndex 交换（页面上相邻 ≠ 文件里相邻）；边界与原地都拒', () => {
+  const doc = {
+    hooks: {
+      PreToolUse: [
+        {
+          hooks: [
+            { type: 'command', command: 'a' },
+            // 这一条解析时会被跳过（非 command）—— 于是页面上 a 与 b 相邻，文件里隔着它。
+            { type: 'prompt', prompt: 'p' },
+            { type: 'command', command: 'b' },
+          ],
+        },
+      ],
+    },
+  }
+  const moved = applied(doc, {
+    op: 'moveHook',
+    file: 'project',
+    event: 'PreToolUse',
+    groupIndex: 0,
+    hookIndex: 2,
+    direction: -1,
+    toIndex: 0,
+  })
+  assert.deepEqual(
+    moved.doc.hooks.PreToolUse[0].hooks.map((hook) => hook.command ?? hook.type),
+    ['b', 'prompt', 'a'],
+    '★ 换的是 b 与 a（页面上那条邻居），不是与文件里紧邻的 prompt 条互换',
+  )
+  assert.equal(preservationProblem(doc, moved.doc, moved.changes), undefined)
+
+  const outOfRange = applyOp(doc, {
+    file: 'project',
+    op: 'moveHook',
+    event: 'PreToolUse',
+    groupIndex: 0,
+    hookIndex: 2,
+    direction: -1,
+    toIndex: 9,
+  })
+  assert.equal(outOfRange.ok, false)
+  assert.equal(outOfRange.reason, 'out-of-range')
+
+  const same = applyOp(doc, {
+    file: 'project',
+    op: 'moveHook',
+    event: 'PreToolUse',
+    groupIndex: 0,
+    hookIndex: 1,
+    direction: -1,
+    toIndex: 1,
+  })
+  assert.equal(same.ok, false, '原地移动要说"到边界了"，不许静默什么都不做')
+  assert.equal(same.reason, 'out-of-range')
+})
+
+test('F：removeGroup 删整组；addHook 追加到**已有组**末尾（不是新开一组）', () => {
+  const doc = {
+    hooks: {
+      PreToolUse: [
+        { matcher: 'a', hooks: [{ type: 'command', command: 'x' }] },
+        { matcher: 'b', hooks: [{ type: 'command', command: 'y' }] },
+      ],
+    },
+  }
+  const removed = applied(doc, { op: 'removeGroup', file: 'project', event: 'PreToolUse', groupIndex: 0 })
+  assert.equal(removed.doc.hooks.PreToolUse.length, 1)
+  assert.equal(removed.doc.hooks.PreToolUse[0].hooks[0].command, 'y', '删的是第一组')
+  assert.equal(preservationProblem(doc, removed.doc, removed.changes), undefined)
+
+  const appended = applied(doc, {
+    op: 'addHook',
+    file: 'project',
+    event: 'PreToolUse',
+    groupIndex: 1,
+    command: 'z',
+    timeoutSec: 7,
+  })
+  assert.equal(appended.doc.hooks.PreToolUse.length, 2, '不许新开一组')
+  assert.equal(appended.doc.hooks.PreToolUse[1].hooks.length, 2)
+  assert.equal(appended.doc.hooks.PreToolUse[1].hooks[1].command, 'z')
+  assert.equal(appended.doc.hooks.PreToolUse[1].hooks[1].timeout, 7)
+  assert.equal(appended.doc.hooks.PreToolUse[1].matcher, 'b', '沿用那一组的匹配范围')
+  assert.equal(preservationProblem(doc, appended.doc, appended.changes), undefined)
 })
 
 //#endregion
@@ -4234,6 +5273,35 @@ await test('集成：hook 超时是非阻断且快速返回', async () => {
   assert.ok(Date.now() - started < 20000, '超时应当很快返回')
 })
 
+await test('集成：Stop 的 stop_hook_active 说真话（第一次 false，续跑之后 true）', async () => {
+  const dir = await makeProject()
+  const flags = path.join(dir, 'stop-flags.txt')
+  const s = await script(
+    dir,
+    'stopflag.mjs',
+    // ⚠️ .mjs 里**没有** `require`（那是 CommonJS）—— 用 import 语句，别抄模板里的 `node -e` 写法。
+    [
+      "import { appendFileSync } from 'node:fs'",
+      "let stdin = ''",
+      "process.stdin.on('data', (chunk) => { stdin += chunk }).on('end', () => {",
+      '  const payload = JSON.parse(stdin)',
+      `  appendFileSync(${JSON.stringify(flags)}, String(payload.stop_hook_active) + '\\n')`,
+      "  process.stdout.write(JSON.stringify({ decision: 'block', reason: 'again' }))",
+      '})',
+    ].join('\n'),
+  )
+  await writeHooks(dir, { hooks: { Stop: [{ hooks: [{ command: cmd(s) }] }] } })
+  const { agent } = fakeAgent(dir)
+  const h = await mount()
+  const handler = h.listeners.get('agent/turn-stopping')[0]
+  for (let i = 0; i < 3; i++) await handler({ agent, turn: i + 1, signal: undefined })
+
+  // ★ 官方语义：`stop_hook_active` = "这一轮已经被 Stop hook 续跑过"。
+  // 以前它恒为 false —— 按官方语义写的防死循环逻辑（看到 true 就放行）在我们这里永远不触发。
+  const seen = fs.readFileSync(flags, 'utf8').trim().split('\n')
+  assert.deepEqual(seen, ['false', 'true', 'true'], `hook 实际收到的值：${JSON.stringify(seen)}`)
+})
+
 await test('集成：stdin payload 形状与 DSH_PROJECT_DIR 环境变量', async () => {
   const dir = await makeProject()
   const s = await script(
@@ -4579,6 +5647,81 @@ await test('fail-open：hooks.json 写坏后必须继续沿用上一份可用配
     assert.ok(
       h.logs.some((e) => e.level === 'info' && /沿用上一份可用配置/.test(e.message)),
       '沿用旧配置这件事必须留痕，否则宿主日志里看不出"为什么改的配置没生效"',
+    )
+  })
+})
+
+await test('fail-open：只有坏掉的那一侧回退 —— 另一侧的新改动必须照常生效', async () => {
+  await withIsolatedHome(async () => {
+    const dir = await makeProject()
+    const guard = await script(dir, 'guard.mjs', `process.stderr.write('project guard');process.exit(2)`)
+    const stopV1 = await script(
+      dir,
+      'stop-v1.mjs',
+      `process.stdout.write(JSON.stringify({decision:'block',reason:'v1'}))`,
+    )
+    const stopV2 = await script(
+      dir,
+      'stop-v2.mjs',
+      `process.stdout.write(JSON.stringify({decision:'block',reason:'v2'}))`,
+    )
+    // 项目级：一条 PreToolUse 守卫（坏掉之后必须仍然从 last-good 拦住）。
+    await writeHooks(dir, { hooks: { PreToolUse: [{ matcher: 'pwsh', hooks: [{ command: cmd(guard) }] }] } })
+    // 用户级：一条 Stop（稍后改成 v2 —— 它必须**不受**项目级坏掉的影响）。
+    const userFile = path.join(process.env.DSH_HOME, 'hooks.json')
+    await fsp.writeFile(
+      userFile,
+      JSON.stringify({ hooks: { Stop: [{ hooks: [{ type: 'command', command: cmd(stopV1) }] }] } }),
+      'utf8',
+    )
+
+    const { agent, steered } = fakeAgent(dir)
+    const { h, invalidate } = await mountCaptured()
+
+    // 基线：两侧都读到（这一次会写下 last-good）。
+    await h.listeners.get('tools/pre-execute')[0]({ name: 'pwsh', arguments: {}, callId: 'c', agent }, nextAllow)
+    await h.listeners.get('agent/turn-stopping')[0]({ agent, turn: 1, signal: undefined })
+    assert.equal(steered[0].content[0].text, 'v1', '基线：用户级 Stop 是 v1')
+
+    // 现在：项目级写坏，同时用户级改成 v2。
+    await fsp.writeFile(path.join(dir, '.dsh', 'hooks.json'), '{"hooks": {"PreToolUse": [', 'utf8')
+    await fsp.writeFile(
+      userFile,
+      JSON.stringify({ hooks: { Stop: [{ hooks: [{ type: 'command', command: cmd(stopV2) }] }] } }),
+      'utf8',
+    )
+    invalidate()
+
+    // ① 坏掉的那一侧照旧拦住（last-good）
+    const denied = await h.listeners.get('tools/pre-execute')[0](
+      { name: 'pwsh', arguments: {}, callId: 'c2', agent },
+      nextAllow,
+    )
+    assert.equal(denied.kind, 'deny', '坏掉的项目级必须继续沿用 last-good —— 守卫不许消失')
+    assert.equal(denied.reason, 'project guard')
+
+    // ② 好着的那一侧**用新的**（这正是 11 票要修的：以前会被连带回退成 v1）
+    steered.length = 0
+    await h.listeners.get('agent/turn-stopping')[0]({ agent, turn: 2, signal: undefined })
+    assert.equal(steered[0].content[0].text, 'v2', '★ 项目级坏掉不该连累用户级：用户级刚改的 v2 必须生效')
+
+    // ③ 两侧都坏 ⇒ 两侧**都**回退到各自的 last-good（这条兜底路径也必须被断言，
+    //    否则"按侧回退"可能悄悄退化成"哪侧都不回退"）。
+    await fsp.writeFile(userFile, '{"hooks": {', 'utf8')
+    await fsp.writeFile(path.join(dir, '.dsh', 'hooks.json'), '{"hooks": {', 'utf8')
+    invalidate()
+    const bothBroken = await h.listeners.get('tools/pre-execute')[0](
+      { name: 'pwsh', arguments: {}, callId: 'c3', agent },
+      nextAllow,
+    )
+    assert.equal(bothBroken.kind, 'deny', '两侧都坏时，项目级的守卫仍然来自 last-good')
+    assert.equal(bothBroken.reason, 'project guard')
+    steered.length = 0
+    await h.listeners.get('agent/turn-stopping')[0]({ agent, turn: 3, signal: undefined })
+    assert.equal(
+      steered[0]?.content[0].text,
+      'v1',
+      '★ 两侧都坏时用户级也回到它自己的 last-good（v1）—— 不许变成"一条都没有"',
     )
   })
 })
@@ -4979,6 +6122,7 @@ function sourceInspection(kind, groups, overrides = {}) {
     version: 'v1',
     groups,
     skipped: [],
+    rejected: [],
     matcherErrors: [],
     ...overrides,
   }
@@ -5051,7 +6195,7 @@ await test('P：快照恒为 7 个事件（含 0 条），顺序即事件表顺�
     snapshot.events.every((event) => event.hookCount === 0 && event.groups.length === 0),
     '没有配置时每个事件都应当是 0 条、0 组',
   )
-  assert.deepEqual(snapshot.total, { hookCount: 0, disabledCount: 0, groupCount: 0 })
+  assert.deepEqual(snapshot.total, { hookCount: 0, disabledCount: 0, groupCount: 0, unrunnable: 0 })
 })
 
 await test('P：快照把 disabled 单独计数（不许把"已停用"算成"在跑"）', () => {
@@ -5075,13 +6219,72 @@ await test('P：快照把 disabled 单独计数（不许把"已停用"算成"在
   assert.equal(pre.groups[0].hooks[0].timeoutSec, null, '未写就是 null，不要编一个数字')
 })
 
-await test('P：非法 matcher 在快照里被标出来（可分别说清，而不是静默消失）', () => {
-  const groups = { PreToolUse: [{ matcher: '(', hooks: [{ command: 'a' }] }] }
-  const snapshot = buildSnapshot(emptyInspection({ effective: groups }))
-  const pre = snapshot.events.find((event) => event.event === 'PreToolUse')
-  assert.equal(pre.groups.length, 1, '页面要能看见这个 group，才能告诉用户它为什么不跑')
-  assert.equal(pre.groups[0].matcherOk, false)
-  assert.ok(pre.groups[0].matcherProblem.includes('invalid regex matcher'))
+await test('P：非法 matcher 走**真解析器** → rejected 非空、可运行集合为空（页面据此说清为什么）', () => {
+  // ⚠️ 这条以前喂的是**手工构造的 ParsedGroups**，而真实链路上 `parseHookConfig` 会把非法 matcher 的
+  // 组直接丢掉 —— 于是断言永远是绿的，页面却什么也看不到（"平凡通过的断言"）。现在从**文件内容**出发。
+  const raw = { hooks: { PreToolUse: [{ matcher: '(', hooks: [{ type: 'command', command: 'a' }] }] } }
+  const parsed = parseHookConfig(raw)
+  assert.deepEqual(parsed.groups, {}, '非法 matcher 的组照旧**不执行**（执行语义一字不改）')
+  assert.equal(parsed.rejected.length, 1, '但它必须被**记下来** —— 否则页面上这几条就是"凭空消失"')
+  assert.equal(parsed.rejected[0].reason, 'invalid-matcher')
+  assert.equal(parsed.rejected[0].groupIndex, 0, '要带**文件下标**，页面才能定位到它')
+  assert.equal(parsed.rejected[0].hookCount, 1)
+
+  const snapshot = buildSnapshot(
+    emptyInspection({
+      sources: [sourceInspection('project', parsed.groups, { rejected: parsed.rejected, skipped: parsed.skipped })],
+    }),
+  )
+  const project = snapshot.files.find((file) => file.kind === 'project')
+  assert.equal(project.rejected.length, 1, '快照必须把"跑不了的那一组"带给页面')
+  assert.equal(project.rejected[0].reason, 'invalid-matcher')
+  assert.equal(project.unrunnable, 1, '页面要能说"文件里有 N 条，其中 M 条跑不了"')
+  assert.equal(project.hookCount, 0, '可运行条数仍然是 0（不许把跑不了的算进去）')
+})
+
+await test('P：文件里有内容但一条都跑不了 ⇒ 快照说得出条数与原因（不是"0 条"）', () => {
+  // 真机形态：别人写的 hooks.json 全是 `type: "prompt"`，外加一组 matcher 打错的正则。
+  const raw = {
+    hooks: {
+      PreToolUse: [
+        { hooks: [{ type: 'prompt', prompt: 'x' }] },
+        { matcher: '(', hooks: [{ type: 'command', command: 'y' }] },
+      ],
+      Stop: [{ hooks: [] }],
+    },
+  }
+  const parsed = parseHookConfig(raw)
+  assert.deepEqual(parsed.groups, {}, '一条能跑的都没有（只跑 command）')
+  assert.equal(parsed.skipped.length, 1, '非 command handler 要被记下（带下标与原因）')
+  assert.equal(parsed.skipped[0].groupIndex, 0)
+  assert.equal(parsed.skipped[0].reason, 'unsupported-type')
+  assert.equal(parsed.rejected.length, 3, '只有不支持类型的一组 + 非法 matcher 一组 + 空组一组')
+  assert.deepEqual(
+    parsed.rejected.map((one) => one.reason).sort(),
+    ['invalid-matcher', 'no-command', 'unsupported-type'],
+    '三种原因都要能分别说清（复查时补上的那条：全是 prompt 的组以前一条记录都不留）',
+  )
+  // ★ `unsupported-type` 那一组的 hookCount 必须是 0：它的条目已经在 skipped 里计过，
+  //   再算一次就会把"跑不了 3 条"说成"跑不了 5 条"。
+  assert.equal(
+    parsed.rejected.find((one) => one.reason === 'unsupported-type').hookCount,
+    0,
+    '不支持类型的组不许重复计数（那一条在 skipped 里）',
+  )
+
+  const snapshot = buildSnapshot(
+    emptyInspection({
+      sources: [sourceInspection('project', parsed.groups, { rejected: parsed.rejected, skipped: parsed.skipped })],
+    }),
+  )
+  const project = snapshot.files.find((file) => file.kind === 'project')
+  assert.equal(project.hookCount, 0)
+  assert.ok(project.unrunnable >= 2, '跑不了的条数必须可数（页面据此说"3 条里 3 条跑不了"）')
+  assert.deepEqual(
+    snapshot.total.unrunnable,
+    project.unrunnable,
+    '顶层口径与文件口径必须同源（否则页面两处数字会打架）',
+  )
 })
 
 await test('P：GET 正常路径 —— 两个来源、合并条数、只读能力位', async () => {
@@ -6062,6 +7265,125 @@ await test('P：not-preservable 会以 409 透传给页面（页面要能分别�
   assert.equal(response.body.detail, '改写会动到目标之外的字段')
 })
 
+await test('P：试运行一个"被拒"的组 ⇒ rejected（说清它为什么不跑，而不是"这一条已经不在了"）', async () => {
+  await withIsolatedHome(async () => {
+    const dir = await makeProject()
+    await writeHooks(dir, {
+      hooks: { PreToolUse: [{ matcher: '(', hooks: [{ type: 'command', command: 'echo a' }] }] },
+    })
+    const conn = makeConnection()
+    const { agent } = fakeAgent(dir)
+    await mount({ connection: conn.connection, fs: makeFs({ version: true }), initiator: agent })
+
+    const response = await postRoute(conn.routes[0], {
+      op: 'dryRun',
+      file: 'project',
+      event: 'PreToolUse',
+      groupIndex: 0,
+      hookIndex: 0,
+    })
+    assert.equal(response.status, 409, '目标在文件里，只是跑不了 —— 不是 404')
+    assert.equal(response.body.error, 'rejected', '必须与 not-found（真的不在了）区分开')
+    assert.ok(
+      typeof response.body.detail === 'string' && response.body.detail.includes('matcher'),
+      `要说得出是哪一处不合法：${String(response.body.detail)}`,
+    )
+  })
+})
+
+await test('P：写请求带 expectedVersion —— 页面看到的版本就是写入的锁，过期即 stale（字节不变）', async () => {
+  await withIsolatedHome(async () => {
+    const dir = await makeProject()
+    const projectFile = path.join(dir, '.dsh', 'hooks.json')
+    await writeHooks(dir, { hooks: { PreToolUse: [{ hooks: [{ command: 'echo old' }] }] } })
+    const conn = makeConnection()
+    const writes = []
+    const { agent } = fakeAgent(dir)
+    await mount({ connection: conn.connection, fs: makeFs({ version: true, writes }), initiator: agent })
+
+    const before = await callRoute(conn.routes[0])
+    const version = before.data.files.find((file) => file.kind === 'project').version
+    assert.equal(typeof version, 'string')
+    const original = fs.readFileSync(projectFile, 'utf8')
+    const edit = (extra) => ({
+      op: 'setHookCommand',
+      file: 'project',
+      event: 'PreToolUse',
+      groupIndex: 0,
+      hookIndex: 0,
+      command: 'echo NEW',
+      ...extra,
+    })
+
+    // ① 页面上的版本已经过期（别处改过）→ 拒写，文件一个字节都不许变，也不许触到写盘。
+    const stale = await postRoute(conn.routes[0], edit({ expectedVersion: 'v-page-saw-older' }))
+    assert.equal(stale.status, 409)
+    assert.equal(stale.body.error, 'stale', '页面据此说"文件被别处改过了，刷新后再改"')
+    assert.equal(fs.readFileSync(projectFile, 'utf8'), original)
+    assert.equal(writes.length, 0, '过期的请求绝不许触到写盘 —— 否则就是"改到了别的位置上"')
+
+    // ② 页面是最新的：写盘必须用**页面给的那个版本**，而不是宿主自己重新读的一个版本。
+    const ok = await postRoute(conn.routes[0], edit({ expectedVersion: version }))
+    assert.equal(ok.status, 200)
+    assert.equal(writes.length, 1)
+    assert.equal(writes[0].expected.kind, 'replaceIfVersion')
+    assert.equal(writes[0].expected.version, version, '锁必须是页面看到的那个版本')
+    assert.equal(JSON.parse(fs.readFileSync(projectFile, 'utf8')).hooks.PreToolUse[0].hooks[0].command, 'echo NEW')
+
+    // ③ `expectedVersion: null` = "我以为这个文件还不存在" → 它其实存在 ⇒ stale（绝不静默覆盖）。
+    const wrongNew = await postRoute(conn.routes[0], edit({ expectedVersion: null }))
+    assert.equal(wrongNew.status, 409)
+    assert.equal(wrongNew.body.error, 'stale')
+
+    // ④ 反向：`null` 且文件真的不存在 ⇒ 允许新建（否则"新建"这条路径就废了）。
+    const fresh = await makeProject()
+    const freshConn = makeConnection()
+    const freshAgent = fakeAgent(fresh)
+    await mount({ connection: freshConn.connection, fs: makeFs({ version: true }), initiator: freshAgent.agent })
+    const created = await postRoute(freshConn.routes[0], {
+      op: 'addGroup',
+      file: 'project',
+      event: 'PreToolUse',
+      matcher: null,
+      command: 'echo first',
+      timeoutSec: null,
+      expectedVersion: null,
+    })
+    assert.equal(created.status, 200, '页面认为它不存在 + 它确实不存在 ⇒ 允许新建')
+    const createdFile = path.join(fresh, '.dsh', 'hooks.json')
+    assert.equal(JSON.parse(fs.readFileSync(createdFile, 'utf8')).hooks.PreToolUse[0].hooks[0].command, 'echo first')
+
+    // ⑤ 两个写请求用**同一个**版本（两个标签页同时点保存）：先到的成功，后到的拿 stale。
+    //    没有这条，版本锁只证明了"能比"，没证明"并发时谁赢"。
+    const currentVersion = (await callRoute(conn.routes[0])).data.files.find((file) => file.kind === 'project').version
+    const first = await postRoute(conn.routes[0], edit({ expectedVersion: currentVersion, command: 'echo first-win' }))
+    const second = await postRoute(
+      conn.routes[0],
+      edit({ expectedVersion: currentVersion, command: 'echo second-lose' }),
+    )
+    assert.equal(first.status, 200, '先到的那个必须成功')
+    assert.equal(second.status, 409, '后到的那个必须被挡住')
+    assert.equal(second.body.error, 'stale')
+    assert.equal(
+      JSON.parse(fs.readFileSync(projectFile, 'utf8')).hooks.PreToolUse[0].hooks[0].command,
+      'echo first-win',
+      '★ 先到的那个生效，后到的那个一个字都没写进去',
+    )
+
+    // ⑥ 文件在页面加载后被删掉：带旧版本写入 ⇒ stale（不是"顺手新建一份"）。
+    fs.rmSync(projectFile)
+    const gone = await postRoute(conn.routes[0], edit({ expectedVersion: version }))
+    assert.equal(gone.status, 409)
+    assert.equal(gone.body.error, 'stale')
+    assert.equal(fs.existsSync(projectFile), false, '过期版本绝不许顺手把文件建回来')
+
+    // ⑦ 旧客户端不传这个字段 ⇒ 行为与改动前逐字一致（读后写），向后兼容。
+    await writeHooks(dir, { hooks: { PreToolUse: [{ hooks: [{ command: 'echo old' }] }] } })
+    const legacy = await postRoute(conn.routes[0], edit({}))
+    assert.equal(legacy.status, 200, '缺省 expectedVersion 时必须回退到"读后写"（不打断旧页面）')
+  })
+})
+
 //#endregion
 
 //#region P3b. 作用域写入（§8 的 P3-10 / P3-11 / P3-12）：绝不改错文件
@@ -6285,7 +7607,7 @@ function applied(doc, op) {
 test('W：风格探测与序列化是不动点（我们写的文件，后续编辑只会是最小 diff）', () => {
   const canonical = JSON.stringify(RICH_DOC, null, 2) + '\n'
   const style = detectStyle(canonical)
-  assert.deepEqual(style, { indent: '  ', eol: '\n', finalNewline: true })
+  assert.deepEqual(style, { indent: '  ', eol: '\n', finalNewline: true, compact: false })
   assert.equal(serialize(JSON.parse(canonical), style), canonical, '2 空格 + LF + 结尾换行必须逐字节还原')
 
   const tabs = '{\n\t"hooks": {}\n}\n'
@@ -6304,8 +7626,35 @@ test('W：风格探测与序列化是不动点（我们写的文件，后续编�
   )
 })
 
+test('W：单行紧凑文件编辑后仍是单行（不许把整个文件重排）', () => {
+  // 真机场景：手写 / 工具生成的 minified hooks.json。整份文件只有一行，
+  // 而"按行首空白探测缩进"探不到任何东西 —— 于是回退两空格，一次编辑就把文件展开成十几行，
+  // 用户看到的是"我只改了一条命令，整个文件全红了"。
+  const compact = '{"hooks":{"PreToolUse":[{"matcher":"pwsh","hooks":[{"type":"command","command":"echo a"}]}]}}'
+  const style = detectStyle(compact)
+  assert.equal(style.compact, true, '完全没有换行的文件必须被识别成紧凑布局')
+  assert.equal(serialize(JSON.parse(compact), style), compact, '紧凑风格必须是逐字节不动点')
+
+  const { doc } = applied(JSON.parse(compact), {
+    op: 'setHookCommand',
+    file: 'project',
+    event: 'PreToolUse',
+    groupIndex: 0,
+    hookIndex: 0,
+    command: 'echo b',
+  })
+  const text = serialize(doc, style)
+  assert.equal(text.split('\n').length, 1, '改一条命令之后仍然是一行')
+  assert.ok(text.includes('"echo b"'), '改动本身要落上')
+
+  // 反向：多行文件**不许**被误判成紧凑（否则我们就会把用户的缩进全吃掉）。
+  const pretty = JSON.stringify(JSON.parse(compact), null, 2)
+  assert.equal(detectStyle(pretty).compact, false, '多行文件不是紧凑布局')
+  assert.equal(serialize(JSON.parse(pretty), detectStyle(pretty)), pretty, '多行文件仍是逐字节不动点')
+})
+
 test('W：新文件内容是"能被解析成空配置"的自解释形状', () => {
-  const text = starterText({ indent: '  ', eol: '\n', finalNewline: true })
+  const text = starterText({ indent: '  ', eol: '\n', finalNewline: true, compact: false })
   const parsed = parseHookConfig(JSON.parse(text))
   assert.deepEqual(parsed.errors, [])
   assert.deepEqual(parsed.groups, {})

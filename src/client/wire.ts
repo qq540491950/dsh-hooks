@@ -11,6 +11,19 @@
  * 字段名漂移的防线：P5b 的渲染断言会在字段读不到时当场红（"页面显示空"是断言失败，不是静默降级）。
  */
 
+import type { RejectedReason } from '../shared/types.ts'
+
+/** 一个**跑不了**的组（文件里有、但一条都不会跑）。 */
+export interface RejectedGroupView {
+  event: string
+  /** **文件里的真实下标**（改匹配范围 / 删这一组时要原样回传）。 */
+  groupIndex: number
+  matcher: string | null
+  /** 原因取值来自共享的领域类型（**不许**在客户端再抄一份联合，抄一份就会多出一种没人认识的值）。 */
+  reason: RejectedReason
+  hookCount: number
+}
+
 /** 一个文件的状态（三态 + 版本）。 */
 export interface FileView {
   kind: 'project' | 'user'
@@ -20,7 +33,11 @@ export interface FileView {
   message: string | null
   version: string | null
   hookCount: number
-  skipped: Array<{ event: string; type: string }>
+  /** 文件里跑不了的组（页面据此画灰化的「不会运行」行，而不是让它们消失）。 */
+  rejected: RejectedGroupView[]
+  /** 文件里跑不了的条数（`hookCount + unrunnable` = 文件里真实条目数）。 */
+  unrunnable: number
+  skipped: Array<{ event: string; type: string; groupIndex?: number; hookIndex?: number; reason?: string }>
   matcherErrors: string[]
   events: FileEventView[]
 }
@@ -129,7 +146,7 @@ export interface HooksSnapshot {
   session: SessionEffectView | null
   files: FileView[]
   events: EventView[]
-  total: { hookCount: number; disabledCount: number; groupCount: number }
+  total: { hookCount: number; disabledCount: number; groupCount: number; unrunnable: number }
   staleInUse: boolean
   capabilities: { writable: boolean }
 }

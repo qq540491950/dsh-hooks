@@ -9,6 +9,8 @@
  */
 
 import { HOOKS_ROUTE } from '../shared/constants.ts'
+import { ERROR_SENTENCES } from '../shared/errors.ts'
+import type { SentenceErrorCode } from '../shared/errors.ts'
 import type { HooksWriteResponse } from './wire.ts'
 
 /**
@@ -70,21 +72,50 @@ export type WriteOp =
   | { op: 'addHook'; event: string; groupIndex: number; command: string; timeoutSec: number | null }
   | { op: 'addGroup'; event: string; matcher: string | null; command: string; timeoutSec: number | null }
   | { op: 'removeHook'; event: string; groupIndex: number; hookIndex: number }
-  | { op: 'moveHook'; event: string; groupIndex: number; hookIndex: number; direction: -1 | 1 }
+  | {
+      op: 'moveHook'
+      event: string
+      groupIndex: number
+      hookIndex: number
+      direction: -1 | 1
+      /**
+       * 目标位置的**文件下标**（邻居的真实下标）。
+       *
+       * 页面上"上一条"是**解析后**的邻居，而解析会跳过非 command 条目 —— 于是"相邻"在文件里
+       * 可能是 0 和 2。只发 `direction` 会与文件里的 1 号互换，用户点了上移却看不出变化。
+       */
+      toIndex?: number
+    }
   | { op: 'removeGroup'; event: string; groupIndex: number }
 
 /** 真正发出去的请求体（字段与宿主 `write.ts` 的 `HooksRequest` 一一对应）。 */
-export type WriteIntent = WriteOp & { file: 'project' | 'user'; workspaceId?: string }
+export type WriteIntent = WriteOp & {
+  file: 'project' | 'user'
+  workspaceId?: string
+  /**
+   * 页面看到的那份文件的版本（乐观锁的**页面侧**那一半）。
+   *
+   * - 字符串 = "我看到的是这个版本" → 宿主按它做 `replaceIfVersion`，不符就 `stale`；
+   * - `null` = "我以为它还不存在" → 宿主要求目标**确实不存在**；
+   * - 缺省 = 旧页面的语义（宿主读后写），只为向后兼容而保留。
+   *
+   * 为什么必须有：`groupIndex` / `hookIndex` 是**文件下标**。别处插/删一条之后，同一个下标会指向
+   * 另一条 hook —— 而保留性证明只证明"我只改了声明的那一处"，证明不了"那一处还是原来那条"。
+   * 没有这一半，删除/启停会静默落到别的 hook 上（且不可撤销）。
+   */
+  expectedVersion?: string | null
+}
 
 /**
- * **唯一**的请求体构造函数：`(作用域, 操作) → WriteIntent`。
+ * **唯一**的请求体构造函数：`(作用域, 操作, 页面版本) → WriteIntent`。
  *
  * 为什么必须是函数而不是"各调用点自己写 file/workspaceId"：只要有一个调用点忘了带
  * `workspaceId`，宿主就会按**会话 cwd** 落笔 —— 页面看着 A 项目、改到 B 项目，而且是静默的
  * （§2.2 里最重的一条）。收成一个构造点之后，"选中工作区却没带 id"在结构上不可能发生。
  */
-export function intentFor(scope: ScopeValue, op: WriteOp): WriteIntent {
-  return { ...scopeTargetOf(scope), ...op }
+export function intentFor(scope: ScopeValue, op: WriteOp, expectedVersion?: string | null): WriteIntent {
+  const base: WriteIntent = { ...scopeTargetOf(scope), ...op }
+  return expectedVersion === undefined ? base : { ...base, expectedVersion }
 }
 
 /** 写请求的结果（永不抛，所以调用方只需判 `ok`）。 */
@@ -100,41 +131,13 @@ export interface WriteOutcome {
  *
  * 糊成一句"保存失败"是不允许的：用户据此分不清"该刷新页面"、"该去修文件"、"该换权限"。
  * 宿主返回的 `detail` 是技术原文，只作补充，**绝不**当主文案。
+ *
+ * 表本身在 `src/shared/errors.ts`（与"宿主能返回哪些码"同一份目录）：加一个码而忘了写文案，
+ * 自检的表驱动断言会当场红 —— 这条以前是**静默**的（页面会显示"写入失败（no-version）。"）。
  */
 export function writeErrorSentence(error: string): string {
-  switch (error) {
-    case 'stale':
-      return '这个文件刚被别处改过了，页面上的内容已经不是最新的。请刷新后再改。'
-    case 'invalid-json':
-      // ⚠️ 文案里**不许**出现 markdown 语法（真机截图上 `**…**` 被原样渲染出来了）——
-      // 自检的渲染护栏会把任何文本节点里的星号对/反引号/井号判红。
-      return '文件现在读不出来（内容不是合法 JSON）。为避免覆盖你的内容，这次没有写入，请先手工修好文件。'
-    case 'not-preservable':
-      return '这次改动会动到目标以外的字段。为避免破坏文件，已拒绝写入。'
-    case 'sandbox':
-      return '当前会话的权限不允许写这个文件（沙箱限制）。'
-    case 'absent':
-      return '这份配置文件还不存在。'
-    case 'exists':
-      return '文件已经存在，不能再"新建"。'
-    case 'not-found':
-      return '要改的那一条已经不在了（文件可能刚被改过），请刷新。'
-    case 'bad-op':
-      return '这次请求不合法（界面与宿主的版本可能不一致）。'
-    case 'bad-timeout':
-      // 纯前端校验：还没发请求就被拦下了（表单内错误通道，§3.7）。
-      return '超时必须是正数秒；留空就用默认 600s。'
-    case 'no-project':
-      return '无法确定当前项目，所以不能写项目级配置。'
-    case 'unknown-workspace':
-      return '这个工作区已经不在宿主的清单里了（可能被删过），请刷新页面后重试。'
-    case 'no-workspace-registry':
-      return '宿主没有提供工作区清单，只能改当前项目和用户级配置。'
-    case 'network':
-      return '连不上宿主，写入没有发生。'
-    default:
-      return `写入失败（${error}）。`
-  }
+  const known = ERROR_SENTENCES[error as SentenceErrorCode]
+  return typeof known === 'string' ? known : `写入失败（${error}）。`
 }
 
 /**
@@ -166,7 +169,13 @@ export async function requestWrite(
     const outcome: WriteOutcome = { ok: false, error: typeof body.error === 'string' ? body.error : 'internal' }
     return typeof body.detail === 'string' ? { ...outcome, detail: body.detail } : outcome
   } catch (error) {
-    return { ok: false, error: 'network', detail: error instanceof Error ? error.message : String(error) }
+    // 中止（时间预算用完 / 组件卸载）与"连不上"要分开说：前者用户可以重试，后者多半是宿主没起。
+    const aborted = error instanceof Error && (error.name === 'AbortError' || /abort/i.test(error.message))
+    return {
+      ok: false,
+      error: aborted ? 'timeout' : 'network',
+      detail: error instanceof Error ? error.message : String(error),
+    }
   }
 }
 
@@ -235,6 +244,11 @@ export async function requestDryRun(
     const outcome: DryRunResult = { ok: false, error: typeof body.error === 'string' ? body.error : 'internal' }
     return typeof body.detail === 'string' ? { ...outcome, detail: body.detail } : outcome
   } catch (error) {
-    return { ok: false, error: 'network', detail: error instanceof Error ? error.message : String(error) }
+    const aborted = error instanceof Error && (error.name === 'AbortError' || /abort/i.test(error.message))
+    return {
+      ok: false,
+      error: aborted ? 'timeout' : 'network',
+      detail: error instanceof Error ? error.message : String(error),
+    }
   }
 }

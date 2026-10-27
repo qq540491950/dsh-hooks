@@ -27,6 +27,8 @@
  */
 
 /** 事件 → 中文名（卡片标题 / 折叠事件行 / 新建表单的事件下拉都用它）。 */
+import type { RejectedReason } from '../shared/types.ts'
+
 export const EVENT_LABEL: Record<string, string> = {
   SessionStart: '会话开始',
   UserPromptSubmit: '提示词提交',
@@ -64,4 +66,65 @@ export function eventHint(event: string): string {
 /** 事件 → `title`：中文时机 + 英文原文（用户查文档 / 配 `hooks.json` 时需要原文）。 */
 export function eventTitle(event: string): string {
   return `${eventHint(event)} · ${event}`
+}
+
+/**
+ * 「多久之前」——状态点的**时间维度**（12 票）。
+ *
+ * 只有 `exit 0 · 12ms` 的时候，用户没法把"三天前的通过"和"刚刚的通过"分开；而台账是**进程级**
+ * 记忆（重启即空），所以"未运行"也可能只是"这次还没跑"。
+ */
+export function relativeTime(at: number, now: number): string {
+  const diff = Math.max(0, now - at)
+  const minutes = Math.floor(diff / 60_000)
+  if (minutes < 1) return '刚刚'
+  if (minutes < 60) return `${String(minutes)} 分钟前`
+  const hours = Math.floor(minutes / 60)
+  if (hours < 24) return `${String(hours)} 小时前`
+  return `${String(Math.floor(hours / 24))} 天前`
+}
+
+/** `cwd` 的来源（诊断行用；内部枚举不进正文）。 */
+export function cwdSourceText(source: string): string {
+  switch (source) {
+    case 'session':
+      return '来自当前会话'
+    case 'initiator':
+      return '来自当前发起者（会话未知）'
+    default:
+      return '无法确定（没有会话上下文）'
+  }
+}
+
+/** 被跳过的不支持 handler → 一句人话（诊断行用；`PreToolUse:prompt` 这种拼接不进正文）。 */
+export function skippedText(skipped: Array<{ event: string; type: string; reason?: string }>): string {
+  if (skipped.length === 0) return '无'
+  return skipped
+    .map((item) =>
+      item.reason === 'empty-command'
+        ? `${eventLabel(item.event)} 里有一条没有命令的 command`
+        : `${eventLabel(item.event)} 里有一个不支持的 ${item.type}`,
+    )
+    .join('；')
+}
+
+/**
+ * 「这一组为什么不会运行」——**一句人话**（06 票）。
+ *
+ * 这句话是"空 vs 不存在 vs 跑不了"三种情形里第三种的全部内容：以前这些组被解析器静默丢掉，
+ * 页面于是把"有 4 条、全跑不了"说成"文件里还没有任何 hook"。原因取值来自宿主的解析器
+ * （`invalid-matcher` / `malformed-group` / `no-command`），页面只负责翻译，不自己判断合法性。
+ */
+export function rejectedReasonText(reason: RejectedReason, matcher: string | null): string {
+  switch (reason) {
+    case 'invalid-matcher':
+      // 把用户写的原文摆出来：他才知道自己少打了什么（比如漏了一个右括号）。
+      return matcher === null ? '匹配范围不合法，这一组不会运行' : `匹配范围不合法（${matcher}），这一组不会运行`
+    case 'malformed-group':
+      return '这一组的结构不合法（缺少 hooks 数组），不会运行'
+    case 'no-command':
+      return '这一组里没有可运行的命令'
+    case 'unsupported-type':
+      return '这一组里只有本插件不支持的处理器类型（只运行 command），不会运行'
+  }
 }

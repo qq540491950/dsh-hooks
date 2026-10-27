@@ -19,12 +19,9 @@
 
 import { h } from './react.ts'
 import type { Jsx } from './react.ts'
-import { HOOK_EVENTS } from '../shared/constants.ts'
+import { HOOK_EVENTS, eventHasMatcher } from '../shared/constants.ts'
 import { eventHint, eventLabel } from './labels.ts'
 import { HOOK_TEMPLATES } from './templates.ts'
-
-/** 哪些事件没有 matcher（与宿主解析器的行为一致，不在这里另写一套判断规则）。 */
-const MATCHERLESS = new Set(['UserPromptSubmit', 'Stop'])
 
 /** 新建表单的字段值（状态由最外层持有）。 */
 export interface NewHookDraft {
@@ -34,9 +31,20 @@ export interface NewHookDraft {
   timeout: string
 }
 
+/** 一个可追加的已有组（`rawIndex` 是**文件里的**下标）。 */
+export interface GroupOption {
+  rawIndex: number
+  matcher: string | null
+}
+
 /** 表单渲染 + 回调。 */
 export function NewHookForm(props: {
   draft: NewHookDraft
+  /** 当前事件下**已有的组**（有的话给出"追加到已有的匹配范围"这个落点）。 */
+  groups: GroupOption[]
+  /** 落点：`''` = 新开一组；否则是已有组的文件下标（字符串）。 */
+  target: string
+  onTarget: (value: string) => void
   /** **表单内**的错误（已翻成人话）；null = 没有错误。 */
   error: string | null
   /** 技术原文，只作补充（排查用），绝不作为主文案（§3.9）。 */
@@ -52,6 +60,8 @@ export function NewHookForm(props: {
   onCancel: () => void
 }): Jsx {
   const { draft, error, errorDetail, busy, writable } = props
+  /** 追加到已有组时 matcher 由那一组决定，所以这一栏不出现（填了也不生效 = 界面的错）。 */
+  const appending = props.target !== ''
   return (
     <div className="dsh-hooks__newform">
       {/* 模板行：**不是字段容器**（没有 label + 控件的配对），所以用 `__tplrow` 而不是 `__newfield`
@@ -86,7 +96,8 @@ export function NewHookForm(props: {
           <select
             className="dsh-hooks__select dsh-hooks__newselect"
             value={draft.event}
-            onChange={(changeEvent) => {
+            autoFocus
+            onChange={(changeEvent: { target: { value: string } }) => {
               props.onEvent(changeEvent.target.value)
             }}
           >
@@ -101,9 +112,32 @@ export function NewHookForm(props: {
           {/* 选中的事件**什么时候触发**（官方 README 的「运行时机」，见 labels.ts 的出处） */}
           <span className="dsh-hooks__hint">{eventHint(draft.event)}</span>
         </div>
-        {MATCHERLESS.has(draft.event) ? (
+        {props.groups.length === 0 ? null : (
+          // 落点：新开一组 / 追加到已有的匹配范围。常见形态是"同一个 matcher 下多条命令"，
+          // 以前只能一条一个组（文件越用越碎）。
+          <div className="dsh-hooks__newfield dsh-hooks__newfield--group">
+            <span className="dsh-hooks__newlabel">加到</span>
+            <select
+              className="dsh-hooks__select dsh-hooks__newselect"
+              value={props.target}
+              onChange={(changeEvent: { target: { value: string } }) => {
+                props.onTarget(changeEvent.target.value)
+              }}
+            >
+              <option value="">新开一组</option>
+              {props.groups.map((group) => (
+                <option key={group.rawIndex} value={String(group.rawIndex)}>
+                  {group.matcher === null ? '已有的全匹配组' : `已有的「${group.matcher}」组`}
+                </option>
+              ))}
+            </select>
+          </div>
+        )}
+        {!eventHasMatcher(draft.event) ? (
           // 这一句里**不许出现** `matcher`：表单是给用户看的，接口字段名只留在诊断折叠里。
           <span className="dsh-hooks__hint">这个事件不看匹配范围（填了也不生效）</span>
+        ) : appending ? (
+          <span className="dsh-hooks__hint">追加到已有组时沿用那一组的匹配范围</span>
         ) : (
           <div className="dsh-hooks__newfield dsh-hooks__newfield--matcher">
             {/* F2：标签是中文「匹配」，与卡片里的 `匹配 pwsh|bash` 同一套用词 */}
@@ -143,9 +177,10 @@ export function NewHookForm(props: {
           }}
         />
       </div>
-      {/* §3.7：表单错误**只**在这里渲染（页面级横幅不会写它）。 */}
+      {/* §3.7：表单错误**只**在这里渲染（页面级横幅不会写它）。
+          17 票：加 `role="alert"` —— 提交失败是一个异步结论，读屏必须播报。 */}
       {error === null ? null : (
-        <div className="dsh-hooks__newerror">
+        <div className="dsh-hooks__newerror" role="alert">
           {error}
           {errorDetail === '' ? null : <span className="dsh-hooks__muted">（{errorDetail}）</span>}
         </div>

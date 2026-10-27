@@ -94,7 +94,16 @@ export function ScopePicker(props: {
                 props.onClose()
               }}
             />
-            <div className="dsh-hooks__popover" role="listbox" aria-label="作用域">
+            {/* 17 票：`aria-activedescendant` 是"焦点留在触发器、高亮项由它指认"这套做法的**必需**属性
+                —— 只写 `role="listbox"` 而不设它，读屏不知道键盘上下移动到了哪一项。 */}
+            <div
+              className="dsh-hooks__popover"
+              role="listbox"
+              aria-label="作用域"
+              aria-activedescendant={
+                active >= 0 && active < options.length ? `dsh-hooks-scope-${String(active)}` : undefined
+              }
+            >
               {options.map((option, index) => (
                 <Fragment key={option.value}>
                   {/* 分组标题：与上一项不同组时才画（分组是"连续段"而不是嵌套容器，
@@ -104,6 +113,7 @@ export function ScopePicker(props: {
                   ) : null}
                   <button
                     type="button"
+                    id={`dsh-hooks-scope-${String(index)}`}
                     className={index === active ? 'dsh-hooks__option dsh-hooks__option--active' : 'dsh-hooks__option'}
                     role="option"
                     aria-selected={option.value === value}

@@ -91,9 +91,10 @@
 import { Fragment, h, useEffect, useState } from './react.ts'
 import type { Jsx } from './react.ts'
 import { HOOK_EVENTS } from '../shared/constants.ts'
+import { matcherDiagnostic } from '../shared/protocol.ts'
 import { styles } from './styles.ts'
-import { HookCard } from './hook-card.tsx'
-import { eventLabel, eventTitle } from './labels.ts'
+import { HookCard, BlockedRow, statusOf } from './hook-card.tsx'
+import { cwdSourceText, eventLabel, eventTitle, skippedText } from './labels.ts'
 import { NewHookForm } from './new-hook.tsx'
 import { HOOK_TEMPLATES } from './templates.ts'
 import { ScopePicker, type KeyLike, type ScopeOption } from './scope-picker.tsx'
@@ -109,7 +110,7 @@ import {
   type ScopeValue,
   type WriteOp,
 } from './write.ts'
-import type { FileView, GroupView, HooksResponse, HooksSnapshot, HookView } from './wire.ts'
+import type { FileView, GroupView, HooksResponse, HooksSnapshot, HookView, RejectedGroupView } from './wire.ts'
 
 /**
  * 请求超时预算。
@@ -198,12 +199,23 @@ function stateToken(file: FileView): string {
 }
 
 /**
- * 试运行结果 → 一行字。
+ * 试运行输出在卡片上最多显示多少字符。
+ *
+ * 没有上限的话，一个会打印 JSON / 日志的 hook 会把整张卡撑成一大片糊字（模板输出的就是 JSON）。
+ * 台账侧有 `MAX_TEXT_CHARS` 截断，而试运行走的是另一条路径 —— 这里必须自己也限一次。
+ */
+const DRY_TEXT_MAX = 400
+
+/**
+ * 试运行结果 → `{ shown, full }`。
+ *
+ * `shown` 是卡片上那一行（超长就截断并留标记），`full` 只有被截断时才非空（给「查看全文」）。
+ * 两件事一起算：各写一遍 stderr-or-stdout 的取值，迟早漂移成"摘要是 stderr、展开是 stdout"。
  *
  * **不猜**（§3.8）：`exitCode === null`（子进程没起来）与"非零退出"是两件事，各自说清；
  * `deny`/`block` 单独点名。输出优先显示 stderr（钩子通常把原因写在 stderr）。
  */
-function formatDryRun(run: DryRunView): string {
+function dryRunText(run: DryRunView): { shown: string; full: string } {
   const outcome =
     run.exitCode === null
       ? '启动失败（子进程没起来）'
@@ -213,7 +225,12 @@ function formatDryRun(run: DryRunView): string {
           ? '通过（exit 0）'
           : `失败（exit ${String(run.exitCode)}）`
   const text = run.stderr.trim() === '' ? run.stdout.trim() : run.stderr.trim()
-  return `试运行：${outcome} · ${String(run.durationMs)}ms${text === '' ? '' : ` · ${text}`}`
+  const truncated = text.length > DRY_TEXT_MAX
+  const body = truncated ? `${text.slice(0, DRY_TEXT_MAX)}…（已截断 ${String(text.length - DRY_TEXT_MAX)} 字符）` : text
+  return {
+    shown: `试运行：${outcome} · ${String(run.durationMs)}ms${body === '' ? '' : ` · ${body}`}`,
+    full: truncated ? text : '',
+  }
 }
 
 /** 一条 hook 的身份键：**文件 + 事件 + 两个原始下标**（就是寻址用的那三元组）。 */
@@ -344,6 +361,18 @@ function fileKindLabel(kind: 'project' | 'user'): string {
 function primaryFileOf(snapshot: HooksSnapshot): FileView | undefined {
   const wanted = snapshot.scope.kind === 'user' ? 'user' : 'project'
   return snapshot.files.find((file) => file.kind === wanted) ?? snapshot.files[0]
+}
+
+/**
+ * 一个作用域对应的那份文件。
+ *
+ * ⚠️ 用它取**版本**（乐观锁的页面侧），不要用 `primaryFileOf`：后者按**宿主回显**的作用域取，
+ * 而写请求要用的版本必须是"我要写的那一份"的版本 —— 两者在"宿主把 current 归一成 user"这类
+ * 情况下会不一致，取错就等于拿 A 的版本去锁 B。
+ */
+function fileOfScope(snapshot: HooksSnapshot, scope: ScopeValue): FileView | undefined {
+  const wanted = scope === 'user' ? 'user' : 'project'
+  return snapshot.files.find((file) => file.kind === wanted)
 }
 
 /** 一份文件里已停用的条数（口径与宿主一致：`hookCount` 不含 disabled）。 */
@@ -534,6 +563,17 @@ interface CardRow {
   matcher: string | null
   matcherProblem: string | null
   hook: HookView
+  /** 这一条在**解析后**的组内位置（0 = 第一条）。顺序即执行顺序，上移/下移靠它判断边界。 */
+  position: number
+  /** 组内条数（同上）。 */
+  groupSize: number
+  /**
+   * 组内各条的**文件下标**（解析后顺序）。
+   *
+   * 上移/下移要拿**邻居的文件下标**：解析会跳过非 command 条目，所以"相邻"在文件里可能是 0 和 2，
+   * 只按 ±1 移动会与文件里的 1 号互换 → 用户点了上移却看不出变化（像按钮坏了）。
+   */
+  rawIndexes: number[]
 }
 
 /** 按事件顺序铺平"有内容的 hook"（主列表用；0 条的事件不进主列表 —— 见文件头的偏离说明）。 */
@@ -541,19 +581,57 @@ function cardRows(file: FileView, matches: (hook: HookView, group: GroupView, ev
   const rows: CardRow[] = []
   for (const view of file.events) {
     for (const group of view.groups) {
-      for (const hook of group.hooks) {
-        if (!matches(hook, group, view.event)) continue
+      const rawIndexes = group.hooks.map((one) => one.rawIndex)
+      group.hooks.forEach((hook, position) => {
+        if (!matches(hook, group, view.event)) return
         rows.push({
           event: view.event,
           groupRawIndex: group.rawIndex,
           matcher: group.matcher,
           matcherProblem: group.matcherOk ? null : (group.matcherProblem ?? 'matcher 非法'),
           hook,
+          position,
+          groupSize: group.hooks.length,
+          rawIndexes,
         })
-      }
+      })
     }
   }
   return rows
+}
+
+/**
+ * 就地编辑某一栏时的**不合法原因**（`null` = 合法）。
+ *
+ * 口径必须与宿主一致：matcher 用共享协议那一份 `matcherDiagnostic`（禁止另写一套），
+ * timeout 用"正数秒 / 留空即默认"。就地拦住 → 用户不必保存后才知道自己写错了。
+ */
+function fieldProblemOf(field: '' | 'matcher' | 'timeout', draft: string): string | null {
+  const text = draft.trim()
+  if (field === 'matcher') return text === '' ? null : (matcherDiagnostic(text) ?? null)
+  if (field === 'timeout') {
+    if (text === '') return null
+    const value = Number(text)
+    return Number.isFinite(value) && value > 0 ? null : '超时必须是正数秒（留空 = 默认）'
+  }
+  return null
+}
+
+/**
+ * 回显里"**请求**的是什么作用域"（人话）。
+ *
+ * 诊断行以前直出 `requested=current`：机器码上屏，用户读不懂；而这一行恰恰是"为什么我看到的是
+ * 这份文件"的关键证据（`current` 在没有会话上下文时会被宿主归一成用户级）。
+ */
+function requestedScopeText(snapshot: HooksSnapshot): string {
+  switch (snapshot.scope.requested) {
+    case 'user':
+      return '用户级'
+    case 'current':
+      return '当前会话的项目'
+    default:
+      return snapshot.scope.workspaceTitle ?? snapshot.scope.workspaceId ?? '某个工作区'
+  }
 }
 
 /** 设置页「Hooks」的整节内容。 */
@@ -597,6 +675,26 @@ export function HooksSection(props?: HooksSectionProps): Jsx {
    * 菜单收着的话用户点完"编辑"会找不到"保存"。
    */
   const [menuKey, setMenuKey] = useState('')
+  /**
+   * 菜单里正在改**哪一栏**（`''` = 没在改）。
+   *
+   * 匹配范围与超时以前只能看（"看得见改不了"里最大的一块）。它们和"改命令"是**两种编辑**：
+   * 改命令改的是 hook 节点上的 `command`，而这两栏一个是 group 节点、一个是 hook 节点的
+   * `timeout` —— 混成一个状态会让「保存」不知道该发哪个定点操作。
+   *
+   * ⚠️ 新增状态一律**追加在末尾**（假 React 按 hook 位置发值，插到中间会让后面所有状态错位）。
+   */
+  const [menuField, setMenuField] = useState<'' | 'matcher' | 'timeout'>('')
+  /** 那一栏的草稿（与改命令的 `draft` 分开，互不污染）。 */
+  const [menuDraft, setMenuDraft] = useState('')
+  /**
+   * 新建表单的落点：`''` = 新开一组；否则是**已有组的文件下标**（字符串形式）。
+   *
+   * 常见形态是"同一个匹配范围下挂多条命令"，以前只能新开一组（文件越用越碎）。
+   */
+  const [newGroup, setNewGroup] = useState('')
+  /** 试运行输出的**全文**（只有被截断时才非空；给「查看全文」用）。 */
+  const [dryFull, setDryFull] = useState('')
 
   useEffect(() => {
     const controller = new AbortController()
@@ -647,6 +745,23 @@ export function HooksSection(props?: HooksSectionProps): Jsx {
   const displayScope: ScopeValue = phase.kind === 'ready' ? echoedScopeOf(phase.snapshot) : scope
 
   /**
+   * 乐观锁的**页面侧**：屏幕上这一份文件的版本。
+   *
+   * 返回 `undefined`（= **不带**这个字段）与 `null`（= "我以为它不存在"）是**两件事**：
+   *   - `null` 只在文件确实不存在（`state === 'absent'`）时给 —— 宿主据此要求"目标必须不存在"；
+   *   - 文件存在但 provider 没给版本时给 `undefined` → 宿主走"读后写"，拿不到版本它会回 `no-version`。
+   * 以前把这两种情形都写成 `?? null`：于是"文件存在但没有版本"会被当成"它不存在"，每次保存都变成
+   * 一条 `stale`，页面还会一直劝用户"刷新后再改"（刷新也永远不会好）。
+   */
+  const versionOfScope = (target: ScopeValue): string | null | undefined => {
+    if (phase.kind !== 'ready') return undefined
+    const file = fileOfScope(phase.snapshot, target)
+    if (file === undefined) return undefined
+    if (file.state === 'absent') return null
+    return file.version ?? undefined
+  }
+
+  /**
    * 所有写请求的唯一入口。
    *
    * - 请求体一律由 `intentFor(displayScope, op)` 产出（选中工作区时**一定**带 `workspaceId`，§2.2）；
@@ -655,13 +770,33 @@ export function HooksSection(props?: HooksSectionProps): Jsx {
    *   "一条错误只允许一个渲染点"，绝不两条都写；
    * - 成功后 `nonce + 1` 重新取数（绝不自己在本地猜新状态：那会和宿主的答案漂移）。
    */
+  /**
+   * 一次请求的**时间预算**（15 票）。
+   *
+   * 读请求本来就有预算，写请求与试运行却没有 —— 而 `busy` 是**整页共享**的：宿主一旦不回应，
+   * 每个控件都会永久禁用，用户只能刷新整个页面。这里把它补齐：超时即中止，`busy` 随之释放。
+   */
+  const withBudget = async <T,>(run: (signal: AbortSignal) => Promise<T>): Promise<T> => {
+    const controller = new AbortController()
+    const timer = setTimeout(() => {
+      controller.abort()
+    }, REQUEST_TIMEOUT_MS)
+    try {
+      return await run(controller.signal)
+    } finally {
+      clearTimeout(timer)
+    }
+  }
+
   const runRequest = (op: WriteOp, channel: 'page' | 'form', onSuccess: () => void): void => {
     if (busy) return
     setBusy(true)
     if (channel === 'page') setBanner(null)
     else setFormError(null)
     void (async () => {
-      const outcome = await requestWrite(intentFor(displayScope, op), sessionId)
+      const outcome = await withBudget((signal) =>
+        requestWrite(intentFor(displayScope, op, versionOfScope(displayScope)), sessionId, signal),
+      )
       if (outcome.ok) {
         setNonce((value) => value + 1)
         onSuccess()
@@ -684,6 +819,92 @@ export function HooksSection(props?: HooksSectionProps): Jsx {
       setEditingKey('')
       setConfirmKey('')
       setMenuKey('')
+      setMenuField('')
+      setMenuDraft('')
+    })
+  }
+
+  /**
+   * 打开菜单里某一栏的就地编辑（预填当前值）。
+   *
+   * 同时清掉"改命令"与"删除确认"：同一时刻只允许一件事在编辑态，否则"保存"该发哪个
+   * 定点操作就是猜的（而这正是"改错东西"的来源）。
+   */
+  /**
+   * 就地编辑的目标：能跑的卡片给整行，跑不了的组只给 `event + groupRawIndex`（它没有 hook）。
+   *
+   * 一个入口两种行 —— 否则"改匹配范围"要为被拒组再写一份（两份必然漂移）。
+   */
+  type FieldTarget = { event: string; groupRawIndex: number; hook?: HookView; matcher: string | null }
+
+  const startField = (key: string, field: 'matcher' | 'timeout', row: FieldTarget): void => {
+    setMenuKey(key)
+    setEditingKey('')
+    setConfirmKey('')
+    setMenuField(field)
+    setMenuDraft(
+      field === 'matcher'
+        ? (row.matcher ?? '')
+        : row.hook?.timeoutSec === null || row.hook === undefined
+          ? ''
+          : String(row.hook.timeoutSec),
+    )
+  }
+
+  /** 保存菜单里那一栏。matcher 的合法性用**共享协议那一份**判定（禁止另写一套）。 */
+  const saveField = (row: FieldTarget): void => {
+    if (menuField === 'matcher') {
+      const text = menuDraft.trim()
+      if (matcherDiagnostic(text === '' ? undefined : text) !== undefined) return
+      runWrite({
+        op: 'setGroupMatcher',
+        event: row.event,
+        groupIndex: row.groupRawIndex,
+        matcher: text === '' ? null : text,
+      })
+      return
+    }
+    if (menuField !== 'timeout' || row.hook === undefined) return
+    const text = menuDraft.trim()
+    if (text === '') {
+      runWrite({
+        op: 'setHookTimeout',
+        event: row.event,
+        groupIndex: row.groupRawIndex,
+        hookIndex: row.hook.rawIndex,
+        timeoutSec: null,
+      })
+      return
+    }
+    const value = Number(text)
+    // 走到这里的值一定合法：保存按钮在 `fieldProblem !== null` 时就是禁用的（就地校验在那里）。
+    // 这里只留一条防御性返回 —— 不为不可达的状态再造一条用户可见的报错通道。
+    if (!Number.isFinite(value) || value <= 0) return
+    runWrite({
+      op: 'setHookTimeout',
+      event: row.event,
+      groupIndex: row.groupRawIndex,
+      hookIndex: row.hook.rawIndex,
+      timeoutSec: value,
+    })
+  }
+
+  /**
+   * 上移 / 下移一条（顺序即执行顺序）。
+   *
+   * 目标位置用**邻居的文件下标**（`rawIndexes`）：解析会跳过非 command 条目，所以页面上相邻的
+   * 两条在文件里可能隔着一条。只发 `direction` 就会与文件里的"下一条"互换 —— 用户点了没变化。
+   */
+  const moveRow = (row: CardRow, step: -1 | 1): void => {
+    const target = row.rawIndexes[row.position + step]
+    if (target === undefined) return
+    runWrite({
+      op: 'moveHook',
+      event: row.event,
+      groupIndex: row.groupRawIndex,
+      hookIndex: row.hook.rawIndex,
+      direction: step,
+      toIndex: target,
     })
   }
 
@@ -697,7 +918,11 @@ export function HooksSection(props?: HooksSectionProps): Jsx {
     setConfirmKey('')
     setDryKey('')
     setDryText('')
+    setDryFull('')
     setMenuKey('')
+    setMenuField('')
+    setMenuDraft('')
+    setNewGroup('')
     setFormError(null)
     setNewOpen(false)
   }
@@ -714,6 +939,8 @@ export function HooksSection(props?: HooksSectionProps): Jsx {
     setNewMatcher(template.matcher)
     setNewCommand(template.command)
     setNewTimeout(template.timeout)
+    // 模板换了事件 ⇒ 可选的"已有组"整批换掉，旧下标必须清掉（否则会追加到别的事件的那一组上）。
+    setNewGroup('')
     setFormError(null)
   }
 
@@ -723,13 +950,18 @@ export function HooksSection(props?: HooksSectionProps): Jsx {
     setBanner(null)
     void (async () => {
       // 试运行**不是写操作**：不碰文件、不进台账（§3.8），但寻址同样必须定点到作用域。
-      const outcome = await requestDryRun(
-        dryRunFor(displayScope, { event, groupIndex: groupRawIndex, hookIndex: hook.rawIndex }),
-        sessionId,
+      const outcome = await withBudget((signal) =>
+        requestDryRun(
+          dryRunFor(displayScope, { event, groupIndex: groupRawIndex, hookIndex: hook.rawIndex }),
+          sessionId,
+          signal,
+        ),
       )
       if (outcome.ok && outcome.run !== undefined) {
+        const text = dryRunText(outcome.run)
         setDryKey(rowKey(kind, event, groupRawIndex, hook.rawIndex))
-        setDryText(formatDryRun(outcome.run))
+        setDryText(text.shown)
+        setDryFull(text.full)
       } else {
         setBanner({ code: outcome.error ?? 'internal', detail: outcome.detail ?? '' })
       }
@@ -750,13 +982,18 @@ export function HooksSection(props?: HooksSectionProps): Jsx {
       timeoutSec = value
     }
     runRequest(
-      { op: 'addGroup', event: newEvent, matcher: newMatcher, command: newCommand, timeoutSec },
+      // 有落点就**追加到已有组**（`addHook`），否则新开一组（`addGroup`）—— 两条 op 各司其职，
+      // 不在宿主侧猜"要不要合并"（那是猜，猜错就是改错文件）。
+      newGroup === ''
+        ? { op: 'addGroup', event: newEvent, matcher: newMatcher, command: newCommand, timeoutSec }
+        : { op: 'addHook', event: newEvent, groupIndex: Number(newGroup), command: newCommand, timeoutSec },
       'form',
       () => {
         setNewOpen(false)
         setNewCommand('')
         setNewMatcher('')
         setNewTimeout('')
+        setNewGroup('')
       },
     )
   }
@@ -777,7 +1014,9 @@ export function HooksSection(props?: HooksSectionProps): Jsx {
     return (
       <div className="dsh-hooks">
         <style>{styles}</style>
-        <div className="dsh-hooks__alert dsh-hooks__alert--error">{sentenceFor(phase.code)}</div>
+        <div className="dsh-hooks__alert dsh-hooks__alert--error" role="alert">
+          {sentenceFor(phase.code)}
+        </div>
         {phase.detail === '' ? null : <div className="dsh-hooks__muted">{phase.detail}</div>}
         <div className="dsh-hooks__toolbar">
           <button
@@ -813,19 +1052,84 @@ export function HooksSection(props?: HooksSectionProps): Jsx {
   const primary = primaryFileOf(snapshot)
   const others = snapshot.files.filter((file) => file !== primary)
   const needle = query.trim().toLowerCase()
+  /**
+   * 搜索匹配"**页面上的字**"（16 票）。
+   *
+   * 以前只匹配命令 / 匹配范围 / **英文**事件枚举 —— 而页面主文案是中文事件名与状态词，
+   * 于是搜"工具运行前"、"已停用"、"失败"全是 0 结果（用户会以为 hook 没了）。
+   */
   const matches = (hook: HookView, group: GroupView, event: string): boolean => {
     if (needle === '') return true
-    return (
-      hook.command.toLowerCase().includes(needle) ||
-      (group.matcher ?? '').toLowerCase().includes(needle) ||
-      event.toLowerCase().includes(needle)
-    )
+    const haystack = [
+      hook.command,
+      group.matcher ?? '',
+      event,
+      eventLabel(event),
+      statusOf(hook).label,
+      hook.disabled ? '已停用' : '',
+    ]
+      .join('\n')
+      .toLowerCase()
+    return haystack.includes(needle)
   }
   const options = scopeOptions(snapshot)
   const rows = primary === undefined ? [] : cardRows(primary, matches)
   const fileTotal = primary === undefined ? 0 : primary.hookCount
   const disabledTotal = primary === undefined ? 0 : disabledCountOf(primary)
   const shown = rows.length
+  /**
+   * 文件里跑不了的那些组（06 票）：**主列表里每一条都要有归属**。
+   *
+   * 它们不进 `rows`（那是"会运行的东西"），但也不许消失 —— 每一条渲染成一行灰化的
+   * 「不会运行」，原因写在正文里。搜索时按同一套字面过滤（事件名 / 匹配范围）。
+   */
+  const blocked: RejectedGroupView[] =
+    primary === undefined
+      ? []
+      : primary.rejected.filter(
+          (row) =>
+            needle === '' ||
+            row.event.toLowerCase().includes(needle) ||
+            eventLabel(row.event).toLowerCase().includes(needle) ||
+            (row.matcher ?? '').toLowerCase().includes(needle) ||
+            '不会运行'.includes(needle),
+        )
+  /** 文件里跑不了的**条数**（口径由宿主给：被跳过的 handler + 被拒的组）。 */
+  const unrunnableTotal = primary === undefined ? 0 : primary.unrunnable
+  /** 文件里**真实**条目数 = 能跑的（含停用）+ 跑不了的。 */
+  const fileRealTotal = fileTotal + unrunnableTotal
+  /** 新建表单的"已有组"选项（按当前选中的事件取；没有组时这一栏不出现）。 */
+  const newFormGroups =
+    primary === undefined
+      ? []
+      : (primary.events.find((view) => view.event === newEvent)?.groups ?? []).map((group) => ({
+          rawIndex: group.rawIndex,
+          matcher: group.matcher,
+        }))
+  /**
+   * 生效（合并）视图的数据（13 票）：用户级在前、项目级在后，**顺序即执行顺序**。
+   *
+   * 这份数据一直躺在快照里（`events` + `fromUser` / `fromProject`），但页面一个字段都没渲染过 ——
+   * 于是"实际会跑什么、什么顺序、来自哪一份"这个最核心的问题在页面上无法回答。
+   */
+  const effectiveRows = snapshot.events
+    .filter((view) => view.groups.length > 0)
+    .map((view) => ({
+      event: view.event,
+      groups: view.groups.map((group) => ({
+        file: group.file,
+        matcher: group.matcher,
+        hookCount: group.hooks.length,
+      })),
+    }))
+  let effectiveTotal = 0
+  let effectiveUser = 0
+  let effectiveProject = 0
+  for (const view of snapshot.events) {
+    effectiveTotal += view.hookCount
+    effectiveUser += view.fromUser
+    effectiveProject += view.fromProject
+  }
   /**
    * 搜索框**只在真的有东西可筛时**出现（`fileTotal >= 5`）：1 条 hook 的页面上它是纯噪音。
    *
@@ -836,7 +1140,11 @@ export function HooksSection(props?: HooksSectionProps): Jsx {
   const showSearch = fileTotal >= 5 || needle !== ''
   /** 第二行那句人话：总条数（含已停用）+ 停用数 + 筛选口径 —— `钩子 N` / `已安装 N` 两个 chip 都删了。 */
   const countText = needle === '' ? `${String(fileTotal)} 个 hook` : `匹配 ${String(shown)} / 共 ${String(fileTotal)}`
-  const metaText = disabledTotal === 0 ? countText : `${countText} · 其中 ${String(disabledTotal)} 个已停用`
+  const disabledText = disabledTotal === 0 ? '' : ` · 其中 ${String(disabledTotal)} 个已停用`
+  // 跑不了的条数**分开说**：以前它们既不在卡片里、也不在任何一句话里，用户只能得出
+  // "文件里没有这些"（而他明明在文件里看见了）。
+  const unrunnableText = unrunnableTotal === 0 ? '' : ` · 另有 ${String(unrunnableTotal)} 条跑不了`
+  const metaText = `${countText}${disabledText}${unrunnableText}`
   // 触发器 label / 勾选位置 / 说明文字全部按**回显**（`displayScope`），不按本地 state：
   // 否则同屏会出现"触发器说用户级、数据是项目级"（AGENTS §2.6）。
   const displayLabel = echoedLabelOf(snapshot)
@@ -959,7 +1267,7 @@ export function HooksSection(props?: HooksSectionProps): Jsx {
             className="dsh-hooks__search"
             type="search"
             value={query}
-            placeholder="搜索钩子…"
+            placeholder="搜索 hook…"
             onChange={(changeEvent) => {
               setQuery(changeEvent.target.value)
             }}
@@ -1015,7 +1323,9 @@ export function HooksSection(props?: HooksSectionProps): Jsx {
       {/* 唯一的提示行（§2.1 / §2.9 / §3.9 的话都在这里，不再堆叠）。
           非当前工作区那条是**信息**（`--info`，没有黄底）+ 一个 ghost 动作（仅当目标 ≠ 当前作用域）。 */}
       {alert === null ? null : (
-        <div className={`dsh-hooks__alert dsh-hooks__alert--${alert.tone}`}>
+        // `role="alert"`：读取失败 / 保存失败 / 非当前工作区这些**异步**结论要能被读屏播报
+        // （17 票：以前它们只出现在视觉上）。
+        <div className={`dsh-hooks__alert dsh-hooks__alert--${alert.tone}`} role="alert">
           <span className="dsh-hooks__alerttext">
             {alert.text}
             {alert.detail === '' ? null : <span className="dsh-hooks__muted">（{alert.detail}）</span>}
@@ -1038,12 +1348,19 @@ export function HooksSection(props?: HooksSectionProps): Jsx {
       {newOpen ? (
         <NewHookForm
           draft={{ event: newEvent, matcher: newMatcher, command: newCommand, timeout: newTimeout }}
+          groups={newFormGroups}
+          target={newGroup}
+          onTarget={setNewGroup}
           error={formError === null ? null : writeErrorSentence(formError.code)}
           errorDetail={formError === null ? '' : formError.detail}
           busy={busy}
           writable={writable}
           onTemplate={applyTemplate}
-          onEvent={setNewEvent}
+          onEvent={(value) => {
+            // 换事件 ⇒ 可选的"已有组"整批换掉（旧下标不再指向同一组）。
+            setNewEvent(value)
+            setNewGroup('')
+          }}
           onMatcher={setNewMatcher}
           onCommand={setNewCommand}
           onTimeout={setNewTimeout}
@@ -1051,6 +1368,7 @@ export function HooksSection(props?: HooksSectionProps): Jsx {
           onCancel={() => {
             setNewOpen(false)
             setFormError(null)
+            setNewGroup('')
           }}
         />
       ) : null}
@@ -1059,33 +1377,33 @@ export function HooksSection(props?: HooksSectionProps): Jsx {
           主列表为空时有四种情形，**分别**说清（"空"与"读不出来"绝不许混，§2.9/§3.9）：
           ① 搜索没命中 → "没有匹配的 hook"；② 文件不存在 → 空状态块（附"新建配置文件"）；
           ③ 文件在但 0 条 → 空状态块；④ 文件读不出来 → 如实说"无法判断"，**不冒充空的**。 */}
-      {needle !== '' && rows.length === 0 ? (
+      {needle !== '' && rows.length === 0 && blocked.length === 0 ? (
         <div className="dsh-hooks__muted">没有匹配的 hook</div>
-      ) : rows.length === 0 && primary !== undefined ? (
-        primary.state === 'error' ? (
-          <div className="dsh-hooks__muted">文件读不出来，无法判断里面有没有 hook（见上面的提示）。</div>
-        ) : (
-          <EmptyState
-            block={emptyBlockOf(snapshot, primary)}
-            writable={writable}
-            busy={busy}
-            onCreateHook={() => {
-              setNewOpen(true)
-              setFormError(null)
-            }}
-            onCreateFile={() => {
-              runWrite({ op: 'createFile' })
-            }}
-            onGuide={changeScope}
-          />
-        )
-      ) : rows.length === 0 ? (
+      ) : rows.length === 0 && primary !== undefined && primary.state === 'error' ? (
+        <div className="dsh-hooks__muted">文件读不出来，无法判断里面有没有 hook（见上面的提示）。</div>
+      ) : rows.length === 0 && blocked.length === 0 && primary !== undefined ? (
+        <EmptyState
+          block={emptyBlockOf(snapshot, primary)}
+          writable={writable}
+          busy={busy}
+          onCreateHook={() => {
+            setNewOpen(true)
+            setFormError(null)
+          }}
+          onCreateFile={() => {
+            runWrite({ op: 'createFile' })
+          }}
+          onGuide={changeScope}
+        />
+      ) : rows.length === 0 && blocked.length === 0 ? (
         <div className="dsh-hooks__muted">这个作用域没有可编辑的文件。</div>
       ) : (
         <div className="dsh-hooks__list">
           {rows.map((row) => {
             const kind = primary === undefined ? 'project' : primary.kind
             const key = rowKey(kind, row.event, row.groupRawIndex, row.hook.rawIndex)
+            /** 整组删除的确认键（与单条删除共用同一个 `confirmKey`，靠前缀区分）。 */
+            const groupKey = `group|${key}`
             return (
               <HookCard
                 key={key}
@@ -1098,8 +1416,46 @@ export function HooksSection(props?: HooksSectionProps): Jsx {
                 editing={editingKey === key}
                 draft={draft}
                 confirming={confirmKey === key}
-                menuOpen={menuKey === key || editingKey === key || confirmKey === key}
+                menuOpen={menuKey === key || editingKey === key || confirmKey === key || confirmKey === groupKey}
                 dryText={dryKey === key ? dryText : ''}
+                dryFull={dryKey === key ? dryFull : ''}
+                menu={{
+                  field: menuKey === key ? menuField : '',
+                  draft: menuDraft,
+                  problem: fieldProblemOf(menuKey === key ? menuField : '', menuDraft),
+                  canMoveUp: row.position > 0,
+                  canMoveDown: row.position < row.groupSize - 1,
+                  confirmingGroup: confirmKey === groupKey,
+                }}
+                onField={(field) => {
+                  startField(key, field, row)
+                }}
+                onFieldDraft={setMenuDraft}
+                onSaveField={() => {
+                  saveField(row)
+                }}
+                onCancelField={() => {
+                  setMenuField('')
+                  setMenuDraft('')
+                }}
+                onMoveUp={() => {
+                  moveRow(row, -1)
+                }}
+                onMoveDown={() => {
+                  moveRow(row, 1)
+                }}
+                onAskRemoveGroup={() => {
+                  setConfirmKey(groupKey)
+                  setEditingKey('')
+                  setMenuField('')
+                }}
+                onRemoveGroup={() => {
+                  runWrite({ op: 'removeGroup', event: row.event, groupIndex: row.groupRawIndex })
+                }}
+                onCancelRemoveGroup={() => {
+                  setConfirmKey('')
+                  setMenuKey('')
+                }}
                 onToggle={() => {
                   runWrite({
                     op: 'setHookDisabled',
@@ -1168,6 +1524,47 @@ export function HooksSection(props?: HooksSectionProps): Jsx {
               />
             )
           })}
+          {/* 跑不了的组：**紧跟能跑的卡片之后**，一行一条，带原因、不带试运行。
+              全部跑不了时这里也会有一条汇总句（否则用户只看到几行灰字，不知道该干什么）。 */}
+          {blocked.length === 0 ? null : (
+            <div className="dsh-hooks__muted">
+              {rows.length === 0
+                ? `文件里有 ${String(fileRealTotal)} 条，其中 ${String(unrunnableTotal)} 条跑不了 —— 它们不会运行。`
+                : `还有 ${String(unrunnableTotal)} 条跑不了（灰化的那几行）。`}
+            </div>
+          )}
+          {blocked.map((row) => {
+            const key = `blocked|${row.event}|${String(row.groupIndex)}`
+            const target: FieldTarget = { event: row.event, groupRawIndex: row.groupIndex, matcher: row.matcher }
+            return (
+              <BlockedRow
+                key={key}
+                row={row}
+                writable={writable}
+                busy={busy}
+                menuOpen={menuKey === key}
+                field={menuKey === key ? menuField : ''}
+                fieldDraft={menuDraft}
+                fieldProblem={fieldProblemOf(menuKey === key ? menuField : '', menuDraft)}
+                onToggleMenu={() => {
+                  setMenuKey(menuKey === key ? '' : key)
+                  setMenuField('')
+                  setMenuDraft('')
+                }}
+                onField={(field) => {
+                  startField(key, field, target)
+                }}
+                onFieldDraft={setMenuDraft}
+                onSaveField={() => {
+                  saveField(target)
+                }}
+                onCancelField={() => {
+                  setMenuField('')
+                  setMenuDraft('')
+                }}
+              />
+            )
+          })}
         </div>
       )}
 
@@ -1210,9 +1607,12 @@ export function HooksSection(props?: HooksSectionProps): Jsx {
           )
         })}
 
-      {/* ── 底部**只有一个**折叠区 `更多`：7 个事件（含 0 条）+ 诊断 ──
+      {/* ── 底部**只有一个**折叠区 `更多`：生效配置 + 7 个事件（含 0 条）+ 诊断。
           v3 是两个并列开关（`查看全部事件（7）` / `诊断`），"诊断"两个字挂在每一屏上就是
-          用户说的"一堆说明和检测"。事实没删：一行字 + 一次点击之后全都在。 */}
+          用户说的"一堆说明和检测"。事实没删：一行字 + 一次点击之后全都在。
+
+          ⚠️ 18 票起分成**三节**（各带标题）：以前事件行与诊断行直接拼在一起，两套列宽（150 / 96）
+          混排，读起来是一堆没有结构的行；而诊断值是内部字段直出（`kind=… requested=…`）。 */}
       <div className="dsh-hooks__folds">
         <button
           type="button"
@@ -1227,9 +1627,44 @@ export function HooksSection(props?: HooksSectionProps): Jsx {
         </button>
       </div>
 
-      {/* 全部事件：**7 个永远都在这里**（含 0 条）——"空"没有变得不可达（见文件头的偏离说明） */}
       {moreOpen ? (
         <div className="dsh-hooks__foldbody">
+          {/* ① 生效配置（13 票）：用户级 + 项目级按**执行顺序**排开 —— 这是"实际会跑什么"的答案，
+              数据一直在快照里（`events`），只是以前一个字段都没渲染。 */}
+          <div className="dsh-hooks__foldhead">生效配置</div>
+          <div className="dsh-hooks__effectrow">
+            <span className="dsh-hooks__eventname dsh-hooks__eventname--fold">将运行</span>
+            <span className="dsh-hooks__count">
+              {`${String(effectiveTotal)} 条（用户级 ${String(effectiveUser)} + 项目级 ${String(
+                effectiveProject,
+              )}）${snapshot.session === null ? ' —— 当前会话未知，这不代表实际会跑什么' : ''}`}
+            </span>
+          </div>
+          {effectiveRows.length === 0 ? (
+            <div className="dsh-hooks__effectrow">
+              <span className="dsh-hooks__eventname dsh-hooks__eventname--fold">—</span>
+              <span className="dsh-hooks__muted">这一份作用域里没有任何会运行的 hook</span>
+            </div>
+          ) : (
+            effectiveRows.map((row) =>
+              row.groups.map((group, index) => (
+                <div className="dsh-hooks__effectrow" key={`${row.event}-${String(index)}`}>
+                  <span className="dsh-hooks__eventname dsh-hooks__eventname--fold" title={eventTitle(row.event)}>
+                    {/* 顺序即执行顺序：序号就是它在事件里的执行位次（用户级在前、项目级在后）。 */}
+                    {`${String(index + 1)}. ${eventLabel(row.event)}`}
+                  </span>
+                  <span className="dsh-hooks__count">
+                    {`${group.file === 'user' ? '用户级' : group.file === 'project' ? '项目级' : '来源未知'} · ${
+                      group.matcher === null ? '匹配全部' : `匹配 ${group.matcher}`
+                    } · ${String(group.hookCount)} 条`}
+                  </span>
+                </div>
+              )),
+            )
+          )}
+
+          {/* ② 全部事件：**7 个永远都在这里**（含 0 条）——"空"没有变得不可达（见文件头的偏离说明） */}
+          <div className="dsh-hooks__foldhead">全部事件</div>
           {eventRows.map(({ event, file }) => (
             <div className="dsh-hooks__eventrow" key={event}>
               <span className="dsh-hooks__eventname dsh-hooks__eventname--fold" title={eventTitle(event)}>
@@ -1267,32 +1702,28 @@ export function HooksSection(props?: HooksSectionProps): Jsx {
               ) : null}
             </div>
           ))}
-        </div>
-      ) : null}
 
-      {/* 诊断：所有"开发者要看的"东西都收在这里（与事件行**同一个** `更多` 里，默认收起）。
-          P0-2 删掉的那两条事实（项目根 / 写入会被沙箱判定）必须有落点 —— 前者本来就在，
-          后者是这一轮新增的 `写入权限` 一行。
-          ⚠️ v4 起它与"7 个事件"共用一次点击：**没有任何事实被删掉**，只是不再各占一个开关。 */}
-      {moreOpen ? (
-        <div className="dsh-hooks__foldbody">
+          {/* ③ 诊断：所有"开发者要看的"东西都收在这里。**值一律人话**（内部字段名只作补充）。 */}
+          <div className="dsh-hooks__foldhead">诊断</div>
           <DiagRow label="作用域" value={help} />
           <DiagRow label="当前会话" value={sessionLine(snapshot)} />
           <DiagRow label="项目根" value={snapshot.projectRoot ?? '未知（没有会话上下文，不编造）'} />
-          <DiagRow label="cwd 来源" value={snapshot.cwdSource} />
+          <DiagRow label="工作目录来源" value={cwdSourceText(snapshot.cwdSource)} />
           <DiagRow label="写入权限" value="按调用会话的沙箱策略判定；被拒绝时报 sandbox" />
+          <DiagRow label="状态记录" value="只记录本次进程内的真实执行；重启后回到「未运行」" />
           <DiagRow
             label="作用域回显"
-            value={`kind=${snapshot.scope.kind} requested=${snapshot.scope.requested} workspaceId=${String(
-              snapshot.scope.workspaceId,
-            )} isCurrentSession=${String(snapshot.scope.isCurrentSession)}`}
+            value={`请求的是「${requestedScopeText(snapshot)}」，实际给的是「${scopeWhere(
+              snapshot,
+              displayScope,
+            )}」${snapshot.scope.isCurrentSession === null ? '（当前会话未知，无法判断是不是它）' : ''}`}
           />
           {primary === undefined ? null : (
             <DiagRow
               label="当前文件"
               value={`${primary.path} · ${stateToken(primary)} · 版本 ${String(primary.version)} · ${String(
                 primary.hookCount,
-              )} 个`}
+              )} 个${primary.unrunnable > 0 ? `（另有 ${String(primary.unrunnable)} 条跑不了）` : ''}`}
             />
           )}
           {others.map((file) => (
@@ -1308,7 +1739,10 @@ export function HooksSection(props?: HooksSectionProps): Jsx {
               value={`${snapshot.scope.workspacePath}（≠ 项目根，配置落在项目根的 .dsh/hooks.json）`}
             />
           ) : null}
-          <DiagRow label="staleInUse" value={snapshot.staleInUse ? '是（沿用上一份可用配置）' : '否'} />
+          <DiagRow
+            label="沿用旧配置"
+            value={snapshot.staleInUse ? '是（磁盘此刻读不出来，运行的是上一份可用配置）' : '否'}
+          />
           <DiagRow
             label="工作区清单"
             value={
@@ -1327,20 +1761,11 @@ export function HooksSection(props?: HooksSectionProps): Jsx {
           ) : null}
           {primary === undefined ? null : (
             <DiagRow
-              label="matcher 诊断"
+              label="匹配范围诊断"
               value={primary.matcherErrors.length === 0 ? '无' : primary.matcherErrors.join('；')}
             />
           )}
-          {primary === undefined ? null : (
-            <DiagRow
-              label="跳过的 handler"
-              value={
-                primary.skipped.length === 0
-                  ? '无'
-                  : primary.skipped.map((item) => `${item.event}:${item.type}`).join('、')
-              }
-            />
-          )}
+          {primary === undefined ? null : <DiagRow label="跑不了的条目" value={skippedText(primary.skipped)} />}
           {banner === null ? null : <DiagRow label="错误详情" value={`${banner.code} ${banner.detail}`} />}
         </div>
       ) : null}

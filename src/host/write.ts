@@ -70,6 +70,14 @@ export type HooksOp =
       hookIndex: number
       /** -1 = 上移，+1 = 下移（顺序即执行顺序，所以这是个语义操作）。 */
       direction: -1 | 1
+      /**
+       * 目标位置（**文件下标**）。
+       *
+       * 为什么需要它：页面上"上一条"是**解析后**的邻居，而解析会跳过非 command 条目 ——
+       * 于是"相邻"在文件里可能是 0 和 2。只按 `direction` 移动会与文件里的 1 号互换，
+       * 用户点了"上移"却什么也没变（看起来像按钮坏了）。给了 `toIndex` 就按它换。
+       */
+      toIndex?: number
     }
   | { op: 'removeGroup'; file: FileKind; event: HookEvent; groupIndex: number }
   | {
@@ -103,11 +111,28 @@ export interface WorkspaceField {
   workspaceId?: string
 }
 
+/**
+ * 请求信封：作用域 + **页面看到的版本**。
+ *
+ * `expectedVersion` 是乐观锁的页面侧那一半（03 票）。为什么必须由页面给而宿主不自己重新读：
+ * 目标是用 `groupIndex` / `hookIndex` 这种**文件下标**寻址的，而"页面渲染 → 用户点按钮"
+ * 之间任何一次外部插入/删除都会让同一个下标指到另一条 hook 上。保留性证明只证明
+ * "我只改了声明的那一处"，证明不了"那一处还是原来那条" —— 只有页面手里那个版本能证明。
+ *
+ * 三种取值：
+ *   - 字符串 → 按它 `replaceIfVersion`；磁盘不是这个版本就 `stale`；
+ *   - `null` → 页面认为目标不存在 → 宿主要求**确实**不存在（否则 `stale`）；
+ *   - 缺省 → 旧页面（向后兼容）：宿主读后写，行为与改动前逐字一致。
+ */
+export interface RequestEnvelope extends WorkspaceField {
+  expectedVersion?: string | null
+}
+
 /** 客户端能发的完整请求体。 */
-export type HooksRequest = (HooksOp | { op: 'createFile'; file: FileKind }) & WorkspaceField
+export type HooksRequest = (HooksOp | { op: 'createFile'; file: FileKind }) & RequestEnvelope
 
 /** 拒写的机器可读原因（页面据此给出各自的文案，而不是一句"保存失败"）。 */
-export type OpFailure = 'bad-op' | 'not-found' | 'out-of-range' | 'not-preservable'
+export type OpFailure = 'bad-op' | 'not-found' | 'out-of-range' | 'not-preservable' | 'malformed-event'
 
 /** 有意改动的一处：比较时用它把两边"改动的那一处"抹掉，剩下的必须逐字段相等。 */
 export interface Change {
@@ -142,14 +167,24 @@ export interface DocStyle {
   indent: string
   eol: '\n' | '\r\n'
   finalNewline: boolean
+  /**
+   * 源文件**完全没有换行**（minified / 工具生成）。
+   *
+   * 这一档必须单独记：按"行首空白"探测缩进在单行文件上一个字符都探不到，于是会回退两空格，
+   * 一次编辑就把整份文件展开成十几行 —— 用户在编辑器里看到的是"我只改了一条命令，整个文件全红了"。
+   */
+  compact: boolean
 }
 
 /**
  * 探测文件的风格。
  *
- * JSON 没有注释，格式上只有三件事需要保持：缩进、行尾、结尾换行。按"第一处行首空白"取缩进；
- * 探测不到就退回 2 空格（同时也是我们自己的输出风格，于是我们写的文件是**不动点**：
- * 再解析再序列化与原文逐字节相同 → 后续编辑的 diff 只会是最小的一处）。
+ * JSON 没有注释，格式上只有四件事需要保持：缩进、行尾、结尾换行、以及"是不是一行"。
+ * 按"第一处行首空白"取缩进；探测不到就退回 2 空格（同时也是我们自己的输出风格，于是我们写的
+ * 文件是**不动点**：再解析再序列化与原文逐字节相同 → 后续编辑的 diff 只会是最小的一处）。
+ *
+ * 已知残留（写进文档，不当 bug 修）：多行但**完全没有缩进**的文件仍会被规范成 2 空格 ——
+ * 那种形状没有可靠的探测依据，硬猜比重排更危险。
  */
 export function detectStyle(text: string): DocStyle {
   const indentMatch = text.match(/^([ \t]+)"/m)
@@ -158,6 +193,7 @@ export function detectStyle(text: string): DocStyle {
     indent: captured !== undefined && captured.length > 0 ? captured : '  ',
     eol: text.includes('\r\n') ? '\r\n' : '\n',
     finalNewline: text.endsWith('\n'),
+    compact: text.length > 0 && !text.includes('\n'),
   }
 }
 
@@ -166,8 +202,9 @@ function reindent(text: string, indent: string): string {
   return text.replace(/^( +)/gm, (spaces) => indent.repeat(Math.floor(spaces.length / 2)))
 }
 
-/** 按探测到的风格序列化。 */
+/** 按探测到的风格序列化。紧凑文件（源文件只有一行）保持一行，不许展开。 */
 export function serialize(doc: Record<string, unknown>, style: DocStyle): string {
+  if (style.compact) return JSON.stringify(doc)
   const pretty = JSON.stringify(doc, null, 2)
   const body = style.indent === '  ' ? pretty : reindent(pretty, style.indent)
   const withEol = style.eol === '\n' ? body : body.split('\n').join(style.eol)
@@ -175,7 +212,7 @@ export function serialize(doc: Record<string, unknown>, style: DocStyle): string
 }
 
 /** 默认风格（我们自己的输出风格，也是新建文件用的风格）。 */
-export const DEFAULT_STYLE: DocStyle = { indent: '  ', eol: '\n', finalNewline: true }
+export const DEFAULT_STYLE: DocStyle = { indent: '  ', eol: '\n', finalNewline: true, compact: false }
 
 /** 新文件的内容：一个自解释的空配置。 */
 export function starterText(style: DocStyle): string {
@@ -273,6 +310,19 @@ function eventListOf(doc: Record<string, unknown>, event: HookEvent): unknown[] 
   return isUnknownArray(list) ? list : undefined
 }
 
+/**
+ * 事件键**存在但不是数组**（用户手写坏了的形状）。
+ *
+ * 为什么必须单独判：`addGroup` 早先把它当"事件数组不存在"处理，于是**整段覆盖**掉用户的内容
+ * （`{PreToolUse: {oops:…}}` → `[新组]`），而保留性证明会**放行** —— 因为它声明的是
+ * "我改的就是 `PreToolUse` 这个键"。证明只能保护"声明之外"的字段，保护不了"声明之内的原文"。
+ * 所以：结构坏了就拒写，让用户自己去修。
+ */
+function hasMalformedEvent(doc: Record<string, unknown>, event: HookEvent): boolean {
+  const value = hooksMapOf(doc)[event]
+  return value !== undefined && !isUnknownArray(value)
+}
+
 /** 取一个 group 对象（下标越界 / 形状不对都返回 undefined）。 */
 function groupAt(
   doc: Record<string, unknown>,
@@ -364,6 +414,7 @@ export function applyOp(doc: Record<string, unknown>, op: HooksOp): OpResult {
 
     case 'addHook': {
       if (op.command.length === 0) return { ok: false, reason: 'bad-op' }
+      if (hasMalformedEvent(next, op.event)) return { ok: false, reason: 'malformed-event' }
       const group = groupAt(next, op.event, op.groupIndex)
       if (group === undefined || !isUnknownArray(group.hooks)) return { ok: false, reason: 'not-found' }
       const added: Record<string, unknown> = { type: 'command', command: op.command }
@@ -377,28 +428,37 @@ export function applyOp(doc: Record<string, unknown>, op: HooksOp): OpResult {
     }
 
     case 'removeHook': {
+      const list = eventListOf(next, op.event)
       const group = groupAt(next, op.event, op.groupIndex)
-      if (group === undefined || !isUnknownArray(group.hooks)) return { ok: false, reason: 'not-found' }
+      if (list === undefined || group === undefined || !isUnknownArray(group.hooks)) {
+        return { ok: false, reason: 'not-found' }
+      }
       if (op.hookIndex < 0 || op.hookIndex >= group.hooks.length) return { ok: false, reason: 'not-found' }
       group.hooks.splice(op.hookIndex, 1)
-      return {
-        ok: true,
-        applied: {
-          doc: next,
-          // `original`：那一项**只有原文**有（新文档里已经删掉了），抹两侧会对不上。
-          changes: [{ path: [...groupPath(next, op), 'hooks', op.hookIndex], mode: 'index', area: 'original' }],
-        },
+      const changes: Change[] = [
+        // `original`：那一项**只有原文**有（新文档里已经删掉了），抹两侧会对不上。
+        { path: [...groupPath(next, op), 'hooks', op.hookIndex], mode: 'index', area: 'original' },
+      ]
+      // **回收空组**：删掉最后一条之后，那一组在文件里就成了 `{"matcher":"…","hooks":[]}` ——
+      // 解析器会丢弃它（`commands.length === 0`），于是页面上看不见、文件里永远删不掉。
+      // 两处下标删除分属**不同数组**，`strip` 的"同一数组内从大到小"排序不受影响。
+      if (group.hooks.length === 0) {
+        list.splice(op.groupIndex, 1)
+        changes.push({ path: [...mapPath(next), op.event, op.groupIndex], mode: 'index', area: 'original' })
       }
+      return { ok: true, applied: { doc: next, changes } }
     }
 
     case 'moveHook': {
       const group = groupAt(next, op.event, op.groupIndex)
       if (group === undefined || !isUnknownArray(group.hooks)) return { ok: false, reason: 'not-found' }
       const from = op.hookIndex
-      const to = from + op.direction
+      // `toIndex` 优先：页面的"上一条/下一条"是**解析后**的邻居，文件里可能隔着被跳过的条目。
+      const to = op.toIndex === undefined ? from + op.direction : op.toIndex
       if (from < 0 || from >= group.hooks.length || to < 0 || to >= group.hooks.length) {
         return { ok: false, reason: 'out-of-range' }
       }
+      if (from === to) return { ok: false, reason: 'out-of-range' }
       const moved = group.hooks[from]
       group.hooks[from] = group.hooks[to]
       group.hooks[to] = moved
@@ -416,6 +476,7 @@ export function applyOp(doc: Record<string, unknown>, op: HooksOp): OpResult {
 
     case 'addGroup': {
       if (op.command.length === 0) return { ok: false, reason: 'bad-op' }
+      if (hasMalformedEvent(next, op.event)) return { ok: false, reason: 'malformed-event' }
       const map = hooksMapOf(next)
       const existing = map[op.event]
       // 事件数组不存在就**创建**它。顶层形状由 `hooksMapOf()` 判定：
@@ -510,12 +571,21 @@ export function parseHooksRequest(body: unknown): RequestParse {
       return { ok: false, reason: 'file 为 user 时不许带 workspaceId（用户级配置不属于任何工作区）' }
     }
   }
-  /** 作用域字段（只在给定时出现 —— 不凭空补 `workspaceId: undefined` 这个键）。 */
-  const scope: WorkspaceField = rawWorkspaceId === undefined ? {} : { workspaceId: rawWorkspaceId }
-  /** 成功返回：把作用域字段**统一**挂到请求体上（调用点不许自己拼，§2.2）。 */
+  /** 信封字段（只在给定时出现 —— 不凭空补 `workspaceId: undefined` 这种键）。 */
+  const envelope: RequestEnvelope = rawWorkspaceId === undefined ? {} : { workspaceId: rawWorkspaceId }
+
+  // `expectedVersion` 同样是**不可信输入**：只认字符串 / null / 缺省。
+  // 字符串可以是任意值（哪怕过期）：过不过期由写入路径拿磁盘版本去比 —— 这里只保证类型。
+  const rawVersion = body.expectedVersion
+  if (rawVersion !== undefined && rawVersion !== null && typeof rawVersion !== 'string') {
+    return { ok: false, reason: 'expectedVersion 必须是字符串、null 或缺省' }
+  }
+  if (rawVersion !== undefined) envelope.expectedVersion = rawVersion
+
+  /** 成功返回：把信封字段**统一**挂到请求体上（调用点不许自己拼，§2.2）。 */
   const ok = (request: HooksOp | { op: 'createFile'; file: FileKind }): RequestParse => ({
     ok: true,
-    request: { ...request, ...scope },
+    request: { ...request, ...envelope },
   })
 
   /** 校验 event（`addGroup` 用：它没有 groupIndex —— 新开一组本来就没有"哪一组"）。 */
@@ -625,8 +695,22 @@ export function parseHooksRequest(body: unknown): RequestParse {
       const where = withHook()
       if (typeof where === 'string') return { ok: false, reason: where }
       const direction = body.direction === -1 ? -1 : body.direction === 1 ? 1 : undefined
-      if (direction === undefined) return { ok: false, reason: 'direction 必须是 -1 或 1' }
-      return ok({ op, file, ...where, direction })
+      const toIndex = body.toIndex === undefined ? undefined : indexOf(body.toIndex)
+      if (body.toIndex !== undefined && toIndex === undefined) {
+        return { ok: false, reason: 'toIndex 必须是非负整数' }
+      }
+      // 两种写法都收：`direction`（相邻挪一格）或 `toIndex`（挪到指定位置）。
+      // 都没有就没法移动 —— 但**不许**静默当成 direction=1。
+      if (direction === undefined && toIndex === undefined) {
+        return { ok: false, reason: 'direction 必须是 -1 或 1（或给 toIndex）' }
+      }
+      return ok({
+        op,
+        file,
+        ...where,
+        direction: direction ?? 1,
+        ...(toIndex === undefined ? {} : { toIndex }),
+      })
     }
 
     case 'removeGroup': {

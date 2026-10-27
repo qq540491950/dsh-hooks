@@ -2,7 +2,7 @@
   "name": "dsh-hooks",
   "version": "0.2.2",
   "private": true,
-  "description": "DSH Host 插件：按项目读取 <projectRoot>/.dsh/hooks.json 与 $DSH_HOME/hooks.json，运行通用 hooks 格式的配置；并在设置页提供可视化管理（order 920）。",
+  "description": "DSH Host 插件：按项目读取 <projectRoot>/.dsh/hooks.json 与 $DSH_HOME/hooks.json，运行通用 hooks 格式的配置；并在设置页提供可视化管理。",
   "type": "module",
   "main": "lib/index.js",
   "icon": "./icon.svg",
@@ -42,8 +42,7 @@
     "check": "pnpm typecheck && pnpm typecheck:tools && pnpm format:check && pnpm lint && pnpm verify"
   },
   "engines": {
-    "node": ">=22.18",
-    "dsh": "0.2.0-rc.2"
+    "node": ">=22.18"
   },
   "packageManager": "pnpm@12.5.1",
   "peerDependencies": {

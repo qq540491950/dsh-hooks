@@ -200,15 +200,39 @@ export const styles = `
 /* 正文里那**一个**状态词（未运行 / 通过 / 失败 / 已阻断）。它旁边就是状态点，
    所以这里的颜色不承担语义（颜色在点上；词是给色觉障碍与纯文本渲染的答案）。 */
 .dsh-hooks__status { flex:none; font-size:12px; color:var(--dsw-alias-label-secondary, inherit); }
-/* 「⋯」展开出来的那一块：左边一句"匹配 X · 超时 Y"，右边三个动作。 */
+/* 「⋯」展开出来的那一块：第一排是两栏元信息（匹配范围 / 超时，**可点开编辑**）+ 上移/下移，
+   第二排是动作。两排各占一行（__cardmenuwrap 是纵向容器），窄宽度下换行也只在自己那排里换。 */
+.dsh-hooks__cardmenuwrap { display:flex; flex-direction:column; gap:6px; min-width:0; }
 .dsh-hooks__cardmenu { display:flex; align-items:center; gap:8px; min-width:0; min-height:24px; flex-wrap:wrap; }
+/* 可点开的元信息（匹配范围 / 超时）：看起来像"值"，但鼠标一到就亮起来 —— 它是个按钮。
+   刻意不用 __btn 类：D 区按 __btn 数"这一排有几个动作按钮"，混进来那条计数就测错对象。 */
+.dsh-hooks__fieldbtn { font:inherit; font-size:12px; line-height:1; min-height:24px; padding:0 6px; border:0; border-radius:6px;
+  background:transparent; color:var(--dsw-alias-label-secondary, inherit); cursor:pointer; flex:none; text-align:left; }
+.dsh-hooks__fieldbtn:hover:not(:disabled) { color:var(--dsw-alias-label-primary, inherit);
+  background:var(--dsw-alias-interactive-bg-hover, rgba(127,127,127,.12)); }
+.dsh-hooks__fieldbtn:disabled { opacity:.5; cursor:default; }
 .dsh-hooks__meta { flex:none; font-size:12px; color:var(--dsw-alias-label-secondary, inherit); }
 .dsh-hooks__detailRow { display:flex; align-items:center; gap:8px; min-width:0; flex-wrap:wrap; }
 .dsh-hooks__editor { font-family:ui-monospace, monospace; font-size:12px; line-height:16px; min-width:0; flex:1 1 240px;
   resize:vertical; padding:6px 8px; border-radius:6px;
   border:.5px solid var(--dsw-alias-border-l3, rgba(127,127,127,.35));
   background:var(--dsw-alias-bg-module-platform, transparent); color:var(--dsw-alias-label-primary, inherit); }
-.dsh-hooks__dry { font-size:12px; color:var(--dsw-alias-label-secondary, inherit); overflow-wrap:anywhere; }
+.dsh-hooks__dry { display:flex; flex-direction:column; gap:4px; font-size:12px;
+  color:var(--dsw-alias-label-secondary, inherit); overflow-wrap:anywhere; }
+.dsh-hooks__drysummary { overflow-wrap:anywhere; }
+/* 「查看全文」：多行输出用 pre 保留换行 + 等宽（以前被折成一行再 anywhere 撑成一片）。 */
+.dsh-hooks__drytoggle { cursor:pointer; font-size:12px;
+  color:var(--dsw-alias-label-secondary, inherit); }
+.dsh-hooks__drytext { margin:4px 0 0; max-height:200px; overflow:auto; padding:6px 8px; border-radius:6px;
+  font-family:ui-monospace, monospace; font-size:11px; line-height:16px; white-space:pre-wrap;
+  overflow-wrap:anywhere; background:var(--dsw-alias-bg-module-platform, rgba(127,127,127,.12));
+  color:var(--dsw-alias-label-secondary, inherit); }
+
+/* 「不会运行」那一行（06 票）：**例外态**，所以用虚线边框 + 三级色点表达"它在，但它不动"，
+   不引入任何新颜色（颜色仍然只走 token）。正文里的原因用 __muted 类：这一行不是可操作的卡。 */
+.dsh-hooks__hookcard--blocked { border-style:dashed; }
+.dsh-hooks__hookcard--blocked:hover { background:var(--dsw-alias-settings-card-fill, rgba(127,127,127,.06)); }
+.dsh-hooks__hookcard--blocked .dsh-hooks__dot { background:var(--dsw-alias-label-tertiary, rgba(127,127,127,.6)); }
 
 /* ── 状态点（颜色只能来自台账 / disabled，§3.8）──
    ⚠️ token 名以官方 theme 表为准（dsh-client-ui-theme/lib/client.js 的 base_css_default）：
@@ -278,11 +302,21 @@ export const styles = `
    说清"在哪个事件下新建"）。中间那格占满剩余宽度 ⇒ 按钮被推到行尾、对齐成一列。 */
 .dsh-hooks__eventrow { display:flex; align-items:center; gap:8px; min-width:0; height:32px; padding:0 12px;
   border-bottom:.5px solid var(--dsw-alias-border-l2, rgba(127,127,127,.12)); }
+/* 「生效配置」那几行与事件行**同一套行语言**（同一批尺寸/分隔线），但是独立的类：
+   D 区按 __eventrow 数"7 个事件恰好 7 行"，混进来那条断言就测错对象了。 */
+.dsh-hooks__effectrow { display:flex; align-items:center; gap:8px; min-width:0; height:32px; padding:0 12px;
+  border-bottom:.5px solid var(--dsw-alias-border-l2, rgba(127,127,127,.12)); }
+.dsh-hooks__effectrow > .dsh-hooks__muted, .dsh-hooks__effectrow > .dsh-hooks__count { flex:1 1 auto; min-width:0; }
 .dsh-hooks__eventrow > .dsh-hooks__muted, .dsh-hooks__eventrow > .dsh-hooks__count {
   flex:1 1 auto; min-width:0; }
 .dsh-hooks__eventname--fold { flex:none; min-width:150px; }
 .dsh-hooks__glyphbtn { width:24px; height:24px; padding:0; justify-content:center; font-size:14px;
   color:var(--dsw-alias-label-secondary, inherit); }
+/* 「更多」里的分节标题（18 票）：三节分别是「生效配置」「全部事件」「诊断」。
+   走"分隔线"语言（与 __eventrow / __diagrow 同一套），不加底色、不加圆角。 */
+.dsh-hooks__foldhead { display:flex; align-items:center; min-height:24px; padding:8px 12px 0;
+  font-size:11px; font-weight:500; color:var(--dsw-alias-label-tertiary, var(--dsw-alias-label-secondary, inherit));
+  letter-spacing:.02em; }
 /* 诊断行同样走"分隔线"语言（label + value 的表格式条目，官方 settings 的行就是这样）。 */
 .dsh-hooks__diagrow { display:flex; gap:8px; min-width:0; padding:6px 12px;
   border-bottom:.5px solid var(--dsw-alias-border-l2, rgba(127,127,127,.12)); }

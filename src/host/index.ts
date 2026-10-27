@@ -56,6 +56,7 @@ import {
   type HookEvent,
 } from '../shared/constants.ts'
 import { isObject, isUnknownArray, messageOf } from '../shared/guards.ts'
+import type { HostErrorCode } from '../shared/errors.ts'
 import {
   blocksToText,
   contextMessage,
@@ -559,21 +560,31 @@ export function apply(ctx: HostContext): void {
       }
 
       const previous = lastGood.get(projectRoot)
-      const stale = failures.length > 0 && previous !== undefined
+      const pick = (read: ReadState): unknown => (read.state === 'ok' ? read.raw : undefined)
+      /**
+       * **按侧**回退（11 票）：哪一侧读不出来就只回退那一侧。
+       *
+       * 以前是"任一侧坏 → 两侧一起回 last-good"，于是"项目文件坏了"会把用户级**刚改好**的内容
+       * 一起撤掉 —— 而页面那一侧是新鲜读的（显示的是新内容），页面与运行时就此分叉（§2.6）。
+       * 只有"根本不知道哪一侧坏"（`previous === undefined`，即从没成功读过）时才没有回退可言。
+       */
+      const userStale = userRead.state === 'error' && previous !== undefined
+      const projectStale = projectRead.state === 'error' && previous !== undefined
+      const stale = userStale || projectStale
       if (stale) {
+        const sides = [userStale ? '用户级' : '', projectStale ? '项目级' : ''].filter((one) => one !== '').join(' + ')
         infoThrottled(
           `${projectRoot}\u0000stale`,
-          `dsh-hooks: 配置当前读不出来，继续沿用上一份可用配置（${projectPath}）`,
+          `dsh-hooks: ${sides}配置当前读不出来，继续沿用上一份可用配置（${projectPath}）`,
         )
       }
 
-      const pick = (read: ReadState): unknown => (read.state === 'ok' ? read.raw : undefined)
       /** 记录用的版本字符串；取不到就记 `undefined`（= 文件不存在或无法判定）。 */
       const versionOf = (read: ReadState): string | undefined =>
         read.version === undefined || read.version === null ? undefined : read.version
-      // stale 时**两侧都**取上一份：只换一侧会合成出一份从未存在过的配置。
-      const userRaw = stale ? previous.userRaw : pick(userRead)
-      const projectRaw = stale ? previous.projectRaw : pick(projectRead)
+      // 逐侧决定用哪一份：坏的那一侧取 last-good，另一侧用**刚读到的**（否则改动不生效）。
+      const userRaw = userStale ? previous.userRaw : pick(userRead)
+      const projectRaw = projectStale ? previous.projectRaw : pick(projectRead)
 
       const vars = { projectDir: projectRoot }
       const user = parseHookConfig(userRaw, vars)
@@ -581,7 +592,9 @@ export function apply(ctx: HostContext): void {
 
       for (const skipped of [...user.skipped, ...project.skipped]) {
         warn(
-          `dsh-hooks: 跳过不支持的 ${JSON.stringify(skipped.type)} handler（事件 ${skipped.event}）—— 只运行 command hook`,
+          skipped.reason === 'empty-command'
+            ? `dsh-hooks: 跳过一条没有命令的 command 条目（事件 ${skipped.event}）`
+            : `dsh-hooks: 跳过不支持的 ${JSON.stringify(skipped.type)} handler（事件 ${skipped.event}）—— 只运行 command hook`,
         )
       }
       for (const message of [...user.errors, ...project.errors]) warn(`dsh-hooks: ${message}`)
@@ -839,8 +852,9 @@ export function apply(ctx: HostContext): void {
     }
   }
 
-  function stopPayload(agent: AgentLike | undefined, context: RunContext): HookPayload {
-    return { ...basePayload(agent, 'Stop', context), stop_hook_active: false }
+  /** Stop 的 payload：`stop_hook_active` 必须反映**真实**的续跑状态（见下面接线处的用法）。 */
+  function stopPayload(agent: AgentLike | undefined, context: RunContext, forced: boolean): HookPayload {
+    return { ...basePayload(agent, 'Stop', context), stop_hook_active: forced }
   }
 
   function subagentPayload(
@@ -1106,6 +1120,7 @@ export function apply(ctx: HostContext): void {
       version: read.version === undefined || read.version === null ? null : read.version,
       groups: parsed.groups,
       skipped: parsed.skipped,
+      rejected: parsed.rejected,
       matcherErrors: parsed.errors,
     }
   }
@@ -1228,8 +1243,8 @@ export function apply(ctx: HostContext): void {
     return { ok: true, state: 'ok', target: read.target, doc: read.raw, text: read.text, version }
   }
 
-  /** 把 `writeText` 抛出的异常翻成页面能**分别处理**的错误码。 */
-  function writeErrorCode(error: unknown): string {
+  /** 把 `writeText` 抛出的异常翻成页面能**分别处理**的错误码。返回类型是 `HostErrorCode`：目录外的码写不进来。 */
+  function writeErrorCode(error: unknown): HostErrorCode {
     const message = messageOf(error)
     // `FS_STALE_VERSION` 是官方契约里版本冲突的精确错误码（已用 cordis_inspect_query 核实）。
     if (message.includes('FS_STALE_VERSION')) return 'stale'
@@ -1276,9 +1291,19 @@ export function apply(ctx: HostContext): void {
     if (!prep.ok) return { ok: false, error: prep.error, ...(prep.detail !== undefined ? { detail: prep.detail } : {}) }
     // 与 hook 子进程同理：写入按**调用会话**的沙箱档位来；拿不到就省略该字段回退部署策略（AGENTS §1.6）。
     const sandboxPolicy = policy?.passthrough
+    /**
+     * 页面看到的版本（乐观锁的页面侧那一半，03 票）。
+     *
+     * `undefined` = 旧页面：走"读后写"（与改动前逐字一致）；`null` = 页面认为目标还不存在。
+     * 字符串则是"我看到的是这一版" —— 它与磁盘不符时**必须在落笔之前**就拒掉：
+     * `groupIndex` / `hookIndex` 是文件下标，别处插删一条之后同一个下标会指到另一条 hook 上。
+     */
+    const pageVersion = request.expectedVersion
 
     try {
       if (request.op === 'createFile') {
+        // 页面说"它已经存在" → 与 `createFile` 的语义直接矛盾，按冲突处理（不做无守卫新建）。
+        if (typeof pageVersion === 'string') return { ok: false, error: 'stale' }
         if (prep.state !== 'absent') return { ok: false, error: 'exists' }
         const created = await fsSvc.writeText(
           prep.target,
@@ -1291,6 +1316,8 @@ export function apply(ctx: HostContext): void {
       }
 
       if (prep.state === 'absent') {
+        // 页面手里有一个版本 ⇒ 它以为文件还在；现在文件没了 ⇒ 冲突（绝不"顺手新建回来"）。
+        if (pageVersion !== undefined && pageVersion !== null) return { ok: false, error: 'stale' }
         // 「＋新建」要能**一次建出文件**（D2）：只有新增类 op 才放开自动建文件 ——
         // "改一条不存在的命令"仍然 absent 拒写（否则会顺手建出一份空配置，用户看到的是
         // "我明明是去改的，怎么多了个文件"）。骨架就是 `{hooks:{…一条}}`（我们自己的不动点风格）。
@@ -1310,6 +1337,12 @@ export function apply(ctx: HostContext): void {
 
       const applied = applyOp(prep.doc, request)
       if (!applied.ok) return { ok: false, error: applied.reason }
+      // 页面给的版本与磁盘不一致 ⇒ **落笔之前**就拒掉（连 applyOp 都跑过了也无妨：它的产物不落盘）。
+      // 顺序放在这里是为了让"拒写"覆盖所有 op（含 setHookDisabled / removeHook 这些会丢数据的）。
+      if (typeof pageVersion === 'string' && prep.version !== pageVersion) {
+        return { ok: false, error: 'stale', detail: `页面版本 ${pageVersion} ≠ 磁盘版本 ${prep.version}` }
+      }
+      if (pageVersion === null) return { ok: false, error: 'stale', detail: '页面认为文件不存在，但它存在' }
       const problem = preservationProblem(prep.doc, applied.applied.doc, applied.applied.changes)
       if (problem !== undefined) return { ok: false, error: 'not-preservable', detail: problem }
       const text = serialize(applied.applied.doc, detectStyle(prep.text))
@@ -1405,7 +1438,18 @@ export function apply(ctx: HostContext): void {
     // 不是解析后的数组位置 —— 解析会跳过 matcher 非法的 group 与没有 command 的条目。
     const parsed = parseHookConfig(read.raw, { projectDir: projectRoot ?? '' })
     const group = (parsed.groups[request.event] ?? []).find((candidate) => candidate.rawIndex === request.groupIndex)
-    if (group === undefined) return { ok: false, error: 'not-found', detail: '这个分组不在文件里（可能刚被改过）' }
+    if (group === undefined) {
+      // 先分清"真的不在"与"在、但不会跑"：后者是**有原因的**，说成"已经不在了"就是撒谎
+      // （用户明明能在文件里看到它，试运行却告诉他"可能刚被改过，请刷新"）。
+      const rejected = parsed.rejected.find(
+        (candidate) => candidate.event === request.event && candidate.groupIndex === request.groupIndex,
+      )
+      if (rejected !== undefined) {
+        const where = rejected.matcher === undefined ? '' : `：${rejected.matcher}`
+        return { ok: false, error: 'rejected', detail: `这一组不会运行（${rejected.reason}）${where}` }
+      }
+      return { ok: false, error: 'not-found', detail: '这个分组不在文件里（可能刚被改过）' }
+    }
     const hook = group.hooks.find((candidate) => candidate.rawIndex === request.hookIndex)
     if (hook === undefined) return { ok: false, error: 'not-found', detail: '这一条不在文件里（可能刚被改过）' }
 
@@ -1547,12 +1591,14 @@ export function apply(ctx: HostContext): void {
       const context = await contextFor(agent)
       if (context.config.groups.Stop === undefined) return
       const sessionId = agent.session?.header?.id ?? ''
-      const merged = await runPoint(context, 'Stop', '', stopPayload(agent, context), signal)
+      // `stop_hook_active` 的语义是"这一轮已经被 Stop hook 续跑过"（官方协议）。
+      // 以前恒为 false：按官方语义写的防死循环逻辑（看到 true 就放行）在我们这里**永远不触发**。
+      const forced = stopForced.get(sessionId) ?? 0
+      const merged = await runPoint(context, 'Stop', '', stopPayload(agent, context, forced > 0), signal)
       if (merged.decision !== 'deny') {
         stopForced.delete(sessionId)
         return
       }
-      const forced = stopForced.get(sessionId) ?? 0
       if (forced >= STOP_FORCE_LIMIT) {
         warn(`dsh-hooks: Stop hook 已连续强制续跑 ${forced} 次，达到上限 ${STOP_FORCE_LIMIT}，本次放行以免死循环`)
         stopForced.delete(sessionId)
