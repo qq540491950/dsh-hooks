@@ -848,6 +848,14 @@ lib/index.js   locale/en.json   locale/zh.json   package.json      # 9 个文件
 - **展示元数据**（官方 `dsh-app-boot` 的 `readPluginMeta` / `metaOf` 读，**不需要激活插件**）：
   - `icon` 是 **`package.json` 的顶层字段**（不是 `dsh.icon`）：相对包根、≤ 256 KiB、SVG/PNG/JPEG/WebP。
     官方源码里是 `iconOf(manifest?.icon, manifestPath)`。
+  - **图标的规格：`<img>` 里的自成一体资产**（v0.3.1 修）。设置页插件清单里这枚图标由官方
+    `PackageArtwork` 渲染成 `<img width=40 height=40>`，**拿不到页面 CSS，也没有主题 token**。
+    所以：① 不许用 `currentColor` —— 它会退化成初始黑，深色主题下糊成一片；② 底色必须自己画
+    （`<rect rx="14" fill="#3E63DD">`），墨色写死纯白；③ 画布 64x64，与兄弟插件
+    `dsh-mcp-manager` / `dsh-skill-manager` 的 `assets/icon.svg` 同一套规格（40px 显示时圆角一致）。
+    v0.3.0 那枚是 24x24 `currentColor` 描边图标，真机上是"一块看不清的墨"，与旁边两枚蓝底白标的
+    图标明显不是一套（用户截图反馈）。三条判据写进自检 `A` 区（`currentColor` / 显式底色 / 64 画布），
+    都做过反向验证。
   - `locale/en.json` 是**英文兜底**，其余语言必须与它**同目录**（官方按 `<包>/locale/en.json` 找，
     并且会因为"不在同一目录"直接抛错）。
   - `locale/*.json` **必须进 `exports`** —— 否则 subpath 解析被 `exports` 挡住，界面**静默**地不显示

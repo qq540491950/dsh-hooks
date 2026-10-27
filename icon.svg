@@ -1,9 +1,24 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="24" height="24" role="img" aria-label="Hooks">
-  <!-- 一只钩子：竖杆 + 底部向右上回勾（与"hook"的字面意思一致）。 -->
-  <!-- 颜色用 currentColor，跟随主题；不写死颜色。 -->
-  <g fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
-    <path d="M9 3v9.5a3 3 0 0 0 6 0V11" />
-    <path d="M15 11l-2.2-2.4M15 11l2.2-2.4" />
-    <path d="M5 21h14" />
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" width="64" height="64" role="img" aria-label="Hooks">
+  <!--
+    bundle 卡片图标（`package.json` 的顶层 `icon` 指向本文件）。
+
+    为什么这样画（与 dsh-mcp-manager / dsh-skill-manager 的两枚图标同一套规格）：
+      1. 64x64 画布 + `<rect rx="14">` 圆角底色块，白描边画在蓝底上 —— 静态图标以 `<img>`
+         进 DOM，拿不到页面 CSS，**不能**用 `currentColor`（它会退化成初始黑，深色主题下
+         几乎看不见；v0.3.0 那枚 24x24 的 currentColor 图标就是这样糊成一片）。
+      2. 底色 `#3E63DD` 与 MCP 图标同色，墨色纯白 —— 同一条列表里三枚图标看起来是一套。
+      3. 图形语义：一枚**鱼钩**（钩眼 + 竖杆 + 底部回勾 + 倒刺）—— hook 的字面意思，
+         也就是这一页在做的事：在事件点上挂一条命令。
+  -->
+  <rect x="0" y="0" width="64" height="64" rx="14" fill="#3E63DD"/>
+  <g fill="none" stroke="#FFFFFF" stroke-width="5" stroke-linecap="round" stroke-linejoin="round">
+    <!-- 钩眼：鱼钩顶端那个孔 -->
+    <circle cx="21.5" cy="19" r="4"/>
+    <!-- 竖杆 -->
+    <path d="M21.5 23 V39"/>
+    <!-- 底部回勾：半圆向右，再短竖上挑 -->
+    <path d="M21.5 39 a8 8 0 0 0 16 0 V30"/>
+    <!-- 倒刺：钩尖朝上偏右的一小段 -->
+    <path d="M37.5 30 l4.6 -4.6"/>
   </g>
 </svg>

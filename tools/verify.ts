@@ -132,6 +132,17 @@ test('A：发布元数据（icon / locale / exports / files）—— 每一条�
   assert.ok(fs.readFileSync(iconPath, 'utf8').trimStart().startsWith('<svg'), 'icon 必须是 SVG/PNG/JPEG/WebP')
   assert.ok(fs.statSync(iconPath).size <= 256 * 1024, 'icon 必须 ≤ 256 KiB（官方限制）')
 
+  // ①b 图标必须**自成一体**：它以 `<img>` 进 DOM（官方 `PackageArtwork`），拿不到页面 CSS 与主题
+  //     token，所以 `currentColor` 会退化成初始黑 —— 深色主题下几乎看不见。v0.3.0 那枚 24x24
+  //     currentColor 图标就是这样与旁边两枚"蓝底白标"的图标对不上（用户反馈的那张截图）。
+  //     判据三条：无 currentColor、有显式填充的底色块、64x64 画布（与兄弟插件同一套规格）。
+  //    （只查**标记**，注释里可以随便写为什么禁它。）
+  const icon = fs.readFileSync(iconPath, 'utf8')
+  const iconMarkup = icon.replace(/<!--[\s\S]*?-->/g, '')
+  assert.ok(!/currentColor/.test(iconMarkup), 'icon 不许用 currentColor：<img> 里它退化成初始黑，深色主题下糊成一片')
+  assert.ok(/<rect\b[^>]*\bfill="#[0-9A-Fa-f]{3,8}"/.test(iconMarkup), 'icon 必须有显式填充的底色块（静态图标没有主题底色）')
+  assert.ok(/viewBox="0 0 64 64"/.test(iconMarkup), 'icon 用 64x64 画布 —— 与兄弟插件的图标同一套规格')
+
   // ② locale：官方按 `<包>/locale/en.json` 找**英文兜底**、其余语言必须同目录
   //    （源码 `optionalResourcePath(`${specifier}/locale/en.json`)` + "must share the English locale directory"）。
   for (const file of ['locale/en.json', 'locale/zh.json']) {
