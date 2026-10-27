@@ -140,7 +140,10 @@ test('A：发布元数据（icon / locale / exports / files）—— 每一条�
   const icon = fs.readFileSync(iconPath, 'utf8')
   const iconMarkup = icon.replace(/<!--[\s\S]*?-->/g, '')
   assert.ok(!/currentColor/.test(iconMarkup), 'icon 不许用 currentColor：<img> 里它退化成初始黑，深色主题下糊成一片')
-  assert.ok(/<rect\b[^>]*\bfill="#[0-9A-Fa-f]{3,8}"/.test(iconMarkup), 'icon 必须有显式填充的底色块（静态图标没有主题底色）')
+  assert.ok(
+    /<rect\b[^>]*\bfill="#[0-9A-Fa-f]{3,8}"/.test(iconMarkup),
+    'icon 必须有显式填充的底色块（静态图标没有主题底色）',
+  )
   assert.ok(/viewBox="0 0 64 64"/.test(iconMarkup), 'icon 用 64x64 画布 —— 与兄弟插件的图标同一套规格')
 
   // ② locale：官方按 `<包>/locale/en.json` 找**英文兜底**、其余语言必须同目录
@@ -1671,7 +1674,7 @@ await test('D16：选中工作区后点开关 ⇒ 请求体带 workspaceId（开
   })
 })
 
-await test('D17：选中非当前工作区 ⇒ **一行信息**（不是黄底横幅）；选中当前工作区 ⇒ 没有提示', async () => {
+await test('D17：选中非当前工作区 ⇒ 首屏**一条提示都没有**（事实在触发器 title 与「更多」里）', async () => {
   const workspaces = [
     { id: 'w-1', title: 'agent-go', path: 'D:/p', projectRoot: 'D:/p', isCurrent: false },
     { id: 'w-2', title: 'dsh-hooks', path: 'D:/q', projectRoot: 'D:/q', isCurrent: true },
@@ -1688,38 +1691,21 @@ await test('D17：选中非当前工作区 ⇒ **一行信息**（不是黄底�
       : snapshotOf({ scope: 'user', workspaces, projectRoot: 'D:/p' }),
   }))
   const otherNodes = await pickScopeOption(otherInitial, otherComponent, other, 'w-1')
-  // ⚠️ 提醒行的正文现在装在 `__alerttext` 里（外面多了一层，给动作按钮留位置）——
-  //    `textOfClass` 遇到下一个有类名的元素就停，所以这里取到的是**正文**而不是整行。
-  const otherAlert = textOfClass(otherNodes, 'dsh-hooks__alerttext')
-  const errorAlerts = otherNodes.filter(
-    (node) => typeof node.className === 'string' && node.className.includes('dsh-hooks__alert--error'),
+  // ★ v6：非当前工作区**不再常驻**提示行 —— 选到它、什么都不做时，页面上一个字都不多。
+  //   那句"本会话不读这份配置"只在**写入成功之后**出现（D30 守另一半）。
+  assert.equal(
+    allByClass(otherNodes, 'dsh-hooks__alert').length,
+    0,
+    '★ 非当前工作区不再常驻提示（用户要求"平时别占屏"）',
   )
-  const alerts = allByClass(otherNodes, 'dsh-hooks__alert')
-  const otherJoined = joinedText(otherNodes)
-  assert.equal(alerts.length, 1, '非当前工作区时**恰好一条**提示（不堆叠）')
-  assert.equal(errorAlerts.length, 0, '它不是错误，不该用错误底色')
-  // ★ v3（R2）：黄底横幅 → **非黄色信息行**。`--info` 是显式类；样式里 `__alert` 基类**没有底色**
-  //   （D30 对样式字符串做字面断言），所以"黄底警告"在结构上不可能回来。
-  assert.ok(
-    alerts[0].className.includes('dsh-hooks__alert--info'),
-    `★ 它必须是**信息**行（--info），不是警告横幅：${String(alerts[0].className)}`,
-  )
-  assert.ok(otherAlert.includes('本会话不读这份配置'), `一句话说清这一份不是本会话在读的：${otherAlert}`)
-  assert.ok(otherAlert.includes('agent-go'), '要说清正在看/改哪个工作区')
-  // ★ P0-2：提醒行正文里不许再出现盘符路径 / 项目根 / "报 sandbox 属预期"这类内部话术。
-  //   ⚠️ 只对**提醒行**断言路径：这一屏的主列表是空的（这个 fixture 的项目级文件 0 条），
-  //   空状态块里的路径是 D23 明确要求显示的 —— 那是**另一件事**，不该被这条误伤。
-  assert.ok(!otherAlert.includes('项目根'), '★ 提醒行正文里不许出现"项目根"（它进诊断折叠了）')
-  assert.ok(!otherAlert.includes('D:/'), '★ 提醒行正文里不许出现盘符路径')
-  assert.ok(!otherJoined.includes('项目根'), '★ 首屏（可见文本）不许出现"项目根"')
-  assert.ok(!otherJoined.includes('sandbox 属预期'), '★ 更不许出现"报 sandbox 属预期"这种内部话术')
-  // ★ F4：这条提醒**最多两句话**（真机上它曾经堆到三四行）。句子数是能在 DOM 上量的代理指标，
-  //   所以它与"两行以内"一起构成回归护栏：信息一件都不许丢，但不许再涨回去。
-  assert.ok(
-    otherAlert.split('。').filter((part) => part.trim() !== '').length <= 2,
-    `那条提醒最多两句话（压到两行内）：${otherAlert}`,
-  )
-  // 被删掉的两条事实必须**仍然可达**：项目根一行还在，另加"写入权限"一行（含沙箱这件事）。
+  assert.ok(!joinedText(otherNodes).includes('本会话不读'), '★ 首屏不许出现"本会话不读"这句（它属于"写完之后"那一句）')
+  // 但"这一份不是本会话在读的"必须**仍然可达**：作用域触发器的 title 说清后果（§2.1）
+  const triggerTitle = scopeTrigger(otherNodes).title
+  assert.ok(triggerTitle.includes('不会作用于当前会话'), `★ 触发器 title 必须说清改动不影响本会话：${triggerTitle}`)
+  assert.ok(triggerTitle.includes('agent-go'), '并且说清正在看/改哪个工作区')
+  // ⚠️ 这里**不**断言 title 里没有盘符路径：title 是开发者排查用的工具提示（README 的表里明确
+  //   允许它带项目根），"首屏不许出现路径"约束的是**可见文案**，两者不是一回事（D30 守着前者）。
+  // 被删掉的两条事实必须**仍然可达**（诊断折叠）：项目根一行还在，另加"写入权限"（含沙箱这件事）
   const otherDiag = await expandFold(otherNodes, otherComponent, other, '更多')
   const otherDiagText = joinedText(otherDiag)
   assert.ok(otherDiagText.includes('写入权限'), '★ 诊断里必须新增"写入权限"一行（P0-2 要求落点）')
@@ -2543,9 +2529,8 @@ await test('D29：工具条**只有一行** + 第二行一句人话 + 搜索框�
   )
 })
 
-await test('D30：非当前工作区 ⇒ 一行信息 + 「切回当前会话项目」动作（点了真的换作用域）', async () => {
-  // 自洽的 fixture（D17 那个 fixture 的 session 项目根与 scope 项目根相同，动作按规则不该出现）：
-  // 屏幕上是 w-1（agent-go，D:/p），而**当前会话**的项目根是 D:/q（在清单里就是 w-2）。
+await test('D30：非当前工作区 ⇒ **写成功之后**才说一句（首屏零占用；切作用域后收起）', async () => {
+  // 自洽的 fixture：屏幕上是 w-1（agent-go，D:/p），而**当前会话**的项目根是 D:/q（清单里就是 w-2）。
   const workspaces = [
     { id: 'w-1', title: 'agent-go', path: 'D:/p', projectRoot: 'D:/p', isCurrent: false },
     { id: 'w-2', title: 'dsh-hooks', path: 'D:/q', projectRoot: 'D:/q', isCurrent: true },
@@ -2568,33 +2553,67 @@ await test('D30：非当前工作区 ⇒ 一行信息 + 「切回当前会话项
 
   const harness = createFakeReact()
   const component = componentFromArtifact(harness.React)
-  const urls = []
-  const first = await renderSection(component, harness, (url) => {
-    urls.push(String(url))
-    return { ok: true, data: snapshotFor(String(url).includes('scope=workspace') ? 'w-1' : 'user') }
-  })
+  const first = await renderSection(component, harness, (url) => ({
+    ok: true,
+    data: snapshotFor(
+      String(url).includes('workspaceId=w-2') ? 'w-2' : String(url).includes('scope=workspace') ? 'w-1' : 'user',
+    ),
+  }))
   const nodes = await pickScopeOption(first, component, harness, 'w-1')
-  assert.equal(allByClass(nodes, 'dsh-hooks__alert').length, 1, '前提：这一屏确实有那条提示')
-  const body = textOfClass(nodes, 'dsh-hooks__alerttext')
-  assert.ok(body.includes('本会话不读这份配置'), `一句话说清它不是本会话在读的：${body}`)
+  // ★ 前提（v6）：只是**看着**别的工作区时，一条提示都没有
+  assert.equal(allByClass(nodes, 'dsh-hooks__alert').length, 0, '★ 前提：首屏没有提示（不再常驻）')
+
+  // 在那个工作区里真的写一次（点开关）——宿主回 POST 成功
+  const calls = []
+  globalThis.fetch = async (url, options = {}) => {
+    const method = options.method ?? 'GET'
+    calls.push({ method, url: String(url) })
+    return {
+      json: async () =>
+        method === 'POST'
+          ? { ok: true, data: { file: 'project', version: 'v2' } }
+          : {
+              ok: true,
+              data: snapshotFor(String(url).includes('workspaceId=w-2') ? 'w-2' : 'w-1'),
+            },
+    }
+  }
+  switchNode(nodes).onClick()
+  await new Promise((resolve) => setTimeout(resolve, 0))
+  await new Promise((resolve) => setTimeout(resolve, 0))
+  const afterWrite = await advance(component, harness)
+  assert.equal(calls[0].method, 'POST', '前提：这一次确实发出了一条写请求')
+
+  const alerts = allByClass(afterWrite, 'dsh-hooks__alert')
+  assert.equal(alerts.length, 1, '★ 写成功之后**恰好一条**提示')
+  assert.ok(
+    alerts[0].className.includes('dsh-hooks__alert--info'),
+    `★ 它是**信息**行（--info），不是错误横幅：${String(alerts[0].className)}`,
+  )
+  const body = textOfClass(afterWrite, 'dsh-hooks__alerttext')
+  assert.ok(body.includes('已写入 agent-go'), `先说清"写成功了、落到哪里"：${body}`)
+  assert.ok(body.includes('本会话不读这份配置'), `再说清它不是本会话在读的那一份：${body}`)
   assert.ok(body.includes('只影响以后在 agent-go 里打开的会话'), '并且说清改动作用到哪里')
-  // ★ 整页可见文本（不只是提醒行）都不许出现内部话术与盘符路径：主列表非空（1 条 hook），
-  //   所以这里不存在"空状态块要显示路径"那个例外。
-  const joined = joinedText(nodes)
+  assert.ok(
+    body.split('。').filter((part) => part.trim() !== '').length <= 2,
+    `那一句最多两句话（不许涨回三四行）：${body}`,
+  )
+  // 首屏（主列表非空，所以没有空状态块那条路径例外）依旧不许出现内部话术与盘符路径
+  const joined = joinedText(afterWrite)
   assert.ok(!joined.includes('项目根'), '★ 首屏可见文本不许出现"项目根"')
   assert.ok(!joined.includes('sandbox 属预期'), '★ 不许出现"报 sandbox 属预期"')
   assert.ok(!joined.includes('D:/'), '★ 首屏可见文本不许出现盘符路径')
-
-  // ★ 动作：目标（w-2）≠ 当前作用域（w-1）⇒ 必须给一条回去的路，而且点了真的重新取数
-  const back = buttonByLabel(nodes, '切回当前会话项目')
-  const before = urls.length
-  back.onClick()
-  await advance(component, harness)
-  assert.ok(urls.length > before, '点了必须真的重新取数')
-  assert.ok(
-    urls[urls.length - 1].includes('scope=workspace') && urls[urls.length - 1].includes('workspaceId=w-2'),
-    `「切回当前会话项目」必须落到当前会话的那个工作区：${urls[urls.length - 1]}`,
+  // 那句提示不再带按钮：作用域选择器就在它上面一行（「切回当前会话项目」已删除）
+  assert.equal(
+    afterWrite.filter((node) => node.title === '切回当前会话项目').length,
+    0,
+    '★ 这句话只有一句，不再挂动作按钮（选择器就在工具条上）',
   )
+
+  // 切到当前会话那个工作区 ⇒ 那句话收起（旧落点的话对新落点没有意义），并且不再重说一遍
+  const moved = await pickScopeOption(afterWrite, component, harness, 'w-2')
+  assert.equal(allByClass(moved, 'dsh-hooks__alert').length, 0, '★ 换作用域后那句提示必须收起')
+  assert.ok(!joinedText(moved).includes('本会话不读'), '而且不许留在下一屏上')
 })
 
 await test('D31：另一个来源**只在有东西时出现**（0 条不占行 / 有内容给动作 / 读不出来如实说）', async () => {
@@ -6633,7 +6652,11 @@ await test('P：scope=workspace ⇒ 读 root(X)/.dsh/hooks.json；scope 三项�
     assert.equal(data.scope.workspaceTitle, 'agent-go')
     assert.equal(data.scope.workspacePath, other)
     assert.equal(data.scope.projectRoot, other)
-    assert.equal(data.scope.isCurrentSession, false, '当前会话在另一个项目里 → false（页面据此出黄底横幅）')
+    assert.equal(
+      data.scope.isCurrentSession,
+      false,
+      '当前会话在另一个项目里 → false（页面据此**在写成功之后**说一句"本会话不读这份配置"，v6）',
+    )
     // 顶层 projectRoot/cwd 永远是**当前会话**在哪里（与所选作用域无关，AGENTS §2.8）
     assert.equal(data.projectRoot, session)
     assert.equal(data.cwd, session)
@@ -6659,7 +6682,7 @@ await test('P：scope=workspace ⇒ 读 root(X)/.dsh/hooks.json；scope 三项�
     )
     assert.equal(data.workspaces[2].isCurrent, true, '当前会话的项目根就是它')
 
-    // 选中**当前**工作区 ⇒ isCurrentSession 为 true（页面据此换掉那条黄底横幅）
+    // 选中**当前**工作区 ⇒ isCurrentSession 为 true（页面据此**不**说那句"本会话不读这份配置"）
     const current = await callRoute(conn.routes[0], '?scope=workspace&workspaceId=w-current')
     assert.equal(current.data.scope.isCurrentSession, true)
     assert.equal(current.data.scope.projectRoot, session, '工作区是仓库子目录 → 项目根是仓库根（两者不同）')

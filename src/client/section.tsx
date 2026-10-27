@@ -48,10 +48,15 @@
  *   判据：`tools/verify.ts` 里那些"事实必须可达"的断言一条都没减少（只是从"首屏"换成"`更多`里"）。
  *
  * ## 三条"面向用户"的硬规则（v3 的 P0，都有机器断言；v4 只改了渲染点）
- *   1. **非当前工作区**那条提醒是**一行信息**，不是黄底横幅，正文里**没有盘符路径**：
- *      `本会话不读这份配置 —— 改动只影响以后在 X 里打开的会话。` + ghost 动作
- *      `切回当前会话项目`（仅当目标 ≠ 当前作用域时）。被删掉的两条事实落进 `更多` 折叠：
- *      `项目根` 一行仍在，另加 `写入权限` = 「按调用会话的沙箱策略判定；被拒绝时报 sandbox」。
+ *   1. **非当前工作区**（v6：**平时一句话都不说，只在写成功之后说一句**）：
+ *      首屏不渲染任何提醒 —— "我看/改的这一份不是本会话在读的"这件事挂在作用域触发器的 `title`
+ *      与 `更多` 折叠里（`项目根` + `写入权限` = 「按调用会话的沙箱策略判定；被拒绝时报 sandbox」）。
+ *      **只有写入真的成功**（含新建表单提交）且落点不是当前会话这一份时，才在唯一的提示行里出现
+ *      一句 `已写入 X —— 本会话不读这份配置，改动只影响以后在 X 里打开的会话。`
+ *      + 不再给「切回当前会话项目」按钮：作用域选择器就在它上面一行，而那句话说的是选择器的方向。
+ *      理由：用户明确要求"别在平时占屏"（原话"去掉这些信息"）；代价是**动手之后**才知道落到了
+ *      别的工作区 —— 所以这句必须挂在**每一次**成功写入上，不许只在切换作用域时说。
+ *      正文里永远**没有盘符路径**、没有"项目根"。
  *      黄底（`state-warning-background`）**不再挂在 `__alert` 上** —— 样式里没有这个颜色，
  *      自检对样式字符串做字面断言（"警告底色"不许回来）。
  *   2. **另一个来源**（用户级 / 项目级里不是主文件的那一份）**只在"有东西"时出现**：
@@ -82,7 +87,8 @@
  * `tools/verify.ts` 的假 React 按位置发 `useState` 的值，只支持无 hook 的子组件。
  * `useState` 顺序（改顺序要同步改自检的场景）：`phase`→`banner`→`busy`→`nonce`→`scope`→`query`
  * →`editingKey`→`draft`→`confirmKey`→`dryKey`→`dryText`→`newOpen`→`newEvent`→`newMatcher`
- * →`newCommand`→`newTimeout`→`formError`→`scopeOpen`→`scopeActive`→`moreOpen`→`menuKey`。
+ * →`newCommand`→`newTimeout`→`formError`→`scopeOpen`→`scopeActive`→`moreOpen`→`menuKey`
+ * →`menuField`→`menuDraft`→`newGroup`→`dryFull`→**`notice`（v6 追加在末尾）**。
  * ⚠️ `moreOpen`（底部 `更多`）与 `menuKey`（哪一条 hook 的 `⋯` 展开着）**占的是 v3 里
  * `allEventsOpen` / `diagOpen` 那两个位置** —— 位置没变，含义变了：读测试里"点了折叠"这类
  * 交互时按顺序数 useState 的地方会踩到，改这里必须一起看 tools/verify.ts 的 D 区。
@@ -395,6 +401,26 @@ function scopeWhere(snapshot: HooksSnapshot, fallback: ScopeValue): string {
 }
 
 /**
+ * 写成功之后要不要说一句、说什么（v6）。
+ *
+ * 判据只有一条：**落点是不是本会话在读的那一份**。
+ *   - 用户级作用域 ⇒ 不说话：用户级配置对每个项目都生效（包括本会话），没有"不读"这件事；
+ *   - 工作区作用域且 `isCurrentSession === true` ⇒ 不说话：它就是本会话这一份；
+ *   - `isCurrentSession === null`（会话上下文拿不到）⇒ 也**不说话**：不知道就不编造结论（§2.8）；
+ *   - `isCurrentSession === false` ⇒ 说一句，并且说清**改动作用到哪里**（而不是只说"不是这一份"）。
+ *
+ * 这句话是"页面不撒谎"的最后一道：没有它，用户在别的工作区里改完会以为当前会话已经生效。
+ */
+function noteAfterWrite(phase: Phase, fallback: ScopeValue): string {
+  if (phase.kind !== 'ready') return ''
+  const { scope: view } = phase.snapshot
+  if (view.kind !== 'workspace' || view.isCurrentSession !== false) return ''
+  const where = scopeWhere(phase.snapshot, fallback)
+  // 一句话、一个句号：前半句说"写成功了"，后半句说"它不影响本会话"（自检断言句数 ≤ 2）。
+  return `已写入 ${where} —— 本会话不读这份配置，改动只影响以后在 ${where} 里打开的会话。`
+}
+
+/**
  * 「本会话生效 X 个」这一句**要不要出现**。
  *
  * 只在它和屏幕上这一份**不是同一件事**时才说话：选中当前会话项目时，第二行的 `N 个 hook`
@@ -695,6 +721,15 @@ export function HooksSection(props?: HooksSectionProps): Jsx {
   const [newGroup, setNewGroup] = useState('')
   /** 试运行输出的**全文**（只有被截断时才非空；给「查看全文」用）。 */
   const [dryFull, setDryFull] = useState('')
+  /**
+   * **写成功之后**那一句（v6：非当前工作区不再常驻提示，只在这里说一次）。
+   *
+   * 空串 = 没有任何要说的话。设置点是**唯一的**：`runRequest` 成功回调里用 `noteAfterWrite()` 判定；
+   * 清空点有两处 —— 下一次写请求开始时、以及切换作用域时（旧落点的那句话对新落点没有意义）。
+   *
+   * ⚠️ 追加在**末尾**：假 React 按 hook 位置发值，插到中间会让后面所有状态错位（§4.6）。
+   */
+  const [notice, setNotice] = useState('')
 
   useEffect(() => {
     const controller = new AbortController()
@@ -791,6 +826,7 @@ export function HooksSection(props?: HooksSectionProps): Jsx {
   const runRequest = (op: WriteOp, channel: 'page' | 'form', onSuccess: () => void): void => {
     if (busy) return
     setBusy(true)
+    setNotice('')
     if (channel === 'page') setBanner(null)
     else setFormError(null)
     void (async () => {
@@ -798,6 +834,8 @@ export function HooksSection(props?: HooksSectionProps): Jsx {
         requestWrite(intentFor(displayScope, op, versionOfScope(displayScope)), sessionId, signal),
       )
       if (outcome.ok) {
+        // 落点不是本会话在读的那一份 ⇒ 这次改动对本会话**没有效果**，必须说一句（否则页面在撒谎）
+        setNotice(noteAfterWrite(phase, displayScope))
         setNonce((value) => value + 1)
         onSuccess()
       } else {
@@ -913,6 +951,7 @@ export function HooksSection(props?: HooksSectionProps): Jsx {
     setScopeOpen(false)
     if (next === scope) return
     setScope(next)
+    setNotice('')
     setEditingKey('')
     setDraft('')
     setConfirmKey('')
@@ -1153,11 +1192,9 @@ export function HooksSection(props?: HooksSectionProps): Jsx {
     options.findIndex((option) => option.value === displayScope),
   )
   const help = scopeHelp(snapshot, displayScope)
-  /** 「切回当前会话项目」的目标：会话项目在清单里就用那个工作区 id，否则 `scope=current`。 */
-  const switchTarget = currentScopeTarget(snapshot)
-  const canSwitchBack = wantSwitchTo(snapshot, switchTarget)
 
-  // ── 页面级提示**最多一条**（Fix A2）：页面错误 > 配置文件读不出来 > 非当前工作区 > 只读。
+  // ── 页面级提示**最多一条**（Fix A2）：页面错误 > 配置文件读不出来 > **写成功后那一句** > 只读。
+  //    v6：非当前工作区不再**常驻**占用这条通道 —— 它只在写入成功后出现（见 `noteAfterWrite`）。
   const brokenFile = snapshot.files.find((file) => file.state === 'error')
   const alert: {
     tone: 'error' | 'info'
@@ -1175,22 +1212,9 @@ export function HooksSection(props?: HooksSectionProps): Jsx {
             detail: brokenFile?.message ?? '',
             action: null,
           }
-        : snapshot.scope.kind === 'workspace' && snapshot.scope.isCurrentSession === false
-          ? {
-              tone: 'info',
-              // 一句话说清"这一份不是本会话在读的"，**不带路径**、不提内部机制（用户反馈黄底两行
-              // 横幅"太差了"）。被删掉的两条事实进了诊断折叠：`项目根` 一行仍在，另加 `写入权限`。
-              text: `本会话不读这份配置 —— 改动只影响以后在 ${scopeWhere(snapshot, displayScope)} 里打开的会话。`,
-              detail: '',
-              action: canSwitchBack
-                ? {
-                    label: '切回当前会话项目',
-                    onClick: () => {
-                      changeScope(switchTarget)
-                    },
-                  }
-                : null,
-            }
+        : notice !== ''
+          ? // 写成功了、但落点不是本会话在读的那一份（v6）：**只在动手之后**说这一句
+            { tone: 'info', text: notice, detail: '', action: null }
           : writable
             ? null
             : { tone: 'info', text: '本页当前是只读模式（宿主没有提供写入能力）。', detail: '', action: null }
@@ -1321,7 +1345,8 @@ export function HooksSection(props?: HooksSectionProps): Jsx {
       </div>
 
       {/* 唯一的提示行（§2.1 / §2.9 / §3.9 的话都在这里，不再堆叠）。
-          非当前工作区那条是**信息**（`--info`，没有黄底）+ 一个 ghost 动作（仅当目标 ≠ 当前作用域）。 */}
+          信息类（`--info`，没有黄底）现在只剩两种：**写成功但落点不是本会话那一份** 与 **只读**。
+          v6：前者**不再常驻** —— 不选它、不改它，页面上一个字都不会多。 */}
       {alert === null ? null : (
         // `role="alert"`：读取失败 / 保存失败 / 非当前工作区这些**异步**结论要能被读屏播报
         // （17 票：以前它们只出现在视觉上）。

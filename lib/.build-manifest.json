@@ -24,7 +24,7 @@
     },
     {
       "output": "lib/client.js",
-      "outputSha256": "e9bcf61aa53f9524148f7d0098117b6790a7295d469210f7e1b6d3768942ee0c",
+      "outputSha256": "98d9f3f96389756095a0d4de73a540635374fb8747b1086dd5cf48695e3379f6",
       "inputs": {
         "src/client/hook-card.tsx": "2b6603aea748e8b5f86ae45a7ae2e793e9411acbe6ecb9ee27a9a205932cb6de",
         "src/client/index.ts": "4e9ec5ff0aad13cfdb0ed173efad3a607d24193d5751958e03b83735f03b1f0b",
@@ -32,7 +32,7 @@
         "src/client/new-hook.tsx": "dc9de933f3a30ceeb30b5dc5b901fb60ccb8004f4e10620361b85bc6d8d78006",
         "src/client/react.ts": "015dcb18d88be6b65954ada347271c5724b0a5f41e7f72737df1bb4643772946",
         "src/client/scope-picker.tsx": "e2b95ebfc1056a5ad9b18ec52a0ee2898493675d6f03230fda838b86f8e70934",
-        "src/client/section.tsx": "8a2e9f4c0199083ce84978addb78a1ad6990c9868eab6b26e1114bd840f15862",
+        "src/client/section.tsx": "907873de2e054dcca0c764c6a63f968e1d711689db39cb29ab88d6fec4b09700",
         "src/client/styles.ts": "4363a9b05ed063e7a359b73720a46649dd953d9f6ae0c1969b83b21d3aee20c9",
         "src/client/templates.ts": "a609b32669e9396d19c513f4912840e0cfaf9d072b3b5919c057cd2b2430f3e7",
         "src/client/wire.ts": "53bbc7aaba0def043d3fbe8041645f6fb47a55a0fb0c9e121a869222565894e8",
