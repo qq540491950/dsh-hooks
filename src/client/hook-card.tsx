@@ -584,6 +584,10 @@ export function HookCard(props: {
       {dryText === '' ? null : (
         <div className="dsh-hooks__dry" role="status" aria-live="polite">
           <span className="dsh-hooks__drysummary">{dryText}</span>
+          {/* 预演结论与指示灯**并排**时看起来自相矛盾（"试运行通过" + 灰「未运行」），而原因只藏在
+              圆点的 title 里。这句就在动作结果里说清：它不是装饰，只是不认预演（§3.8）。
+              放在这里＝**只有跑过试运行才出现**，首屏没有噪音（§3.13）。 */}
+          <span className="dsh-hooks__dryhint">预演不写进执行记录 —— 指示灯只反映真实工具调用。</span>
           {props.dryFull === '' ? null : (
             <details className="dsh-hooks__drymore">
               <summary className="dsh-hooks__drytoggle">查看全文</summary>

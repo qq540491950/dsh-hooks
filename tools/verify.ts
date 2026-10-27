@@ -1413,6 +1413,11 @@ await test('D：点"试运行"发 dryRun 请求，结果贴在这一行，且那
   const opened = await openCardMenu(first, component, harness)
 
   const calls = []
+  // 否定断言（§3.13）：这句解释**只在试运行结果里**出现，首屏不许有它。
+  assert.ok(
+    !joinedText(opened).includes('指示灯只反映真实工具调用'),
+    '★ 首屏不许出现「指示灯只反映真实工具调用」（它是试运行结果的注解，不是常驻文案）',
+  )
   globalThis.fetch = async (_url: string, options: { method?: string; body?: string } = {}) => {
     const method = options.method ?? 'GET'
     calls.push({ method, body: typeof options.body === 'string' ? JSON.parse(options.body) : null })
@@ -1445,6 +1450,10 @@ await test('D：点"试运行"发 dryRun 请求，结果贴在这一行，且那
   assert.ok(joined.includes('已阻断'), 'deny/block 要**单独点名**，不能只说"失败了事"')
   assert.ok(joined.includes('dry ok'), 'stderr 要带给用户看（原因通常写在这里）')
   assert.ok(joined.includes('7ms'), '耗时也要显示（用户判断"这条 hook 慢不慢"就靠它）')
+  assert.ok(
+    joined.includes('指示灯只反映真实工具调用'),
+    '★ 试运行结果里必须点明指示灯不认预演 —— 否则"预演通过 + 灰『未运行』"并排看着就是自相矛盾',
+  )
   const dot = after.find((node) => typeof node.className === 'string' && node.className.includes('dsh-hooks__dot'))
   assert.ok(dot.title.includes('未运行'), '试运行**不进台账**：那一行仍然是灰的"未运行" —— 预演不该给状态上色（§3.8）')
 

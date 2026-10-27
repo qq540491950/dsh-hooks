@@ -220,6 +220,11 @@ export const styles = `
 .dsh-hooks__dry { display:flex; flex-direction:column; gap:4px; font-size:12px;
   color:var(--dsw-alias-label-secondary, inherit); overflow-wrap:anywhere; }
 .dsh-hooks__drysummary { overflow-wrap:anywhere; }
+/* 试运行结果下面那一句注释（解释"为什么指示灯没变"）：三级色、11px —— 它是注解，不是结论。
+   ⚠️ 用新类名 __dryhint 而不是既有的 __hint：后者是工具条那一栏的 flex:none 横排样式，
+   塞进这里的 flex-direction:column 容器会拿错尺寸。 */
+.dsh-hooks__dryhint { font-size:11px; line-height:16px;
+  color:var(--dsw-alias-label-tertiary, var(--dsw-alias-label-secondary, inherit)); }
 /* 「查看全文」：多行输出用 pre 保留换行 + 等宽（以前被折成一行再 anywhere 撑成一片）。 */
 .dsh-hooks__drytoggle { cursor:pointer; font-size:12px;
   color:var(--dsw-alias-label-secondary, inherit); }

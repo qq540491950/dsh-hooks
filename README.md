@@ -468,6 +468,9 @@ node tools/verify.ts --config "D:\some\project\.dsh\hooks.json"
     `file:'project'` 不带 `workspaceId` = 现状语义（会话 cwd 的项目）；`file:'user'` 带 `workspaceId` = 400。
   - **试运行**：`{op:'dryRun', file, workspaceId?, event, groupIndex, hookIndex}` —— 与真实运行**共用同一条执行
     路径**（同一个 `runSingleHook`、同一个 payload builder），但**不写执行台账**（预演不该给状态上色）。
+    因此试运行通过之后那一行**仍然是灰的「未运行」**—— 这是设计，不是渲染 bug（v0.4.2 起结果行里明写
+    「预演不写进执行记录 —— 指示灯只反映真实工具调用」，此前理由只藏在圆点的 `title` 里，用户会以为
+    指示灯是装饰）。
   - **错误码分得很细**，页面据此把失败**分别**说清（这是硬要求，不许糊成一句"保存失败"）：
     `stale` / `exists` / `not-preservable` / `invalid-json` / `no-project` / `no-version` /
     **`no-workspace-registry`** → 409；`absent` / `not-found` / **`unknown-workspace`** → 404；
