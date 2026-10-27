@@ -288,14 +288,18 @@ export const styles = `
 .dsh-hooks__emptytitle { font-size:13px; font-weight:500; line-height:18px; min-width:0; }
 .dsh-hooks__emptyactions { display:flex; align-items:center; gap:8px; min-width:0; flex-wrap:wrap; }
 
-/* ── 折叠区（全部事件 / 诊断）：默认收起，一行一个开关 ──
+/* ── 折叠区（「更多」= 生效配置 / 全部事件 / 诊断）：默认收起，展开后整块内容走分隔线语言 ──
    这里是**官方"只画分隔线"那套语言**（settings-general 的 .row：border-bottom:.5px solid
    var(--dsw-alias-border-l2)，真机 ΔRGB 77）—— 不加底色、不加圆角、不加卡片描边：
-   卡片语言（hook 卡片 / 空状态 / 表单）与分隔线语言**不许混在同一层**。 */
-.dsh-hooks__folds { display:flex; align-items:center; gap:12px; min-width:0; flex-wrap:wrap; }
-.dsh-hooks__disclosure { display:flex; align-items:center; gap:6px; border:0; background:transparent; cursor:pointer;
-  font:inherit; font-size:12px; color:var(--dsw-alias-label-secondary, inherit); padding:0; }
-.dsh-hooks__disclosure:hover { color:var(--dsw-alias-label-primary, inherit); }
+   卡片语言（hook 卡片 / 空状态 / 表单）与分隔线语言**不许混在同一层**。
+   v7：入口（__disclosure）挪进了工具条，正文最后那行「▸ 更多」整条消失。它现在是工具条里的
+   **24×24 字形按钮** —— 与卡片上的「⋯」同一套规格（安静但不隐形、无描边），因为工具条里已经有
+   两枚描边按钮，再加第三枚描边就会让"描边 = 工具条语言"这条变得含糊。 */
+.dsh-hooks__disclosure { flex:none; width:24px; height:24px; padding:0; border:0; border-radius:6px; cursor:pointer;
+  display:inline-flex; align-items:center; justify-content:center; font:inherit; font-size:14px; line-height:1;
+  background:transparent; color:var(--dsw-alias-label-secondary, inherit); }
+.dsh-hooks__disclosure:hover { color:var(--dsw-alias-label-primary, inherit);
+  background:var(--dsw-alias-interactive-bg-hover, rgba(127,127,127,.12)); }
 .dsh-hooks__foldbody { display:flex; flex-direction:column; min-width:0; padding:0; }
 /* 事件行：**行高固定 32px**（7 行等距，扫起来是"一张表"而不是"一堆按钮"），
    右侧的「＋」是 ghost **字形按钮**（24×24、无描边、只有动作、不抢视线；title / aria-label

@@ -3,12 +3,11 @@
  *
  * ## 这一层的布局契约（v4：用户拿 ZCode 的钩子页做参照，说"非要使用一堆说明和检测"）
  * ```
- * 作用域 [ 当前会话项目（dsh-hooks） ▾ ]                [↻ 刷新]  [＋ 新建]
+ * 作用域 [ 当前会话项目（dsh-hooks） ▾ ]                [▸] [↻ 刷新]  [＋ 新建]
  * 1 个 hook · 其中 1 个已停用                              本会话生效 4 个
  * ─────────────────────────────────────────────────────────
  * ●  工具运行前 PreToolUse              未运行              [ ●—— ]  ⋯
  *    node -e const fs=require('node:fs')…
- * ▸ 更多
  * ```
  *   - **一张卡 = 一条 hook**，一屏只有两行：标题行（状态点 + 中文名主/英文枚举次要 + 一个
  *     **状态词** + 开关 + `⋯`）与命令行；
@@ -23,9 +22,12 @@
  *     出现（作用域 ≠ 当前会话项目，或会话未知）—— 选中当前会话项目时上面那句已经是答案。
  *     过去同一屏把条数说了 5 遍（`钩子 1` / `已安装 1` / `（用户级 0 + 项目级 1）` / `0 条` / `1 条`），
  *     现在 `（用户级 a + 项目级 b）` 与完整口径只留在**详情折叠**里；
- *   - **底部只有一个折叠区 `更多`**（v3 是 `查看全部事件（7）` + `诊断` 两个）：展开后先列
- *     7 个事件（含 0 条，这是"空"的唯一可达路径），再列诊断（项目根 / cwd 来源 / 路径 / 状态 /
- *     版本 / `写入权限` / 清单 / matcher 诊断…）。折叠收起时整页只多一行字；
+ *   - **折叠只有一个，入口在工具条右端**（v7 从"正文最后一行 `▸ 更多`"挪过去的；v3 是
+ *     `查看全部事件（7）` + `诊断` 两个并列开关）：24×24 的 `▸`/`▾` 字形按钮，与卡片上那个 `⋯`
+ *     同一套规格，名字走 `title` + `aria-label`（字形不是名字）。展开后先列 7 个事件（含 0 条，
+ *     这是"空"的唯一可达路径），再列诊断（项目根 / cwd 来源 / 路径 / 状态 / 版本 / `写入权限` /
+ *     清单 / matcher 诊断…）。**内容就贴在工具条下面**（在第一张卡之前）——从工具条点开的东西
+ *     落在页尾，用户会以为按钮没生效。收起时整页不多占一行；
  *   - **主列表为空时渲染空状态块**（真机那一屏就是它）：标题 + **一句**副文案
  *     （文件不存在 = "这份 hooks.json 还不存在 —— 这是空的，不是出错"；存在但 0 条 =
  *     "文件里还没有任何 hook"）+ 一行按钮（主按钮 `＋ 新建第一条 hook` + 仅文件不存在时的
@@ -1298,6 +1300,23 @@ export function HooksSection(props?: HooksSectionProps): Jsx {
           />
         ) : null}
         <span className="dsh-hooks__toolbarActions">
+          {/* v7：折叠入口从正文最后一行挪到工具条（正文那一行整条消失）。
+              仍是**唯一**开关：正文里不会再有第二个「更多」。图标是页面既有的折叠语汇
+              （`▸` 收起 / `▾` 展开），名字走 `title` + `aria-label` —— 读屏拿到的是名字，
+              不是那个字形；`aria-expanded` 照旧如实反映状态（按钮不许骗人）。
+              放在动作簇最左，右邻仍是 刷新 / 新建（主操作留在右端，不被这枚图标挤走）。 */}
+          <button
+            type="button"
+            className="dsh-hooks__disclosure"
+            title="更多"
+            aria-label="更多（生效配置 / 全部事件 / 诊断）"
+            aria-expanded={moreOpen}
+            onClick={() => {
+              setMoreOpen(!moreOpen)
+            }}
+          >
+            {moreOpen ? '▾' : '▸'}
+          </button>
           <button
             type="button"
             className="dsh-hooks__toolbtn"
@@ -1326,6 +1345,153 @@ export function HooksSection(props?: HooksSectionProps): Jsx {
           </button>
         </span>
       </div>
+
+      {/* ── 「更多」展开后的那块内容：生效配置 + 7 个事件（含 0 条）+ 诊断。
+          v7：入口是工具条右端那个 `▸`（见上），内容就贴在工具条下面 —— 点了之后必须**就在眼前**，
+          不能落在页面尾巴上（展开后还要滚一段才看见，等于按钮没生效）。仍然是**一个**折叠，
+          仍然守"不占屏 ≠ 看不见"：收起时这一块整块都不渲染。 */}
+      {moreOpen ? (
+        <div className="dsh-hooks__foldbody">
+          {/* ① 生效配置（13 票）：用户级 + 项目级按**执行顺序**排开 —— 这是"实际会跑什么"的答案，
+              数据一直在快照里（`events`），只是以前一个字段都没渲染。 */}
+          <div className="dsh-hooks__foldhead">生效配置</div>
+          <div className="dsh-hooks__effectrow">
+            <span className="dsh-hooks__eventname dsh-hooks__eventname--fold">将运行</span>
+            <span className="dsh-hooks__count">
+              {`${String(effectiveTotal)} 条（用户级 ${String(effectiveUser)} + 项目级 ${String(
+                effectiveProject,
+              )}）${snapshot.session === null ? ' —— 当前会话未知，这不代表实际会跑什么' : ''}`}
+            </span>
+          </div>
+          {effectiveRows.length === 0 ? (
+            <div className="dsh-hooks__effectrow">
+              <span className="dsh-hooks__eventname dsh-hooks__eventname--fold">—</span>
+              <span className="dsh-hooks__muted">这一份作用域里没有任何会运行的 hook</span>
+            </div>
+          ) : (
+            effectiveRows.map((row) =>
+              row.groups.map((group, index) => (
+                <div className="dsh-hooks__effectrow" key={`${row.event}-${String(index)}`}>
+                  <span className="dsh-hooks__eventname dsh-hooks__eventname--fold" title={eventTitle(row.event)}>
+                    {/* 顺序即执行顺序：序号就是它在事件里的执行位次（用户级在前、项目级在后）。 */}
+                    {`${String(index + 1)}. ${eventLabel(row.event)}`}
+                  </span>
+                  <span className="dsh-hooks__count">
+                    {`${group.file === 'user' ? '用户级' : group.file === 'project' ? '项目级' : '来源未知'} · ${
+                      group.matcher === null ? '匹配全部' : `匹配 ${group.matcher}`
+                    } · ${String(group.hookCount)} 条`}
+                  </span>
+                </div>
+              )),
+            )
+          )}
+
+          {/* ② 全部事件：**7 个永远都在这里**（含 0 条）——"空"没有变得不可达（见文件头的偏离说明） */}
+          <div className="dsh-hooks__foldhead">全部事件</div>
+          {eventRows.map(({ event, file }) => (
+            <div className="dsh-hooks__eventrow" key={event}>
+              <span className="dsh-hooks__eventname dsh-hooks__eventname--fold" title={eventTitle(event)}>
+                {eventLabel(event)}
+                <span className="dsh-hooks__eventid">{event}</span>
+              </span>
+              {file === undefined || file.groups.length === 0 ? (
+                <span className="dsh-hooks__muted">
+                  没有配置
+                  {file !== undefined && file.runCount > 0 ? `（但历史上跑过 ${String(file.runCount)} 次）` : ''}
+                </span>
+              ) : (
+                <span className="dsh-hooks__count">
+                  {String(file.hookCount)} 个
+                  {file.disabledCount > 0 ? `（另有 ${String(file.disabledCount)} 个已停用）` : ''}
+                </span>
+              )}
+              {writable ? (
+                // 空事件行右侧是 **`＋` 字形按钮**（过去是六个「＋新建」文字按钮 = 用户说的"噪音"）。
+                // 它仍然是一个真按钮：`title` / `aria-label` 说清"在哪个事件下新建"，键盘能 Tab 到。
+                <button
+                  type="button"
+                  className="dsh-hooks__btn dsh-hooks__btn--ghost dsh-hooks__glyphbtn"
+                  title={`在 ${event} 下新建`}
+                  aria-label={`在 ${eventLabel(event)}（${event}）下新建`}
+                  disabled={busy}
+                  onClick={() => {
+                    setNewEvent(event)
+                    setNewOpen(true)
+                    setFormError(null)
+                  }}
+                >
+                  ＋
+                </button>
+              ) : null}
+            </div>
+          ))}
+
+          {/* ③ 诊断：所有"开发者要看的"东西都收在这里。**值一律人话**（内部字段名只作补充）。 */}
+          <div className="dsh-hooks__foldhead">诊断</div>
+          <DiagRow label="作用域" value={help} />
+          <DiagRow label="当前会话" value={sessionLine(snapshot)} />
+          <DiagRow label="项目根" value={snapshot.projectRoot ?? '未知（没有会话上下文，不编造）'} />
+          <DiagRow label="工作目录来源" value={cwdSourceText(snapshot.cwdSource)} />
+          <DiagRow label="写入权限" value="按调用会话的沙箱策略判定；被拒绝时报 sandbox" />
+          <DiagRow label="状态记录" value="只记录本次进程内的真实执行；重启后回到「未运行」" />
+          <DiagRow
+            label="作用域回显"
+            value={`请求的是「${requestedScopeText(snapshot)}」，实际给的是「${scopeWhere(
+              snapshot,
+              displayScope,
+            )}」${snapshot.scope.isCurrentSession === null ? '（当前会话未知，无法判断是不是它）' : ''}`}
+          />
+          {primary === undefined ? null : (
+            <DiagRow
+              label="当前文件"
+              value={`${primary.path} · ${stateToken(primary)} · 版本 ${String(primary.version)} · ${String(
+                primary.hookCount,
+              )} 个${primary.unrunnable > 0 ? `（另有 ${String(primary.unrunnable)} 条跑不了）` : ''}`}
+            />
+          )}
+          {others.map((file) => (
+            <DiagRow
+              key={file.kind}
+              label={file.kind === 'user' ? '用户级文件' : '项目级文件'}
+              value={`${file.path} · ${stateToken(file)} · 版本 ${String(file.version)} · ${String(file.hookCount)} 个`}
+            />
+          ))}
+          {snapshot.scope.workspacePath !== null && snapshot.scope.workspacePath !== snapshot.scope.projectRoot ? (
+            <DiagRow
+              label="工作区路径"
+              value={`${snapshot.scope.workspacePath}（≠ 项目根，配置落在项目根的 .dsh/hooks.json）`}
+            />
+          ) : null}
+          <DiagRow
+            label="沿用旧配置"
+            value={snapshot.staleInUse ? '是（磁盘此刻读不出来，运行的是上一份可用配置）' : '否'}
+          />
+          <DiagRow
+            label="工作区清单"
+            value={
+              snapshot.workspacesAvailable
+                ? `${String(snapshot.workspaces.length)} 项`
+                : '宿主没有提供工作区清单，只能改当前项目和用户级配置'
+            }
+          />
+          {snapshot.workspacesAvailable && currentProjectMissing(snapshot) ? (
+            <DiagRow
+              label="当前会话项目"
+              value={`${String(snapshot.projectRoot)} 不在清单里 —— 用作用域下拉的「当前会话项目（${lastSegment(
+                String(snapshot.projectRoot),
+              )}）」编辑它`}
+            />
+          ) : null}
+          {primary === undefined ? null : (
+            <DiagRow
+              label="匹配范围诊断"
+              value={primary.matcherErrors.length === 0 ? '无' : primary.matcherErrors.join('；')}
+            />
+          )}
+          {primary === undefined ? null : <DiagRow label="跑不了的条目" value={skippedText(primary.skipped)} />}
+          {banner === null ? null : <DiagRow label="错误详情" value={`${banner.code} ${banner.detail}`} />}
+        </div>
+      ) : null}
 
       {/* ── 第二行：**一句人话**（次要色）。同一个条数不再在五个地方各说一遍；
              「本会话生效 X 个」只在它和屏幕上这一份不是同一件事时才出现（选中当前会话项目时，
@@ -1631,169 +1797,6 @@ export function HooksSection(props?: HooksSectionProps): Jsx {
             </div>
           )
         })}
-
-      {/* ── 底部**只有一个**折叠区 `更多`：生效配置 + 7 个事件（含 0 条）+ 诊断。
-          v3 是两个并列开关（`查看全部事件（7）` / `诊断`），"诊断"两个字挂在每一屏上就是
-          用户说的"一堆说明和检测"。事实没删：一行字 + 一次点击之后全都在。
-
-          ⚠️ 18 票起分成**三节**（各带标题）：以前事件行与诊断行直接拼在一起，两套列宽（150 / 96）
-          混排，读起来是一堆没有结构的行；而诊断值是内部字段直出（`kind=… requested=…`）。 */}
-      <div className="dsh-hooks__folds">
-        <button
-          type="button"
-          className="dsh-hooks__disclosure"
-          title="更多"
-          aria-expanded={moreOpen}
-          onClick={() => {
-            setMoreOpen(!moreOpen)
-          }}
-        >
-          {moreOpen ? '▾' : '▸'} 更多
-        </button>
-      </div>
-
-      {moreOpen ? (
-        <div className="dsh-hooks__foldbody">
-          {/* ① 生效配置（13 票）：用户级 + 项目级按**执行顺序**排开 —— 这是"实际会跑什么"的答案，
-              数据一直在快照里（`events`），只是以前一个字段都没渲染。 */}
-          <div className="dsh-hooks__foldhead">生效配置</div>
-          <div className="dsh-hooks__effectrow">
-            <span className="dsh-hooks__eventname dsh-hooks__eventname--fold">将运行</span>
-            <span className="dsh-hooks__count">
-              {`${String(effectiveTotal)} 条（用户级 ${String(effectiveUser)} + 项目级 ${String(
-                effectiveProject,
-              )}）${snapshot.session === null ? ' —— 当前会话未知，这不代表实际会跑什么' : ''}`}
-            </span>
-          </div>
-          {effectiveRows.length === 0 ? (
-            <div className="dsh-hooks__effectrow">
-              <span className="dsh-hooks__eventname dsh-hooks__eventname--fold">—</span>
-              <span className="dsh-hooks__muted">这一份作用域里没有任何会运行的 hook</span>
-            </div>
-          ) : (
-            effectiveRows.map((row) =>
-              row.groups.map((group, index) => (
-                <div className="dsh-hooks__effectrow" key={`${row.event}-${String(index)}`}>
-                  <span className="dsh-hooks__eventname dsh-hooks__eventname--fold" title={eventTitle(row.event)}>
-                    {/* 顺序即执行顺序：序号就是它在事件里的执行位次（用户级在前、项目级在后）。 */}
-                    {`${String(index + 1)}. ${eventLabel(row.event)}`}
-                  </span>
-                  <span className="dsh-hooks__count">
-                    {`${group.file === 'user' ? '用户级' : group.file === 'project' ? '项目级' : '来源未知'} · ${
-                      group.matcher === null ? '匹配全部' : `匹配 ${group.matcher}`
-                    } · ${String(group.hookCount)} 条`}
-                  </span>
-                </div>
-              )),
-            )
-          )}
-
-          {/* ② 全部事件：**7 个永远都在这里**（含 0 条）——"空"没有变得不可达（见文件头的偏离说明） */}
-          <div className="dsh-hooks__foldhead">全部事件</div>
-          {eventRows.map(({ event, file }) => (
-            <div className="dsh-hooks__eventrow" key={event}>
-              <span className="dsh-hooks__eventname dsh-hooks__eventname--fold" title={eventTitle(event)}>
-                {eventLabel(event)}
-                <span className="dsh-hooks__eventid">{event}</span>
-              </span>
-              {file === undefined || file.groups.length === 0 ? (
-                <span className="dsh-hooks__muted">
-                  没有配置
-                  {file !== undefined && file.runCount > 0 ? `（但历史上跑过 ${String(file.runCount)} 次）` : ''}
-                </span>
-              ) : (
-                <span className="dsh-hooks__count">
-                  {String(file.hookCount)} 个
-                  {file.disabledCount > 0 ? `（另有 ${String(file.disabledCount)} 个已停用）` : ''}
-                </span>
-              )}
-              {writable ? (
-                // 空事件行右侧是 **`＋` 字形按钮**（过去是六个「＋新建」文字按钮 = 用户说的"噪音"）。
-                // 它仍然是一个真按钮：`title` / `aria-label` 说清"在哪个事件下新建"，键盘能 Tab 到。
-                <button
-                  type="button"
-                  className="dsh-hooks__btn dsh-hooks__btn--ghost dsh-hooks__glyphbtn"
-                  title={`在 ${event} 下新建`}
-                  aria-label={`在 ${eventLabel(event)}（${event}）下新建`}
-                  disabled={busy}
-                  onClick={() => {
-                    setNewEvent(event)
-                    setNewOpen(true)
-                    setFormError(null)
-                  }}
-                >
-                  ＋
-                </button>
-              ) : null}
-            </div>
-          ))}
-
-          {/* ③ 诊断：所有"开发者要看的"东西都收在这里。**值一律人话**（内部字段名只作补充）。 */}
-          <div className="dsh-hooks__foldhead">诊断</div>
-          <DiagRow label="作用域" value={help} />
-          <DiagRow label="当前会话" value={sessionLine(snapshot)} />
-          <DiagRow label="项目根" value={snapshot.projectRoot ?? '未知（没有会话上下文，不编造）'} />
-          <DiagRow label="工作目录来源" value={cwdSourceText(snapshot.cwdSource)} />
-          <DiagRow label="写入权限" value="按调用会话的沙箱策略判定；被拒绝时报 sandbox" />
-          <DiagRow label="状态记录" value="只记录本次进程内的真实执行；重启后回到「未运行」" />
-          <DiagRow
-            label="作用域回显"
-            value={`请求的是「${requestedScopeText(snapshot)}」，实际给的是「${scopeWhere(
-              snapshot,
-              displayScope,
-            )}」${snapshot.scope.isCurrentSession === null ? '（当前会话未知，无法判断是不是它）' : ''}`}
-          />
-          {primary === undefined ? null : (
-            <DiagRow
-              label="当前文件"
-              value={`${primary.path} · ${stateToken(primary)} · 版本 ${String(primary.version)} · ${String(
-                primary.hookCount,
-              )} 个${primary.unrunnable > 0 ? `（另有 ${String(primary.unrunnable)} 条跑不了）` : ''}`}
-            />
-          )}
-          {others.map((file) => (
-            <DiagRow
-              key={file.kind}
-              label={file.kind === 'user' ? '用户级文件' : '项目级文件'}
-              value={`${file.path} · ${stateToken(file)} · 版本 ${String(file.version)} · ${String(file.hookCount)} 个`}
-            />
-          ))}
-          {snapshot.scope.workspacePath !== null && snapshot.scope.workspacePath !== snapshot.scope.projectRoot ? (
-            <DiagRow
-              label="工作区路径"
-              value={`${snapshot.scope.workspacePath}（≠ 项目根，配置落在项目根的 .dsh/hooks.json）`}
-            />
-          ) : null}
-          <DiagRow
-            label="沿用旧配置"
-            value={snapshot.staleInUse ? '是（磁盘此刻读不出来，运行的是上一份可用配置）' : '否'}
-          />
-          <DiagRow
-            label="工作区清单"
-            value={
-              snapshot.workspacesAvailable
-                ? `${String(snapshot.workspaces.length)} 项`
-                : '宿主没有提供工作区清单，只能改当前项目和用户级配置'
-            }
-          />
-          {snapshot.workspacesAvailable && currentProjectMissing(snapshot) ? (
-            <DiagRow
-              label="当前会话项目"
-              value={`${String(snapshot.projectRoot)} 不在清单里 —— 用作用域下拉的「当前会话项目（${lastSegment(
-                String(snapshot.projectRoot),
-              )}）」编辑它`}
-            />
-          ) : null}
-          {primary === undefined ? null : (
-            <DiagRow
-              label="匹配范围诊断"
-              value={primary.matcherErrors.length === 0 ? '无' : primary.matcherErrors.join('；')}
-            />
-          )}
-          {primary === undefined ? null : <DiagRow label="跑不了的条目" value={skippedText(primary.skipped)} />}
-          {banner === null ? null : <DiagRow label="错误详情" value={`${banner.code} ${banner.detail}`} />}
-        </div>
-      ) : null}
     </div>
   )
 }

@@ -129,7 +129,7 @@
 **3.5 [边界] `order: 920`，唯一性约束在 `(id, priority)`。** 同一 list 座位里同 `(id, priority)` 重复注册会抛错（`list slot "..." already has an entry with id "..."`）。`order` 只保证排在 `mcp/900`、`skills/910` 之后，不保证"永远最后一个"。
 
 **3.6 [边界] 7 个事件分组永远全部渲染，含 0 条。** 「空」和「不存在」必须长得不一样，否则用户只能得出"这功能没做"——**他的判断没错，是界面在撒谎**。分组标签带条数；默认选中第一个非空分组。两个来源（项目级 / 用户级）同样永远都列，带条数。
-> ⚠️ 本插件**有意偏离**这一条（用户明确要求，见 [README.md](README.md) 的"对 AGENTS §3.6 的一处有意偏离"）：主列表只放**有内容**的事件，全部 7 个（含 0 条）收进底部**默认折叠**的「更多」。"空"没有变得不可达，只是不再默认占一屏；自检两半都在（收起时主列表不含 0 条、展开后恰好 7 行且含"没有配置"）。
+> ⚠️ 本插件**有意偏离**这一条（用户明确要求，见 [README.md](README.md) 的"对 AGENTS §3.6 的一处有意偏离"）：主列表只放**有内容**的事件，全部 7 个（含 0 条）收进**默认折叠**的「更多」（v7 起入口是工具条右端那枚 `▸` 字形按钮，展开的内容贴在工具条下面、在第一张卡之前）。"空"没有变得不可达，只是不再默认占一屏；自检两半都在（收起时主列表不含 0 条、展开后恰好 7 行且含"没有配置"）。
 
 **3.7 [边界] 一条错误只允许一个渲染点。** 错误跟着来源走：表单内的错误由提交失败写入、渲染在表单内部；页面级错误由行内操作（启停 / 删除 / 试运行）失败写入、渲染在页面级。写入辅助函数的第三个参数就是"写进哪条通道"，**必须只写一条**。
 
@@ -144,7 +144,7 @@
 **3.12 [风格] 自适应与外壳留白。** 每个可收缩的 flex 子项显式 `min-width:0`；长文本 `text-overflow:ellipsis`（长路径 `overflow-wrap:anywhere`）；操作区 `flex:none` 且不换行。外壳内容区**已经**有 `padding: 0 24px 24px`（`dsh-client-ui-settings-general` 的 `options` 类），**不要再垫一层**。
 
 **3.13 [边界] 检测不上屏、但必须一键可达（v4）。** 用户的反馈原话是"为什么不能简洁面向用户使用，非要使用一堆说明和检测"。落成两条硬判据：
-- **首屏只允许**：身份（事件名）、命令、**一个**状态词、`已停用`/`不会运行` 标签、开关、以及一个 `⋯`；诊断类事实（匹配范围 / 超时 / `exit N · ms` / 项目根 / 版本 / 会话口径）一律进 `⋯` 或底部**一个** `更多` 折叠 —— **默认不渲染**，不许"渲染出来再靠 hover 隐藏"。
+- **首屏只允许**：身份（事件名）、命令、**一个**状态词、`已停用`/`不会运行` 标签、开关、以及一个 `⋯`；诊断类事实（匹配范围 / 超时 / `exit N · ms` / 项目根 / 版本 / 会话口径）一律进 `⋯` 或工具条上那**一个**「更多」折叠 —— **默认不渲染**，不许"渲染出来再靠 hover 隐藏"。
 - **删的只能是渲染点，不能是判据**：三态（§2.9）、定点写 + 保留性证明（§2.4）、版本锁（§2.3）、沙箱策略透传（§1.6）、台账（§2.11）、matcher 非法只跳过该组（§2.7）**一条都不许删**。每次"收上去"都要在自检里留一条**可达性**断言（点开之后那件事真的还在），并把首屏的"不许出现"写成**否定断言**（`D41` 是这条的执行体）。
 - 代价：多一次点击才能看到证据；好处是默认状态没有噪音。**不许用"用户不需要知道"当理由删事实** —— 那是撒谎，只是把谎话变小了。
 
@@ -214,7 +214,7 @@
 - **装载路线二选一（必须在 README 里写明本包用哪条）**：
   - **路线 1「路径行」**：profile 的 `- insert:` 直接指向 `lib/index.js` 的 `file://` 绝对路径；不需要 `dsh.bundle.patch`、不需要 pnpm / node_modules。客户端 bundle 仍由 `dsh-client-modules` 从本包 `package.json` 的 `exports["./client"]` 定位，由 Host 在 `/plugins` 下发布。
   - **路线 2「bundle」**：`package.json` 声明 `dsh.bundle.patch: './cordis.patch.yml'`，由该 YAML 的 `- insert:` 行声明插件条目，走 `plugin_manager install_bundle`（官方要求：**不要**用 shell 命令复刻安装流程）。**两条路线是替代关系，不是互补字段**。走这条路要额外提交补丁文件与 `lib/**`（git 路线要求），且**替换已安装的包必须重启**才加载新的 JS 模块代。
-  - **本包状态（2026-10-27 14:50 核实）**：**路线 2「bundle」已生效，profile 装的是 `v0.3.1`** —— profile 的 `dsh.profile.bundles` 含 `dsh-hooks`，`dependencies` 钉 `github:qq540491950/dsh-hooks#v0.3.1`，`node_modules/dsh-hooks` 是真实副本；`plugin_manager install_bundle` 返回 `application: applied`。（同日早些时候"profile 里没有 `dsh-hooks` 任何痕迹"那条在当时是事实 —— 用户随后自行装上，现已过期，别再拿它推断运行状态。）
+  - **本包状态（2026-10-27 18:30 核实）**：**路线 2「bundle」已生效** —— profile 的 `dsh.profile.bundles` 含 `dsh-hooks`，`dependencies` 钉 `github:qq540491950/dsh-hooks#v0.4.0`（v0.4.0 = Hooks 页 v6），`node_modules/dsh-hooks` 是真实副本（**不是** junction，所以改仓库不会自动生效：改完要 bump 版本、推 tag，再用 `install_bundle` 装新 tag）。v0.4.1（v7：折叠入口挪进工具条）只在仓库里，装上之后才看得到。`plugin_manager install_bundle` 返回 `application: applied`。历史上"profile 里没有 `dsh-hooks` 任何痕迹"那条在当时是事实，现已过期，别再拿它推断运行状态。
     历史上装不上的直接原因已修：`engines.dsh` 当时钉的是 `"0.2.0-rc.2"`（精确版本），而本机 runtime 是 `0.2.1-rc.3` —— npm 的 semver 规则下**任何**含 prerelease 元组的范围都只匹配"同一个版本元组"的 prerelease，所以换一个 rc 就必然 unmet，而 unmet engines 会**阻断安装与激活**。现在 `engines` 只保留 `node`，`A` 区有断言守着"不许再出现 prerelease 元组"。
     **升级步骤（本机审批档 `danger-full-access` 时可在会话内跑通）**：本地 `git push origin main` + `git push origin v<x.y.z>` → `plugin_manager install_bundle` 传 `github:qq540491950/dsh-hooks#v<x.y.z>`（它自己改 profile 的依赖与 lockfile，**不要**手改 profile）。
 - **`dsh.client` 的确切 schema（官方运行时校验器为准）**：`{platform, inject?, external?, immediately?}`。

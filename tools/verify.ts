@@ -941,7 +941,7 @@ await test('D：一张卡 = 一条 hook（中文名+英文枚举/命令/开关/�
   )
 })
 
-await test('D：底部折叠「更多」展开后 7 个事件都在（含 0 条）——"空"没有变得不可达', async () => {
+await test('D：工具条上的折叠「更多」展开后 7 个事件都在（含 0 条）——"空"没有变得不可达', async () => {
   // §3.6 偏离的另一半保证：默认不占一屏，但**折叠里必须永远列全 7 个**（含 0 条 + ＋新建）。
   const hooks = [snapshotHook(0, 'echo only')]
   const snapshot = minimalSnapshot({
@@ -951,10 +951,26 @@ await test('D：底部折叠「更多」展开后 7 个事件都在（含 0 条�
   const component = componentFromArtifact(harness.React)
   const collapsed = await renderSection(component, harness, { ok: true, data: snapshot })
   const collapsedTexts = collapsed.filter((node) => node.text !== undefined).map((node) => node.text)
-  // v4：底部**只有一个**开关，名字是「更多」（v3 是两个：查看全部事件（7） + 诊断）。
-  assert.ok(joinedText(collapsed).includes('更多'), '底部必须有「更多」这个折叠开关')
+  // v7：入口从"正文最后一行"挪到**工具条**（v3 是底部两个并列开关，v4 是底部一个「更多」）。
+  // 图标按钮只画字形（▸/▾），所以名字必须挂在 title + aria-label 上 —— 只看字形等于没名字。
+  const toggles = allByClass(collapsed, 'dsh-hooks__disclosure')
+  assert.equal(toggles.length, 1, '★ 全页只有一个折叠开关（v3 是两个）')
+  assert.equal(toggles[0].ariaExpanded, false, '默认收起：aria-expanded=false（按钮不许骗人）')
+  assert.equal(toggles[0].title, '更多', '折叠开关的提示名是「更多」')
+  assert.ok(String(toggles[0].ariaLabel).includes('更多'), '★ 只有字形的按钮必须有可读名字（aria-label 含「更多」）')
+  assert.equal(
+    toggles[0].parentClass,
+    'dsh-hooks__toolbarActions',
+    '★ v7：折叠开关长在工具条的动作簇里，不是正文最后一行',
+  )
+  assert.ok(
+    !collapsedTexts.some((text) => text.includes('更多')),
+    '★ 正文里不再出现「更多」那行字（入口已挪走；字形不算文字）',
+  )
   assert.ok(!joinedText(collapsed).includes('诊断'), '★ "诊断"两个字不再挂在首屏（v4：检测不占屏）')
   assert.equal(allByClass(collapsed, 'dsh-hooks__foldbody').length, 0, '默认是收起的')
+  // v7 的两面：工具条里一个开关，且正文里**没有**第二个 —— 过去那行 `▸ 更多` 的容器已经删了。
+  assert.equal(allByClass(collapsed, 'dsh-hooks__folds').length, 0, '★ 正文里的折叠行容器已删（不许长回来）')
   for (const event of HOOK_EVENTS) {
     if (event === 'PreToolUse') continue
     assert.equal(
@@ -966,6 +982,16 @@ await test('D：底部折叠「更多」展开后 7 个事件都在（含 0 条�
 
   const opened = await expandFold(collapsed, component, harness, '更多')
   const openedTexts = opened.filter((node) => node.text !== undefined).map((node) => node.text)
+  // v7：展开的内容**贴在工具条下面**（在卡片列表之前）——它现在是从工具条点开的，
+  // 内容若还落在页尾，收起→展开时按钮看着就像没生效（"点了没反应"比多一行更糟）。
+  const openedBodyAt = opened.findIndex(
+    (node) => typeof node.className === 'string' && node.className.split(' ').includes('dsh-hooks__foldbody'),
+  )
+  const firstCardAt = opened.findIndex(
+    (node) => typeof node.className === 'string' && node.className.split(' ').includes('dsh-hooks__hookcard'),
+  )
+  assert.ok(openedBodyAt >= 0, '展开后必须有折叠内容块')
+  assert.ok(firstCardAt > openedBodyAt, '★ 折叠内容在第一张卡片之前（从工具条展开 => 内容就在眼前，不许掉到页尾）')
   const rows = allByClass(opened, 'dsh-hooks__eventrow')
   assert.equal(rows.length, HOOK_EVENTS.length, '展开后**恰好 7 行**（含 0 条）')
   for (const event of HOOK_EVENTS) {
@@ -3188,7 +3214,16 @@ await test('D41：v4 密度 —— 首屏只有"状态点 + 一个状态词 + �
   assert.equal(allByClass(nodes, 'dsh-hooks__morebtn').length, 3, '每张卡一个 ⋯')
   assert.equal(allByClass(nodes, 'dsh-hooks__cardmenu').length, 0, '★ ⋯ 默认收起：匹配 / 超时 / 动作一个字都不占屏')
   assert.equal(allByClass(nodes, 'dsh-hooks__btn').length, 0, '★ 首屏一个动作按钮都没有（全在 ⋯ 里）')
-  assert.equal(allByClass(nodes, 'dsh-hooks__disclosure').length, 1, '★ 底部只有一个折叠开关（v3 是两个）')
+  assert.equal(
+    allByClass(nodes, 'dsh-hooks__disclosure').length,
+    1,
+    '★ 全页只有一个折叠开关（v3 是底部两个并列开关；v7 起它在工具条里）',
+  )
+  assert.equal(
+    allByClass(nodes, 'dsh-hooks__disclosure')[0].parentClass,
+    'dsh-hooks__toolbarActions',
+    '★ 折叠开关在工具条的动作簇里（正文最后一行已经删掉）',
+  )
   assert.ok(visible.includes('未运行') && visible.includes('通过'), '状态词还在（颜色之外必须有一个词）')
 
   // ③ 一键可达：点开 ⋯ → 详情真的在；再点一次 → 真的收回去
